@@ -111,7 +111,7 @@ class UserSerializer(serializers.ModelSerializer):
 class AcademicGradeBreakdownSerializer(serializers.ModelSerializer):
     class Meta:
         model = AcademicGradeBreakdown
-        fields = ['s_grade_count', 'a_plus_grade_count', 'a_grade_count', 'failed_count', 'class_pass_percentage', 'total_students']
+        fields = ['s_grade_count', 'a_plus_grade_count', 'a_grade_count', 'other_pass_count', 'failed_count', 'class_pass_percentage', 'total_students']
 
 
 class SubmissionSerializer(serializers.ModelSerializer):

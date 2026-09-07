@@ -125,6 +125,8 @@ class DepartmentCourseClassManagementTest(TestCase):
         self.assertEqual(allocated.roll_number, 14)
 
     def test_api_department_and_course_crud(self):
+        admin = User.objects.create(username='admin@mariancollege.org', email='admin@mariancollege.org', role='admin', is_staff=True, is_superuser=True)
+        self.client.force_authenticate(user=admin)
         # Create department via POST
         res = self.client.post('/api/departments/', {
             'name': 'Department of Physics',
@@ -215,6 +217,7 @@ class DepartmentCourseClassManagementTest(TestCase):
         course = Course.objects.create(department=dept, name='BCA', abbreviation='BCA', email_code='bc', duration_years=3)
         cls = Class.objects.create(department=dept, course=course, year_number=1, name='I BCA')
         teacher = User.objects.create(username='prof.smith@mariancollege.org', email='prof.smith@mariancollege.org', role='faculty', first_name='John', last_name='Smith')
+        self.client.force_authenticate(user=teacher)
 
         # PUT /api/auth/classes/<id>/
         res = self.client.put(f'/api/auth/classes/{cls.id}/', {
@@ -258,8 +261,9 @@ class CriteriaSubcategoryScoreValidationTest(TestCase):
         self.evaluator = User.objects.create(
             username='evaluator@mariancollege.org',
             email='evaluator@mariancollege.org',
-            role='evaluator'
+            role='evaluation'
         )
+        self.client.force_authenticate(user=self.evaluator)
         self.category = CriteriaCategory.objects.create(
             code='cat-research',
             category='Research'
@@ -410,4 +414,270 @@ class CriteriaSubcategoryScoreValidationTest(TestCase):
 
         self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn('cannot be negative', res.data['error'])
+
+
+class APISecurityAndAuthorizationTest(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.ay = AcademicYear.objects.create(year='2025-2026', is_active=True)
+        self.category = CriteriaCategory.objects.create(code='cat-sec', category='Security')
+        self.item = CriteriaItem.objects.create(category=self.category, title='Hackathon', type='count', marks=10.0)
+
+        self.student1 = User.objects.create(
+            username='student1@mariancollege.org',
+            email='student1@mariancollege.org',
+            role='student'
+        )
+        self.student2 = User.objects.create(
+            username='student2@mariancollege.org',
+            email='student2@mariancollege.org',
+            role='student'
+        )
+        self.admin = User.objects.create(
+            username='admin@mariancollege.org',
+            email='admin@mariancollege.org',
+            role='admin',
+            is_staff=True,
+            is_superuser=True
+        )
+
+    def test_unauthenticated_requests_are_rejected(self):
+        """Unauthenticated requests to sensitive API endpoints must receive 401 Unauthorized."""
+        # /api/users/
+        self.assertEqual(self.client.get('/api/users/').status_code, status.HTTP_401_UNAUTHORIZED)
+        self.assertEqual(self.client.post('/api/users/', {'email': 'test@mariancollege.org'}).status_code, status.HTTP_401_UNAUTHORIZED)
+
+        # /api/submissions/
+        self.assertEqual(self.client.get('/api/submissions/').status_code, status.HTTP_401_UNAUTHORIZED)
+        self.assertEqual(self.client.post('/api/submissions/', {'criteriaId': self.item.id}).status_code, status.HTTP_401_UNAUTHORIZED)
+
+        # /api/settings/ write
+        self.assertEqual(self.client.post('/api/settings/', {'key': 'val'}).status_code, status.HTTP_401_UNAUTHORIZED)
+
+        # /api/user-groups/ write
+        self.assertEqual(self.client.post('/api/user-groups/', {'id': 'grp-1', 'name': 'Grp'}).status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_student_forbidden_from_admin_endpoints(self):
+        """Students cannot access administrative endpoints or escalate privileges."""
+        self.client.force_authenticate(user=self.student1)
+
+        # /api/users/ (User management)
+        res_get = self.client.get('/api/users/')
+        self.assertEqual(res_get.status_code, status.HTTP_403_FORBIDDEN)
+
+        res_post = self.client.post('/api/users/', {
+            'email': 'evil@mariancollege.org',
+            'role': 'admin'
+        }, format='json')
+        self.assertEqual(res_post.status_code, status.HTTP_403_FORBIDDEN)
+
+        res_del = self.client.delete('/api/users/', {'id': self.admin.id}, format='json')
+        self.assertEqual(res_del.status_code, status.HTTP_403_FORBIDDEN)
+
+        # /api/settings/
+        res_settings = self.client.post('/api/settings/', {'smallest_class_size': '10'}, format='json')
+        self.assertEqual(res_settings.status_code, status.HTTP_403_FORBIDDEN)
+
+        # /api/criteria-items/
+        res_item = self.client.post('/api/criteria-items/', {
+            'category': self.category.id,
+            'title': 'Rogue item',
+            'type': 'count',
+            'marks': 100.0
+        }, format='json')
+        self.assertEqual(res_item.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_admin_allowed_on_admin_endpoints(self):
+        """Admins can access user management and system settings."""
+        self.client.force_authenticate(user=self.admin)
+        res_get = self.client.get('/api/users/')
+        self.assertEqual(res_get.status_code, status.HTTP_200_OK)
+
+        res_settings = self.client.post('/api/settings/', {'smallest_class_size': '25'}, format='json')
+        self.assertEqual(res_settings.status_code, status.HTTP_200_OK)
+
+    def test_submission_cannot_be_impersonated_via_email(self):
+        """Even if request body sends another user's email, submission strictly belongs to request.user."""
+        self.client.force_authenticate(user=self.student1)
+
+        res = self.client.post('/api/submissions/', {
+            'email': self.student2.email,  # Attempting to impersonate student2
+            'criteriaId': self.item.id,
+            'academicYear': '2025-2026',
+            'description': 'Submitted project',
+            'status': 'Pending Rep Verification',
+        }, format='json')
+
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        sub_id = res.data['id']
+        sub = Submission.objects.get(id=sub_id)
+
+        # The submission MUST belong to student1 (the authenticated JWT user)
+        self.assertEqual(sub.user, self.student1)
+        self.assertNotEqual(sub.user, self.student2)
+
+    def test_student_cannot_edit_or_delete_another_students_submission(self):
+        """A student cannot modify or delete a submission belonging to another student."""
+        sub = Submission.objects.create(
+            user=self.student2,
+            criteria_id=self.item.id,
+            academic_year='2025-2026',
+            status='Draft'
+        )
+
+        self.client.force_authenticate(user=self.student1)
+
+        # Attempt to edit student2's submission
+        res_put = self.client.put(f'/api/submissions/{sub.id}/', {
+            'description': 'Malicious modification'
+        }, format='json')
+        self.assertEqual(res_put.status_code, status.HTTP_403_FORBIDDEN)
+
+        # Attempt to delete student2's submission
+        res_del = self.client.delete(f'/api/submissions/{sub.id}/')
+        self.assertEqual(res_del.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertTrue(Submission.objects.filter(id=sub.id).exists())
+
+    def test_student_cannot_self_award_marks_or_self_approve(self):
+        """Students cannot self-assign marks or self-transition to approved/verified states."""
+        sub = Submission.objects.create(
+            user=self.student1,
+            criteria_id=self.item.id,
+            academic_year='2025-2026',
+            status='Pending Rep Verification'
+        )
+
+        self.client.force_authenticate(user=self.student1)
+
+        # Attempt to award marks
+        res_marks = self.client.put(f'/api/submissions/{sub.id}/', {
+            'marks': 10.0
+        }, format='json')
+        self.assertEqual(res_marks.status_code, status.HTTP_403_FORBIDDEN)
+
+        # Attempt to self-approve
+        res_approve = self.client.put(f'/api/submissions/{sub.id}/', {
+            'status': 'Approved'
+        }, format='json')
+        self.assertEqual(res_approve.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_student_submissions_list_is_scoped_to_own(self):
+        """Regular students only see their own submissions in GET /api/submissions/."""
+        sub1 = Submission.objects.create(user=self.student1, criteria_id=self.item.id, academic_year='2025-2026', status='Draft')
+        sub2 = Submission.objects.create(user=self.student2, criteria_id=self.item.id, academic_year='2025-2026', status='Draft')
+
+        self.client.force_authenticate(user=self.student1)
+        res = self.client.get('/api/submissions/')
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+
+        returned_ids = [s['id'] for s in res.data]
+        self.assertIn(sub1.id, returned_ids)
+        self.assertNotIn(sub2.id, returned_ids)
+
+    def test_dev_bypass_disabled_fails_closed(self):
+        """When DEBUG and ENABLE_DEV_BYPASS are False, bypass endpoint returns 404."""
+        from django.conf import settings
+        with self.settings(DEBUG=False, ENABLE_DEV_BYPASS=False):
+            res = self.client.post('/api/auth/bypass/', {
+                'email': 'student1@mariancollege.org'
+            }, format='json')
+            self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_class_index_normalization_invariance_across_class_sizes(self):
+        """Mathematically prove that classes with identical per-student performance
+        achieve approximately the same index across sizes 20, 40, 80, and 120 students.
+        """
+        from users.models import Class, Submission, SystemSetting, Department
+
+        # Set benchmark smallest class size n = 20
+        SystemSetting.objects.update_or_create(
+            key='smallest_class_size',
+            defaults={'value': '20'}
+        )
+
+        dept, _ = Department.objects.get_or_create(name='Computer Science', code='CS')
+
+        sizes = [20, 40, 80, 120]
+        # Identical per-student performance: 15 marks per student
+        PER_STUDENT_MARKS = 15.0
+
+        classes = []
+        for size in sizes:
+            cls = Class.objects.create(
+                name=f'Batch_{size}',
+                department=dept,
+                num_students=size,
+                negative_points=0.0
+            )
+            # Create a student user for this class to hold the locked submission
+            u = User.objects.create_user(
+                username=f'rep_{size}',
+                email=f'rep_{size}@mariancollege.org',
+                role='student',
+                class_name=cls
+            )
+            total_marks = size * PER_STUDENT_MARKS
+            Submission.objects.create(
+                user=u,
+                criteria_id=self.item.id,
+                academic_year='2025-2026',
+                status='Locked',
+                marks=total_marks
+            )
+            classes.append(cls)
+
+        self.client.force_authenticate(user=self.admin)
+        res = self.client.get('/api/class-index/?year=2025-2026')
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+
+        results_by_size = {entry['N']: entry for entry in res.data if entry['N'] in sizes}
+
+        for size in sizes:
+            entry = results_by_size[size]
+            m_val = entry['M']
+            mod_val = entry['moderation_mark']
+            # Moderation mark must be within [0, 200]
+            self.assertGreaterEqual(mod_val, 0.0)
+            self.assertLessEqual(mod_val, 200.0)
+            # Index must be approximately 15.0 (between 15.0 and 17.0)
+            self.assertGreaterEqual(m_val, 15.0)
+            self.assertLessEqual(m_val, 17.0)
+
+        # Confirm Class A (20) index is exactly 15.00
+        self.assertAlmostEqual(results_by_size[20]['M'], 15.00, places=2)
+        # Confirm Class D (120) index is 16.67 (bounded gentle moderation boost, not 2000x)
+        self.assertAlmostEqual(results_by_size[120]['M'], 16.67, places=2)
+
+    def test_academic_grade_breakdown_full_accounting(self):
+        """Verify that all students must be accounted for and pass percentage is accurate."""
+        from users.models import Submission, AcademicGradeBreakdown
+
+        sub = Submission.objects.create(
+            user=self.student1,
+            criteria_id=self.item.id,
+            academic_year='2025-2026',
+            status='Draft'
+        )
+
+        # Case 1: S=10, APlus=10, A=10, Fail=5, Total=50.
+        # Remaining 15 students should automatically be attributed to other_pass_count (B/C/Pass).
+        breakdown = AcademicGradeBreakdown(
+            submission=sub,
+            s_grade_count=10,
+            a_plus_grade_count=10,
+            a_grade_count=10,
+            failed_count=5,
+            total_students=50
+        )
+        breakdown.save()
+        self.assertEqual(breakdown.other_pass_count, 15)
+        # Passed = 45 / 50 = 90.0%
+        self.assertEqual(breakdown.class_pass_percentage, 90.0)
+
+        # Case 2: Grade counts sum does not match total_students (e.g. 10+10+10+20+5 = 55 != 50)
+        breakdown.other_pass_count = 20
+        with self.assertRaises(ValueError):
+            breakdown.save()
+
+
 

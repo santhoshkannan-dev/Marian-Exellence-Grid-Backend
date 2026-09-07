@@ -202,6 +202,7 @@ class AcademicGradeBreakdown(models.Model):
     s_grade_count = models.IntegerField(default=0)
     a_plus_grade_count = models.IntegerField(default=0)
     a_grade_count = models.IntegerField(default=0)
+    other_pass_count = models.IntegerField(default=0)
     failed_count = models.IntegerField(default=0)
     class_pass_percentage = models.FloatField(default=0.0)
     total_students = models.IntegerField(default=0)
@@ -209,11 +210,25 @@ class AcademicGradeBreakdown(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
 
     def save(self, *args, **kwargs):
-        grade_sum = self.s_grade_count + self.a_plus_grade_count + self.a_grade_count + self.failed_count
+        honors_sum = self.s_grade_count + self.a_plus_grade_count + self.a_grade_count
+        passed = max(0, self.total_students - self.failed_count)
+
+        # Automatically account for other passing students (B/C/D/Pass) if not explicitly set
+        if self.other_pass_count <= 0 and passed > honors_sum:
+            self.other_pass_count = passed - honors_sum
+
+        total_accounted = honors_sum + self.other_pass_count + self.failed_count
         if self.total_students <= 0:
-            self.total_students = max(1, grade_sum)
-        if grade_sum > self.total_students:
-            raise ValueError(f"Sum of grade counts ({grade_sum}) exceeds total students ({self.total_students}).")
+            self.total_students = max(1, total_accounted)
+
+        if total_accounted != self.total_students:
+            raise ValueError(
+                f"Sum of grade counts ({total_accounted} accounted: {self.s_grade_count} S + "
+                f"{self.a_plus_grade_count} A+ + {self.a_grade_count} A + "
+                f"{self.other_pass_count} Other Passing + {self.failed_count} Fail) "
+                f"must strictly equal total students ({self.total_students})."
+            )
+
         passed = max(0, self.total_students - self.failed_count)
         self.class_pass_percentage = round((passed / float(self.total_students)) * 100.0, 2)
         super().save(*args, **kwargs)

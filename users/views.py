@@ -12,7 +12,15 @@ logger = logging.getLogger(__name__)
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
-from rest_framework.permissions import AllowAny
+from rest_framework.permissions import AllowAny, IsAuthenticated
+from .permissions import (
+    IsAdminRole,
+    IsAdminOrIQAC,
+    IsStaffOrAdmin,
+    IsAdminOrReadOnly,
+    IsAdminOrPublicReadOnly,
+    IsAdminOrStaffOrReadOnly,
+)
 
 from rest_framework_simplejwt.tokens import RefreshToken
 
@@ -585,7 +593,7 @@ class GoogleLoginView(APIView):
 
 
 class LogoutView(APIView):
-    permission_classes = [AllowAny]
+    permission_classes = [IsAuthenticated]
 
     def post(self, request):
         try:
@@ -607,7 +615,7 @@ class DevBypassLoginView(APIView):
         if not (settings.DEBUG and getattr(settings, 'ENABLE_DEV_BYPASS', False)):
             return Response(
                 {"error": "Developer bypass login is disabled in this environment."},
-                status=status.HTTP_403_FORBIDDEN
+                status=status.HTTP_404_NOT_FOUND
             )
 
         email = request.data.get("email")
@@ -687,6 +695,7 @@ class DevBypassLoginView(APIView):
 
 
 class UserProfileView(APIView):
+    permission_classes = [IsAuthenticated]
 
     def get(self, request):
 
@@ -744,7 +753,7 @@ class UserProfileView(APIView):
 
 
 class AcademicYearListView(APIView):
-    permission_classes = [AllowAny]
+    permission_classes = [IsAdminOrPublicReadOnly]
 
     def get(self, request):
         years = AcademicYear.objects.all().order_by('-year')
@@ -843,7 +852,7 @@ OFFICIAL_CLASS_ORDER = [
 ]
 
 class DepartmentListView(APIView):
-    permission_classes = [AllowAny]
+    permission_classes = [IsAdminOrPublicReadOnly]
 
     def get(self, request):
         depts = Department.objects.prefetch_related('courses', 'classes').all()
@@ -875,7 +884,7 @@ class DepartmentListView(APIView):
 
 class DepartmentDetailView(APIView):
     """GET / PUT / DELETE a single Department by its integer pk."""
-    permission_classes = [AllowAny]
+    permission_classes = [IsAdminOrPublicReadOnly]
 
     def _get_dept(self, pk):
         try:
@@ -918,7 +927,7 @@ class DepartmentDetailView(APIView):
 
 class CourseListView(APIView):
     """List all courses, or create a new course under a department."""
-    permission_classes = [AllowAny]
+    permission_classes = [IsAdminOrPublicReadOnly]
 
     def get(self, request):
         dept_id = request.query_params.get('department')
@@ -966,7 +975,7 @@ class CourseListView(APIView):
 
 class CourseDetailView(APIView):
     """GET / PUT / DELETE a single Course by pk."""
-    permission_classes = [AllowAny]
+    permission_classes = [IsAdminOrPublicReadOnly]
 
     def _get_course(self, pk):
         try:
@@ -1009,7 +1018,7 @@ class CourseDetailView(APIView):
 
 
 class ClassListView(APIView):
-    permission_classes = [AllowAny]
+    permission_classes = [IsAdminOrStaffOrReadOnly]
 
     def get(self, request):
         dept_id = request.query_params.get('department')
@@ -1200,7 +1209,7 @@ class ClassListView(APIView):
 
 class ClassDetailView(APIView):
     """GET / PATCH / PUT / DELETE a single Class by primary key."""
-    permission_classes = [AllowAny]
+    permission_classes = [IsAdminOrStaffOrReadOnly]
 
     def _get_cls(self, pk):
         try:
@@ -1235,6 +1244,8 @@ class ClassDetailView(APIView):
         return Response(self._serialize_class(cls))
 
     def delete(self, request, pk):
+        if not (request.user and request.user.is_authenticated and (getattr(request.user, 'role', None) == 'admin' or request.user.is_staff or request.user.is_superuser)):
+            return Response({"error": "Admin permission required to delete classes."}, status=status.HTTP_403_FORBIDDEN)
         cls = self._get_cls(pk)
         if not cls:
             return Response({"error": "Class not found"}, status=status.HTTP_404_NOT_FOUND)
@@ -1370,15 +1381,20 @@ class ClassDetailView(APIView):
 class ClassIndexView(APIView):
     """Compute and return the moderated class index M for all classes.
 
-    Formula: M = (S - P) / (N^2) * (1 + 100 * (N - n))
-      S = sum of marks on Locked submissions for the class
-      P = Class.negative_points
-      N = Class.num_students
-      n = SystemSetting['smallest_class_size']
+    Authoritative Marian Evaluation Formula:
+      Step 1: Net Obtained Score = S - P
+              S = sum of verified marks on Evaluated/Locked submissions
+              P = Class.negative_points (penalties)
+      Step 2: Moderation Mark = min(200.0, max(0.0, 2.0 * (N - n)))
+              N = Class.num_students (class size)
+              n = SystemSetting['smallest_class_size'] (benchmark class size)
+              Moderation compensation range: 0 to 200 marks.
+      Step 3: Total Score = max(0.0, (S - P) + Moderation Mark)
+      Step 4: Class Index M = Total Score / N
 
     Query param: ?year=2025-2026 (optional, filters by submission academic_year)
     """
-    permission_classes = [AllowAny]
+    permission_classes = [IsAdminOrPublicReadOnly]
 
     def get(self, request):
         year = request.query_params.get('year', None)
@@ -1410,7 +1426,11 @@ class ClassIndexView(APIView):
             S = sub_qs.aggregate(total=Sum('marks'))['total'] or 0.0
 
             if N > 0:
-                M = (S - P) / (N * N) * (1 + 100 * (N - n))
+                net_score = float(S) - float(P)
+                moderation_mark = min(200.0, max(0.0, 2.0 * (float(N) - float(n))))
+                total_score = max(0.0, net_score + moderation_mark)
+                M = total_score / float(N)
+
                 ranked.append({
                     "class_name": cls.name,
                     "department": cls.department.name,
@@ -1419,6 +1439,8 @@ class ClassIndexView(APIView):
                     "S": round(float(S), 2),
                     "P": round(float(P), 2),
                     "n": n,
+                    "moderation_mark": round(float(moderation_mark), 2),
+                    "total_score": round(float(total_score), 2),
                     "M": round(float(M), 4),
                 })
             else:
@@ -1430,6 +1452,8 @@ class ClassIndexView(APIView):
                     "S": round(float(S), 2),
                     "P": round(float(P), 2),
                     "n": n,
+                    "moderation_mark": 0.0,
+                    "total_score": 0.0,
                     "M": None,
                     "rank": None,
                 })
@@ -1443,7 +1467,7 @@ class ClassIndexView(APIView):
 
 
 class UserManagementView(APIView):
-    permission_classes = [AllowAny]
+    permission_classes = [IsAdminRole]
 
     def get(self, request):
         users = User.objects.select_related('department', 'class_name').all().order_by('id')
@@ -1631,14 +1655,30 @@ def get_criteria_allowed_bounds(criteria_item, evidence=None):
 
 
 class SubmissionListView(APIView):
-    permission_classes = [AllowAny]
+    permission_classes = [IsAuthenticated]
 
     def get(self, request):
         user = request.user
         email_param = request.query_params.get('email')
         
-        # Return all submissions to support real-time peer group verification and multi-role evaluation
-        queryset = Submission.objects.all()
+        queryset = Submission.objects.select_related('user', 'user__class_name', 'user__department').all()
+
+        # Role-based submission visibility
+        if getattr(user, 'role', None) == 'student':
+            if is_user_student_rep(user):
+                rep_classes = Class.objects.filter(
+                    Q(dqc_member=user) | Q(dqc_member__email__iexact=user.email)
+                )
+                queryset = queryset.filter(Q(user=user) | Q(user__class_name__in=rep_classes))
+            else:
+                queryset = queryset.filter(user=user)
+        elif getattr(user, 'role', None) == 'faculty':
+            advised_classes = Class.objects.filter(class_teacher=user)
+            if advised_classes.exists():
+                queryset = queryset.filter(
+                    Q(user__class_name__in=advised_classes) |
+                    Q(user__department=user.department)
+                )
             
         academic_year = request.query_params.get('academicYear')
         if academic_year:
@@ -1680,18 +1720,15 @@ class SubmissionListView(APIView):
 
     def post(self, request):
         user = request.user
-        email = request.data.get('email')
-        if not user.is_authenticated or (email and user.email != email):
-            if email:
-                user = User.objects.filter(email=email).first()
-            if not user:
-                user = User.objects.filter(role='student').first() or User.objects.first()
+        if not user or not user.is_authenticated:
+            return Response({"error": "Authentication credentials were not provided."}, status=status.HTTP_401_UNAUTHORIZED)
 
         criteria_id = request.data.get('criteriaId')
         academic_year = request.data.get('academicYear', '2025-2026')
         description = request.data.get('description', '')
         status_val = request.data.get('status', 'Pending Verification')
         remarks = request.data.get('remarks', '')
+        evidence = request.data.get('evidence')
         marks = request.data.get('marks')
         if marks is not None and user and getattr(user, 'role', None) == 'student':
             marks = None
@@ -1721,7 +1758,6 @@ class SubmissionListView(APIView):
                 return Response({"error": "Invalid marks value provided."}, status=status.HTTP_400_BAD_REQUEST)
         proof = request.data.get('proof', '')
         event_id = request.data.get('eventId', '')
-        evidence = request.data.get('evidence')
         start_date = request.data.get('start_date') or request.data.get('startDate')
         if not start_date and isinstance(evidence, dict):
             start_date = evidence.get('startDate') or evidence.get('examDate')
@@ -1844,15 +1880,22 @@ class SubmissionListView(APIView):
                 submission.save(update_fields=["submission_type"])
             grades = sub_evidence.get("grades")
             if isinstance(grades, dict):
+                s_c = int(grades.get("S", 0) or 0)
+                ap_c = int(grades.get("APlus", 0) or 0)
+                a_c = int(grades.get("A", 0) or 0)
+                other_c = int(grades.get("OtherPass", 0) or grades.get("B", 0) or 0)
+                fail_c = int(grades.get("Fail", 0) or 0)
+                total_c = int(sub_evidence.get("totalStudents", 0) or 0)
                 AcademicGradeBreakdown.objects.update_or_create(
                     submission=submission,
                     defaults={
-                        "s_grade_count": grades.get("S", 0),
-                        "a_plus_grade_count": grades.get("APlus", 0),
-                        "a_grade_count": grades.get("A", 0),
-                        "failed_count": grades.get("Fail", 0),
-                        "class_pass_percentage": sub_evidence.get("classPassPercentage", 0.0),
-                        "total_students": sub_evidence.get("totalStudents", 0)
+                        "s_grade_count": s_c,
+                        "a_plus_grade_count": ap_c,
+                        "a_grade_count": a_c,
+                        "other_pass_count": other_c,
+                        "failed_count": fail_c,
+                        "class_pass_percentage": float(sub_evidence.get("classPassPercentage", 0.0) or 0.0),
+                        "total_students": total_c
                     }
                 )
             create_audit_entry(
@@ -1900,20 +1943,62 @@ class SubmissionListView(APIView):
         }, status=status.HTTP_201_CREATED)
 
 class SubmissionDetailView(APIView):
-    permission_classes = [AllowAny]
+    permission_classes = [IsAuthenticated]
 
     def put(self, request, pk):
         user = request.user
         if not user or not getattr(user, 'is_authenticated', False):
-            email = request.data.get('email')
-            user = User.objects.filter(email=email).first() if email else None
-            if not user or not getattr(user, 'is_authenticated', False):
-                user = User.objects.first()
+            return Response({"error": "Authentication credentials were not provided."}, status=status.HTTP_401_UNAUTHORIZED)
 
         try:
             submission = Submission.objects.get(pk=pk)
         except Submission.DoesNotExist:
             return Response({"error": "Submission not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        is_owner = (submission.user_id == user.id)
+        user_role = getattr(user, 'role', None)
+        is_rep = is_user_student_rep(user)
+
+        if user_role == 'student':
+            if is_owner:
+                if submission.status in UNEDITABLE_BY_STUDENT_STATES:
+                    return Response(
+                        {"error": f"Submission cannot be edited in '{submission.status}' status."},
+                        status=status.HTTP_403_FORBIDDEN
+                    )
+                req_status = request.data.get('status')
+                if req_status and req_status != submission.status:
+                    if req_status in ('Approved', 'Verified', 'Teacher Verified', 'Student Rep Verified', 'Evaluated', 'Locked'):
+                        return Response(
+                            {"error": "Unauthorized: Students cannot alter verification or evaluation status."},
+                            status=status.HTTP_403_FORBIDDEN
+                        )
+                if request.data.get('marks') is not None and request.data.get('marks') != submission.marks:
+                    return Response(
+                        {"error": "Unauthorized: Students cannot assign evaluation marks."},
+                        status=status.HTTP_403_FORBIDDEN
+                    )
+            elif is_rep:
+                rep_classes = Class.objects.filter(
+                    Q(dqc_member=user) | Q(dqc_member__email__iexact=user.email)
+                )
+                if not (submission.user and submission.user.class_name in rep_classes):
+                    return Response(
+                        {"error": "Student representative is not assigned to this student's class."},
+                        status=status.HTTP_403_FORBIDDEN
+                    )
+                allowed_rep_statuses = {'Student Rep Verified', 'Correction Requested', 'Rejected', 'Pending Rep Verification', 'Pending', 'Submitted'}
+                req_status = request.data.get('status')
+                if req_status and req_status not in allowed_rep_statuses:
+                    return Response(
+                        {"error": f"Student representatives cannot transition submission to '{req_status}'."},
+                        status=status.HTTP_403_FORBIDDEN
+                    )
+            else:
+                return Response(
+                    {"error": "You do not have permission to modify this submission."},
+                    status=status.HTTP_403_FORBIDDEN
+                )
 
         # Check online courses & UPSC/PSC limits on update if changing criteriaId or status
         target_criteria_id = int(request.data.get('criteriaId', submission.criteria_id))
@@ -2162,16 +2247,38 @@ class SubmissionDetailView(APIView):
         })
 
     def delete(self, request, pk):
+        user = request.user
+        if not user or not getattr(user, 'is_authenticated', False):
+            return Response({"error": "Authentication credentials were not provided."}, status=status.HTTP_401_UNAUTHORIZED)
+
         try:
             submission = Submission.objects.get(pk=pk)
-            submission.delete()
         except Submission.DoesNotExist:
-            pass
-        return Response({"success": True}, status=status.HTTP_200_OK)
+            return Response({"error": "Submission not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        is_owner = (submission.user_id == user.id)
+        is_admin = bool(getattr(user, 'role', None) == 'admin' or user.is_staff or user.is_superuser)
+
+        if is_owner:
+            if submission.status in UNEDITABLE_BY_STUDENT_STATES:
+                return Response(
+                    {"error": f"Submissions in '{submission.status}' status cannot be deleted by students."},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+            submission.delete()
+            return Response({"success": True}, status=status.HTTP_200_OK)
+        elif is_admin:
+            submission.delete()
+            return Response({"success": True}, status=status.HTTP_200_OK)
+        else:
+            return Response(
+                {"error": "You do not have permission to delete this submission."},
+                status=status.HTTP_403_FORBIDDEN
+            )
 
 
 class SystemSettingView(APIView):
-    permission_classes = [AllowAny]
+    permission_classes = [IsAdminOrReadOnly]
 
     def get(self, request):
         settings_objs = SystemSetting.objects.all()
@@ -2194,7 +2301,7 @@ class SystemSettingView(APIView):
 
 
 class UserGroupListView(APIView):
-    permission_classes = [AllowAny]
+    permission_classes = [IsAdminOrReadOnly]
 
     def get(self, request):
         groups = UserGroupModel.objects.all()
@@ -2237,7 +2344,7 @@ from .models import CriteriaCategory, CriteriaItem
 from .serializers import CriteriaCategorySerializer, CriteriaItemSerializer
 
 class CriteriaCategoryListView(APIView):
-    permission_classes = [AllowAny]
+    permission_classes = [IsAdminOrReadOnly]
 
     def get(self, request):
         categories = CriteriaCategory.objects.prefetch_related('items').all().order_by('id')
@@ -2252,7 +2359,7 @@ class CriteriaCategoryListView(APIView):
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 class CriteriaCategoryDetailView(APIView):
-    permission_classes = [AllowAny]
+    permission_classes = [IsAdminRole]
 
     def put(self, request, pk):
         try:
@@ -2281,7 +2388,7 @@ class CriteriaCategoryDetailView(APIView):
 
 
 class CriteriaItemListView(APIView):
-    permission_classes = [AllowAny]
+    permission_classes = [IsAdminRole]
 
     def post(self, request):
         serializer = CriteriaItemSerializer(data=request.data)
@@ -2292,7 +2399,7 @@ class CriteriaItemListView(APIView):
 
 
 class CriteriaItemDetailView(APIView):
-    permission_classes = [AllowAny]
+    permission_classes = [IsAdminRole]
 
     def put(self, request, pk):
         try:
@@ -2315,7 +2422,7 @@ class CriteriaItemDetailView(APIView):
 
 
 class UserGroupDetailView(APIView):
-    permission_classes = [AllowAny]
+    permission_classes = [IsAdminRole]
     
     def put(self, request, pk):
         try:
@@ -2349,7 +2456,7 @@ class UserGroupDetailView(APIView):
 
 
 class ChampionListView(APIView):
-    permission_classes = [AllowAny]
+    permission_classes = [IsAdminOrPublicReadOnly]
     parser_classes = [MultiPartParser, FormParser, JSONParser]
 
     def get(self, request):
@@ -2365,7 +2472,7 @@ class ChampionListView(APIView):
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 class ChampionDetailView(APIView):
-    permission_classes = [AllowAny]
+    permission_classes = [IsAdminOrPublicReadOnly]
     parser_classes = [MultiPartParser, FormParser, JSONParser]
 
     def put(self, request, pk):

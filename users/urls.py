@@ -30,7 +30,6 @@ from .views import (
 
 urlpatterns = [
     path('auth/google/', GoogleLoginView.as_view(), name='google-login'),
-    path('auth/bypass/', DevBypassLoginView.as_view(), name='dev-bypass-login'),
     path('auth/token/refresh/', TokenRefreshView.as_view(), name='token-refresh'),
     path('auth/logout/', LogoutView.as_view(), name='auth-logout'),
     path('auth/profile/', UserProfileView.as_view(), name='user-profile'),
@@ -55,3 +54,8 @@ urlpatterns = [
     path('champions/', ChampionListView.as_view(), name='champions-list'),
     path('champions/<int:pk>/', ChampionDetailView.as_view(), name='champions-detail'),
 ]
+
+# Development bypass login endpoint is strictly registered ONLY when ENABLE_DEV_BYPASS is explicitly enabled
+if getattr(settings, 'ENABLE_DEV_BYPASS', False):
+    urlpatterns.insert(1, path('auth/bypass/', DevBypassLoginView.as_view(), name='dev-bypass-login'))
+

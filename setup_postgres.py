@@ -9,7 +9,7 @@ def setup_postgres():
     db_host = os.environ.get('DATABASE_HOST', 'localhost')
     db_port = os.environ.get('DATABASE_PORT', '5432')
     db_user = os.environ.get('DATABASE_USER', 'postgres')
-    db_pass = os.environ.get('DATABASE_PASSWORD', 'postgres')
+    db_pass = os.environ.get('DATABASE_PASSWORD', '')
     db_name = os.environ.get('DATABASE_NAME', 'marian_best_class')
     
     print(f"Connecting to PostgreSQL server at {db_host}:{db_port} as user '{db_user}'...")

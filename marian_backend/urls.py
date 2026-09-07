@@ -5,15 +5,17 @@ from django.conf import settings
 from django.conf.urls.static import static
 
 def api_root(request):
+    endpoints = {
+        "admin": "/admin/",
+        "google_auth": "/api/auth/google/",
+        "profile": "/api/auth/profile/"
+    }
+    if getattr(settings, 'ENABLE_DEV_BYPASS', False):
+        endpoints["bypass_auth"] = "/api/auth/bypass/"
     return JsonResponse({
         "status": "online",
         "message": "Marian Excellence Grid Evaluation API Server is running",
-        "endpoints": {
-            "admin": "/admin/",
-            "google_auth": "/api/auth/google/",
-            "bypass_auth": "/api/auth/bypass/",
-            "profile": "/api/auth/profile/"
-        },
+        "endpoints": endpoints,
         "frontend": "http://localhost:3000"
     })
 

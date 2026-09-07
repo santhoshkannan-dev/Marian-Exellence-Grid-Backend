@@ -140,7 +140,7 @@ class SubmissionAdmin(admin.ModelAdmin):
 
 @admin.register(AcademicGradeBreakdown)
 class AcademicGradeBreakdownAdmin(admin.ModelAdmin):
-    list_display = ('submission', 's_grade_count', 'a_plus_grade_count', 'a_grade_count', 'failed_count', 'class_pass_percentage', 'total_students')
+    list_display = ('submission', 's_grade_count', 'a_plus_grade_count', 'a_grade_count', 'other_pass_count', 'failed_count', 'class_pass_percentage', 'total_students')
 
 
 @admin.register(WorkflowAuditTrail)

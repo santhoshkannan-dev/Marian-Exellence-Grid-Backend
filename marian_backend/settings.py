@@ -19,17 +19,24 @@ if env_path.exists():
                 key, val = line.split('=', 1)
                 os.environ[key.strip()] = val.strip()
 
-# SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = os.environ.get('DJANGO_SECRET_KEY', 'django-insecure-xc(hxu)1kad%7jrb!9s4_xq79cxq-@6nr@#35^i0z09n4h4p6%')
+from django.core.exceptions import ImproperlyConfigured
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = os.environ.get('DJANGO_DEBUG', 'True') == 'True'
+DEBUG = os.environ.get("DJANGO_DEBUG", "False").lower() == "true"
 
-# SECURITY: Dev bypass login controls (Enabled by default in DEBUG mode, strictly disabled in production)
-if DEBUG:
-    ENABLE_DEV_BYPASS = os.environ.get('ENABLE_DEV_BYPASS', 'True').lower() in ('true', '1', 't')
-else:
-    ENABLE_DEV_BYPASS = False
+# SECURITY WARNING: keep the secret key used in production secret!
+SECRET_KEY = os.environ.get('DJANGO_SECRET_KEY')
+if not SECRET_KEY:
+    if DEBUG:
+        SECRET_KEY = 'django-insecure-dev-key-xc(hxu)1kad%7jrb!9s4_xq79cxq-@6nr@#35^i0z09n4h4p6%'
+    else:
+        raise ImproperlyConfigured("DJANGO_SECRET_KEY environment variable is required in production.")
+
+# SECURITY: Dev bypass login controls (Strictly fail-closed; disabled unless DEBUG and ENABLE_DEV_BYPASS are explicitly set to true)
+ENABLE_DEV_BYPASS = (
+    DEBUG and
+    os.environ.get("ENABLE_DEV_BYPASS", "False").lower() == "true"
+)
 
 ALLOWED_HOSTS = os.environ.get('DJANGO_ALLOWED_HOSTS', '*').split(',')
 
@@ -96,14 +103,26 @@ if DB_ENGINE in ('django.db.backends.sqlite3', 'sqlite'):
         }
     }
 else:
+    db_name = os.environ.get('DATABASE_NAME')
+    db_user = os.environ.get('DATABASE_USER')
+    db_password = os.environ.get('DATABASE_PASSWORD')
+    db_host = os.environ.get('DATABASE_HOST', 'localhost')
+    db_port = os.environ.get('DATABASE_PORT', '5432')
+
+    if not DEBUG and (not db_password or not db_name or not db_user):
+        raise ImproperlyConfigured(
+            "Production database configuration incomplete. "
+            "DATABASE_NAME, DATABASE_USER, and DATABASE_PASSWORD environment variables are strictly required in production."
+        )
+
     DATABASES = {
         'default': {
             'ENGINE': 'django.db.backends.postgresql',
-            'NAME': os.environ.get('DATABASE_NAME', 'marian_best_class'),
-            'USER': os.environ.get('DATABASE_USER', 'postgres'),
-            'PASSWORD': os.environ.get('DATABASE_PASSWORD', 'santhosh'),
-            'HOST': os.environ.get('DATABASE_HOST', 'localhost'),
-            'PORT': os.environ.get('DATABASE_PORT', '5432'),
+            'NAME': db_name or 'marian_best_class',
+            'USER': db_user or 'postgres',
+            'PASSWORD': db_password or '',
+            'HOST': db_host,
+            'PORT': db_port,
         }
     }
 
@@ -153,6 +172,9 @@ CORS_ALLOW_CREDENTIALS = True
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
         'rest_framework_simplejwt.authentication.JWTAuthentication',
+    ),
+    'DEFAULT_PERMISSION_CLASSES': (
+        'rest_framework.permissions.IsAuthenticated',
     ),
     'DEFAULT_THROTTLING_CLASSES': [
         'rest_framework.throttling.AnonRateThrottle',
