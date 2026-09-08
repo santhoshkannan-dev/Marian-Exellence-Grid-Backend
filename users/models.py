@@ -320,3 +320,40 @@ class Champion(models.Model):
 
     def __str__(self):
         return f"{self.year} - Rank {self.rank}: {self.teamName}"
+
+
+class BugReport(models.Model):
+    BUG_TYPE_CHOICES = [
+        ('UI', 'UI / Layout'),
+        ('Function', 'Functionality / Logic'),
+        ('Performance', 'Performance / Speed'),
+        ('Other', 'Other'),
+    ]
+
+    PRIORITY_CHOICES = [
+        ('Low', 'Low'),
+        ('Medium', 'Medium'),
+        ('High', 'High'),
+    ]
+
+    title = models.CharField(max_length=255)
+    description = models.TextField()
+    bug_type = models.CharField(max_length=50, choices=BUG_TYPE_CHOICES, default='UI')
+    priority = models.CharField(max_length=20, choices=PRIORITY_CHOICES, default='Medium')
+    browser_device = models.CharField(max_length=255, blank=True, default='')
+    page_url = models.CharField(max_length=255, blank=True, default='')
+    role_category = models.CharField(max_length=100, default='Student') # e.g. Student / Rep, Teacher / Evaluator, General
+    reporter_name = models.CharField(max_length=150, blank=True, default='')
+    reporter_email = models.CharField(max_length=150, blank=True, default='')
+    whatsapp_numbers = models.CharField(max_length=255, blank=True, default='') # Target numbers notified
+    screenshot = models.ImageField(upload_to='bug_reports/', blank=True, null=True)
+    status = models.CharField(max_length=20, default='Open') # Open, In Progress, Resolved
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"[{self.priority}] {self.title} ({self.bug_type}) - {self.status}"
+

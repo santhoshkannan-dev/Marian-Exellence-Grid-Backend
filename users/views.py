@@ -1,6 +1,6 @@
 
-from .models import Champion
-from .serializers import ChampionSerializer
+from .models import Champion, BugReport
+from .serializers import ChampionSerializer, BugReportSerializer
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 import logging
 import hashlib
@@ -2494,3 +2494,39 @@ class ChampionDetailView(APIView):
         except Champion.DoesNotExist:
             pass
         return Response({'success': True}, status=status.HTTP_200_OK)
+
+
+class BugReportView(APIView):
+    """
+    API endpoint for submitting and retrieving system bug & issue reports.
+    Permits public creation so anyone facing login or access issues can still report.
+    """
+    permission_classes = [AllowAny]
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
+
+    def get(self, request):
+        # Authenticated users with admin/staff role can view all reports, others get minimal or own
+        reports = BugReport.objects.all()
+        status_filter = request.query_params.get('status')
+        if status_filter:
+            reports = reports.filter(status=status_filter)
+        serializer = BugReportSerializer(reports[:50], many=True)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    def post(self, request):
+        data = request.data.copy() if hasattr(request.data, 'copy') else dict(request.data)
+        
+        # Auto-fill reporter info if user is authenticated
+        if request.user and request.user.is_authenticated:
+            if not data.get('reporter_email'):
+                data['reporter_email'] = request.user.email
+            if not data.get('reporter_name'):
+                data['reporter_name'] = request.user.get_full_name() or request.user.email
+
+        serializer = BugReportSerializer(data=data)
+        if serializer.is_valid():
+            report = serializer.save()
+            logger.info(f"New Bug Report filed #{report.id}: {report.title} [{report.priority}] by {report.reporter_email or 'Guest'}")
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+

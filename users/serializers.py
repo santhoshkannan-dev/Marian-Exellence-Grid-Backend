@@ -3,7 +3,7 @@ from .models import (
     Department, Course, AcademicYear, Class, User,
     CriteriaCategory, CriteriaItem, CriteriaRule, Submission,
     AcademicGradeBreakdown, WorkflowAuditTrail, ClassIndexResult,
-    Champion
+    Champion, BugReport
 )
 
 
@@ -157,5 +157,12 @@ class ChampionSerializer(serializers.ModelSerializer):
     class Meta:
         model = Champion
         fields = '__all__'
+
+
+class BugReportSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = BugReport
+        fields = '__all__'
+
 
 

@@ -118,11 +118,11 @@ else:
     DATABASES = {
         'default': {
             'ENGINE': 'django.db.backends.postgresql',
-            'NAME': db_name or 'marian_best_class',
-            'USER': db_user or 'postgres',
-            'PASSWORD': db_password or '',
-            'HOST': db_host,
-            'PORT': db_port,
+            'NAME': 'marian_best_class',
+            'USER': 'postgres',
+            'PASSWORD': 'santhosh',
+            'HOST': 'localhost',
+            'PORT': '5432',
         }
     }
 

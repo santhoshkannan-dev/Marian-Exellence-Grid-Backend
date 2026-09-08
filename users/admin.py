@@ -5,7 +5,8 @@ from django.core.exceptions import ValidationError
 from .models import (
     User, Department, Class, AcademicYear,
     CriteriaCategory, CriteriaItem, Submission,
-    AcademicGradeBreakdown, WorkflowAuditTrail, ClassIndexResult
+    AcademicGradeBreakdown, WorkflowAuditTrail, ClassIndexResult,
+    BugReport
 )
 
 # -------------------------------------------------------------------
@@ -155,3 +156,12 @@ class ClassIndexResultAdmin(admin.ModelAdmin):
     list_display = ('class_name', 'academic_year', 'academic_score', 'co_curricular_score', 'extra_curricular_score', 'final_index', 'rank', 'updated_at')
     list_filter = ('academic_year', 'class_name__department')
     search_fields = ('class_name__name', 'academic_year__year')
+
+
+@admin.register(BugReport)
+class BugReportAdmin(admin.ModelAdmin):
+    list_display = ('id', 'title', 'bug_type', 'priority', 'status', 'role_category', 'reporter_name', 'reporter_email', 'created_at')
+    list_filter = ('status', 'priority', 'bug_type', 'role_category')
+    search_fields = ('title', 'description', 'reporter_name', 'reporter_email', 'browser_device', 'page_url')
+    readonly_fields = ('created_at', 'updated_at')
+

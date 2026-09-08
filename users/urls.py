@@ -25,7 +25,8 @@ from .views import (
     CriteriaItemListView,
     CriteriaItemDetailView,
     ChampionListView,
-    ChampionDetailView
+    ChampionDetailView,
+    BugReportView
 )
 
 urlpatterns = [
@@ -53,6 +54,7 @@ urlpatterns = [
     path('criteria-items/<int:pk>/', CriteriaItemDetailView.as_view(), name='criteria-item-detail'),
     path('champions/', ChampionListView.as_view(), name='champions-list'),
     path('champions/<int:pk>/', ChampionDetailView.as_view(), name='champions-detail'),
+    path('bug-reports/', BugReportView.as_view(), name='bug-reports'),
 ]
 
 # Development bypass login endpoint is strictly registered ONLY when ENABLE_DEV_BYPASS is explicitly enabled
