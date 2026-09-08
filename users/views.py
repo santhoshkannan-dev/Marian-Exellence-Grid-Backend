@@ -27,6 +27,7 @@ from .permissions import (
 )
 
 from rest_framework_simplejwt.tokens import RefreshToken
+from rest_framework_simplejwt.views import TokenRefreshView
 
 try:
     from google.oauth2 import id_token
@@ -530,6 +531,11 @@ class GoogleLoginView(APIView):
 
             try:
                 user = User.objects.get(email=email)
+                if not user.is_active:
+                    return Response(
+                        {"error": "Account is disabled. Please contact your Administrator."},
+                        status=status.HTTP_403_FORBIDDEN
+                    )
             except User.DoesNotExist:
                 if detected_role == 'student':
                     names = full_name.split(" ", 1) if full_name else [email.split("@")[0], ""]
@@ -582,14 +588,13 @@ class GoogleLoginView(APIView):
         except ValueError as e:
             logger.warning(f"Google Token Verification Failed: {e}")
             return Response(
-                {"error": f"Invalid Google token: {str(e)}"},
+                {"error": "Invalid Google token or verification failed."},
                 status=status.HTTP_400_BAD_REQUEST
             )
         except Exception as e:
-            import traceback
-            traceback.print_exc()
+            logger.exception("Google authentication failed")
             return Response(
-                {"error": f"Google authentication failed: {str(e)}"},
+                {"error": "Google authentication failed. Please try again."},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
@@ -606,6 +611,30 @@ class LogoutView(APIView):
             return Response({"detail": "Successfully logged out."}, status=status.HTTP_200_OK)
         except Exception as e:
             return Response({"error": "Invalid or expired refresh token."}, status=status.HTTP_400_BAD_REQUEST)
+
+
+class CustomTokenRefreshView(TokenRefreshView):
+    """
+    Hardened Token Refresh View:
+    Verifies that the user account exists and is active (is_active=True).
+    Disabled/deactivated user accounts cannot refresh tokens.
+    """
+    def post(self, request, *args, **kwargs):
+        refresh_token_str = request.data.get('refresh')
+        if refresh_token_str:
+            try:
+                token = RefreshToken(refresh_token_str)
+                user_id = token.payload.get('user_id')
+                if user_id:
+                    user = User.objects.filter(id=user_id).first()
+                    if user and not user.is_active:
+                        return Response(
+                            {"detail": "User account is disabled. Please contact your Administrator.", "code": "user_inactive"},
+                            status=status.HTTP_401_UNAUTHORIZED
+                        )
+            except Exception:
+                pass
+        return super().post(request, *args, **kwargs)
 
 
 class DevBypassLoginView(APIView):
@@ -637,6 +666,11 @@ class DevBypassLoginView(APIView):
 
         try:
             user = User.objects.get(email=email)
+            if not user.is_active:
+                return Response(
+                    {"error": "Account is disabled. Please contact your Administrator."},
+                    status=status.HTTP_403_FORBIDDEN
+                )
             
             # Security: A user must never be able to select an arbitrary privileged role
             if override_role and override_role != user.role:
@@ -708,15 +742,27 @@ class UserProfileView(APIView):
         name = request.data.get('name')
         class_name_str = request.data.get('class_name')
 
-        if name:
-            parts = name.strip().split(' ', 1)
-            user.first_name = parts[0]
-            if len(parts) > 1:
-                user.last_name = parts[1]
-            else:
-                user.last_name = ""
+        if name is not None:
+            clean_name = str(name).strip()
+            if len(clean_name) > 150:
+                return Response(
+                    {"error": "Name cannot exceed 150 characters."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            if clean_name:
+                parts = clean_name.split(' ', 1)
+                user.first_name = parts[0]
+                if len(parts) > 1:
+                    user.last_name = parts[1]
+                else:
+                    user.last_name = ""
 
         if class_name_str:
+            if getattr(user, 'role', None) == 'student':
+                return Response(
+                    {"error": "Unauthorized: Students cannot alter their class assignment."},
+                    status=status.HTTP_403_FORBIDDEN
+                )
             try:
                 cls_obj = Class.objects.get(name__iexact=class_name_str)
                 user.class_name = cls_obj
@@ -759,6 +805,14 @@ class AcademicYearListView(APIView):
         if not year_str:
             return Response({"error": "year is required"}, status=status.HTTP_400_BAD_REQUEST)
 
+        year_str = str(year_str).strip()
+        import re
+        if not re.match(r'^\d{4}-\d{4}$', year_str) or len(year_str) > 20:
+            return Response(
+                {"error": "Academic year must be in format 'YYYY-YYYY' (e.g. '2025-2026') and cannot exceed 20 characters."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
         ay, created = AcademicYear.objects.get_or_create(year=year_str)
         if is_active:
             AcademicYear.objects.all().update(is_active=False)
@@ -775,6 +829,14 @@ class AcademicYearListView(APIView):
 
         if not year_str:
             return Response({"error": "year is required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        year_str = str(year_str).strip()
+        import re
+        if not re.match(r'^\d{4}-\d{4}$', year_str) or len(year_str) > 20:
+            return Response(
+                {"error": "Academic year must be in format 'YYYY-YYYY' (e.g. '2025-2026') and cannot exceed 20 characters."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
         try:
             ay = AcademicYear.objects.get(year=year_str)
@@ -856,15 +918,26 @@ class DepartmentListView(APIView):
         level = request.data.get('level', 'UG')
         if not name:
             return Response({"error": "name is required"}, status=status.HTTP_400_BAD_REQUEST)
+        clean_name = str(name).strip()
+        if len(clean_name) > 100:
+            return Response({"error": "name cannot exceed 100 characters."}, status=status.HTTP_400_BAD_REQUEST)
         if not code:
-            code = ''.join([w[0] for w in name.split()]).upper()[:5] or "DEPT"
+            code = ''.join([w[0] for w in clean_name.split()]).upper()[:5] or "DEPT"
+        clean_code = str(code).strip().upper()
+        if len(clean_code) > 20:
+            return Response({"error": "code cannot exceed 20 characters."}, status=status.HTTP_400_BAD_REQUEST)
+        if len(email_prefix) > 5:
+            return Response({"error": "email_prefix cannot exceed 5 characters."}, status=status.HTTP_400_BAD_REQUEST)
+        valid_levels = [c[0] for c in Department.LEVEL_CHOICES]
+        if level not in valid_levels:
+            return Response({"error": f"Invalid level '{level}'. Allowed choices: {', '.join(valid_levels)}."}, status=status.HTTP_400_BAD_REQUEST)
 
         dept, created = Department.objects.get_or_create(
-            code=code,
-            defaults={"name": name, "email_prefix": email_prefix, "level": level}
+            code=clean_code,
+            defaults={"name": clean_name, "email_prefix": email_prefix, "level": level}
         )
         if not created:
-            dept.name = name
+            dept.name = clean_name
             dept.email_prefix = email_prefix
             dept.level = level
             dept.save(update_fields=['name', 'email_prefix', 'level'])
@@ -897,8 +970,21 @@ class DepartmentDetailView(APIView):
         code = request.data.get('code', dept.code)
         email_prefix = request.data.get('email_prefix', dept.email_prefix).strip().lower()
         level = request.data.get('level', dept.level)
-        dept.name = name
-        dept.code = code
+
+        clean_name = str(name).strip()
+        if not clean_name or len(clean_name) > 100:
+            return Response({"error": "name is required and cannot exceed 100 characters."}, status=status.HTTP_400_BAD_REQUEST)
+        clean_code = str(code).strip().upper()
+        if not clean_code or len(clean_code) > 20:
+            return Response({"error": "code is required and cannot exceed 20 characters."}, status=status.HTTP_400_BAD_REQUEST)
+        if len(email_prefix) > 5:
+            return Response({"error": "email_prefix cannot exceed 5 characters."}, status=status.HTTP_400_BAD_REQUEST)
+        valid_levels = [c[0] for c in Department.LEVEL_CHOICES]
+        if level not in valid_levels:
+            return Response({"error": f"Invalid level '{level}'. Allowed choices: {', '.join(valid_levels)}."}, status=status.HTTP_400_BAD_REQUEST)
+
+        dept.name = clean_name
+        dept.code = clean_code
         dept.email_prefix = email_prefix
         dept.level = level
         dept.save()
@@ -940,6 +1026,19 @@ class CourseListView(APIView):
                 {"error": "department, name, abbreviation, and email_code are required"},
                 status=status.HTTP_400_BAD_REQUEST
             )
+        if len(name) > 150:
+            return Response({"error": "name cannot exceed 150 characters."}, status=status.HTTP_400_BAD_REQUEST)
+        if len(abbreviation) > 20:
+            return Response({"error": "abbreviation cannot exceed 20 characters."}, status=status.HTTP_400_BAD_REQUEST)
+        if len(email_code) > 10:
+            return Response({"error": "email_code cannot exceed 10 characters."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            dur_years = int(duration_years)
+            if dur_years < 1 or dur_years > 6:
+                return Response({"error": "duration_years must be between 1 and 6."}, status=status.HTTP_400_BAD_REQUEST)
+        except (ValueError, TypeError):
+            return Response({"error": "duration_years must be an integer between 1 and 6."}, status=status.HTTP_400_BAD_REQUEST)
+
         try:
             dept = Department.objects.get(pk=dept_id)
         except Department.DoesNotExist:
@@ -957,7 +1056,7 @@ class CourseListView(APIView):
             abbreviation=abbreviation,
             email_code=email_code,
             is_multi_batch=bool(is_multi_batch),
-            duration_years=int(duration_years),
+            duration_years=dur_years,
         )
         from .serializers import CourseSerializer
         return Response(CourseSerializer(course).data, status=status.HTTP_201_CREATED)
@@ -984,11 +1083,30 @@ class CourseDetailView(APIView):
         course = self._get_course(pk)
         if not course:
             return Response({"error": "Course not found"}, status=status.HTTP_404_NOT_FOUND)
-        course.name = request.data.get('name', course.name)
-        course.abbreviation = request.data.get('abbreviation', course.abbreviation).upper()
-        course.email_code = request.data.get('email_code', course.email_code).lower()
+
+        name = request.data.get('name', course.name)
+        abbreviation = request.data.get('abbreviation', course.abbreviation)
+        email_code = request.data.get('email_code', course.email_code)
+        if name and len(str(name).strip()) > 150:
+            return Response({"error": "name cannot exceed 150 characters."}, status=status.HTTP_400_BAD_REQUEST)
+        if abbreviation and len(str(abbreviation).strip()) > 20:
+            return Response({"error": "abbreviation cannot exceed 20 characters."}, status=status.HTTP_400_BAD_REQUEST)
+        if email_code and len(str(email_code).strip()) > 10:
+            return Response({"error": "email_code cannot exceed 10 characters."}, status=status.HTTP_400_BAD_REQUEST)
+
+        if 'duration_years' in request.data:
+            try:
+                dur_years = int(request.data['duration_years'])
+                if dur_years < 1 or dur_years > 6:
+                    return Response({"error": "duration_years must be between 1 and 6."}, status=status.HTTP_400_BAD_REQUEST)
+                course.duration_years = dur_years
+            except (ValueError, TypeError):
+                return Response({"error": "duration_years must be an integer between 1 and 6."}, status=status.HTTP_400_BAD_REQUEST)
+
+        course.name = str(name).strip()
+        course.abbreviation = str(abbreviation).strip().upper()
+        course.email_code = str(email_code).strip().lower()
         course.is_multi_batch = request.data.get('is_multi_batch', course.is_multi_batch)
-        course.duration_years = int(request.data.get('duration_years', course.duration_years))
         if 'department' in request.data:
             try:
                 course.department = Department.objects.get(pk=request.data['department'])
@@ -1054,6 +1172,12 @@ class ClassListView(APIView):
 
     def post(self, request):
         """Create a new class. Accepts either dept_code (legacy) or course_id + year_number + section."""
+        user = request.user
+        if not (user and user.is_authenticated and (getattr(user, 'role', None) in ('admin', 'iqac') or user.is_staff or user.is_superuser)):
+            return Response(
+                {"error": "Unauthorized: Only administrators and IQAC coordinators can create classes."},
+                status=status.HTTP_403_FORBIDDEN
+            )
         course_id = request.data.get('course_id')
         dept_code = request.data.get('department_code')
         name = request.data.get('name', '').strip()
@@ -1115,6 +1239,13 @@ class ClassListView(APIView):
 
 
     def put(self, request):
+        user = request.user
+        user_role = getattr(user, 'role', None)
+        if user_role in ('student', 'evaluation'):
+            return Response(
+                {"error": "Unauthorized: You do not have permission to modify classes."},
+                status=status.HTTP_403_FORBIDDEN
+            )
         name = request.data.get('name')
         teacher_email = request.data.get('classTeacher')
         dqc_email = request.data.get('dqcMember')
@@ -1126,6 +1257,20 @@ class ClassListView(APIView):
             cls = Class.objects.get(name=name)
         except Class.DoesNotExist:
             return Response({"error": f"Class '{name}' not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        if user_role == 'faculty':
+            is_own_class = (cls.class_teacher_id == user.id)
+            is_claiming_unassigned = (cls.class_teacher is None and teacher_email == user.email)
+            if not (is_own_class or is_claiming_unassigned):
+                return Response(
+                    {"error": "Unauthorized: Faculty can only manage their own advised class."},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+            if teacher_email is not None and teacher_email != (cls.class_teacher.email if cls.class_teacher else user.email):
+                return Response(
+                    {"error": "Unauthorized: Only administrators can reassign class advisors."},
+                    status=status.HTTP_403_FORBIDDEN
+                )
 
         if teacher_email is not None:
             if teacher_email == "":
@@ -1242,34 +1387,81 @@ class ClassDetailView(APIView):
         return Response({"success": True, "deleted": class_name})
 
     def patch(self, request, pk):
+        user = request.user
+        user_role = getattr(user, 'role', None)
+        if user_role in ('student', 'evaluation'):
+            return Response(
+                {"error": "Unauthorized: You do not have permission to modify classes."},
+                status=status.HTTP_403_FORBIDDEN
+            )
         cls = self._get_cls(pk)
         if not cls:
             return Response({"error": "Class not found"}, status=status.HTTP_404_NOT_FOUND)
 
+        if user_role == 'faculty':
+            if cls.class_teacher_id != user.id:
+                return Response(
+                    {"error": "Unauthorized: Faculty can only manage their own advised class."},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+            if 'classTeacher' in request.data and request.data.get('classTeacher') != (cls.class_teacher.email if cls.class_teacher else ''):
+                return Response(
+                    {"error": "Unauthorized: Only administrators can reassign class advisors."},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+
         update_fields = []
         if 'num_students' in request.data:
             try:
-                cls.num_students = int(request.data['num_students'])
+                num_val = int(request.data['num_students'])
+                if num_val < 0 or num_val > 1000:
+                    return Response({"error": "num_students must be between 0 and 1000."}, status=status.HTTP_400_BAD_REQUEST)
+                cls.num_students = num_val
                 update_fields.append('num_students')
             except (ValueError, TypeError):
-                return Response({"error": "num_students must be an integer"}, status=status.HTTP_400_BAD_REQUEST)
+                return Response({"error": "num_students must be an integer between 0 and 1000."}, status=status.HTTP_400_BAD_REQUEST)
         if 'negative_points' in request.data:
             try:
-                cls.negative_points = abs(float(request.data['negative_points']))
+                neg_val = float(request.data['negative_points'])
+                if neg_val < 0 or neg_val > 10000:
+                    return Response({"error": "negative_points must be between 0 and 10000."}, status=status.HTTP_400_BAD_REQUEST)
+                cls.negative_points = neg_val
                 update_fields.append('negative_points')
             except (ValueError, TypeError):
-                return Response({"error": "negative_points must be a number"}, status=status.HTTP_400_BAD_REQUEST)
+                return Response({"error": "negative_points must be a valid number between 0 and 10000."}, status=status.HTTP_400_BAD_REQUEST)
         if 'name' in request.data:
-            cls.name = request.data['name']
+            clean_name = str(request.data['name']).strip()
+            if not clean_name or len(clean_name) > 100:
+                return Response({"error": "Class name cannot be empty or exceed 100 characters."}, status=status.HTTP_400_BAD_REQUEST)
+            cls.name = clean_name
             update_fields.append('name')
         if 'year_number' in request.data:
-            cls.year_number = int(request.data['year_number'])
-            update_fields.append('year_number')
+            try:
+                yn = int(request.data['year_number'])
+                if yn < 1 or yn > 6:
+                    return Response({"error": "year_number must be between 1 and 6."}, status=status.HTTP_400_BAD_REQUEST)
+                cls.year_number = yn
+                update_fields.append('year_number')
+            except (ValueError, TypeError):
+                return Response({"error": "year_number must be an integer between 1 and 6."}, status=status.HTTP_400_BAD_REQUEST)
         if 'section' in request.data:
-            cls.section = request.data['section'].strip().upper()
+            sec = str(request.data['section']).strip().upper()
+            if len(sec) > 5:
+                return Response({"error": "section cannot exceed 5 characters."}, status=status.HTTP_400_BAD_REQUEST)
+            cls.section = sec
             update_fields.append('section')
         if 'batch_start_year' in request.data:
-            cls.batch_start_year = int(request.data['batch_start_year']) if request.data['batch_start_year'] else None
+            bsy = request.data['batch_start_year']
+            if bsy:
+                try:
+                    bsy_int = int(bsy)
+                    if bsy_int < 2000 or bsy_int > 2100:
+                        return Response({"error": "batch_start_year must be between 2000 and 2100."}, status=status.HTTP_400_BAD_REQUEST)
+                    cls.batch_start_year = bsy_int
+                except (ValueError, TypeError):
+                    return Response({"error": "batch_start_year must be an integer between 2000 and 2100."}, status=status.HTTP_400_BAD_REQUEST)
+            else:
+                cls.batch_start_year = None
             update_fields.append('batch_start_year')
 
         if update_fields:
@@ -1278,9 +1470,31 @@ class ClassDetailView(APIView):
 
     def put(self, request, pk):
         """Full update — handles class_teacher, dqcMember, and all moderation fields."""
+        user = request.user
+        user_role = getattr(user, 'role', None)
+        if user_role in ('student', 'evaluation'):
+            return Response(
+                {"error": "Unauthorized: You do not have permission to modify classes."},
+                status=status.HTTP_403_FORBIDDEN
+            )
         cls = self._get_cls(pk)
         if not cls:
             return Response({"error": "Class not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        if user_role == 'faculty':
+            teacher_email_check = request.data.get('classTeacher')
+            is_own_class = (cls.class_teacher_id == user.id)
+            is_claiming_unassigned = (cls.class_teacher is None and teacher_email_check == user.email)
+            if not (is_own_class or is_claiming_unassigned):
+                return Response(
+                    {"error": "Unauthorized: Faculty can only manage their own advised class."},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+            if teacher_email_check is not None and teacher_email_check != (cls.class_teacher.email if cls.class_teacher else user.email):
+                return Response(
+                    {"error": "Unauthorized: Only administrators can reassign class advisors."},
+                    status=status.HTTP_403_FORBIDDEN
+                )
 
         teacher_email = request.data.get('classTeacher')
         dqc_email = request.data.get('dqcMember')
@@ -1337,22 +1551,50 @@ class ClassDetailView(APIView):
 
         if 'num_students' in request.data:
             try:
-                cls.num_students = int(request.data['num_students'])
+                num_val = int(request.data['num_students'])
+                if num_val < 0 or num_val > 1000:
+                    return Response({"error": "num_students must be between 0 and 1000."}, status=status.HTTP_400_BAD_REQUEST)
+                cls.num_students = num_val
             except (ValueError, TypeError):
-                return Response({"error": "num_students must be an integer"}, status=status.HTTP_400_BAD_REQUEST)
+                return Response({"error": "num_students must be an integer between 0 and 1000."}, status=status.HTTP_400_BAD_REQUEST)
         if 'negative_points' in request.data:
             try:
-                cls.negative_points = abs(float(request.data['negative_points']))
+                neg_val = float(request.data['negative_points'])
+                if neg_val < 0 or neg_val > 10000:
+                    return Response({"error": "negative_points must be between 0 and 10000."}, status=status.HTTP_400_BAD_REQUEST)
+                cls.negative_points = neg_val
             except (ValueError, TypeError):
-                return Response({"error": "negative_points must be a number"}, status=status.HTTP_400_BAD_REQUEST)
+                return Response({"error": "negative_points must be a valid number between 0 and 10000."}, status=status.HTTP_400_BAD_REQUEST)
         if 'name' in request.data:
-            cls.name = request.data['name']
+            clean_name = str(request.data['name']).strip()
+            if not clean_name or len(clean_name) > 100:
+                return Response({"error": "Class name cannot be empty or exceed 100 characters."}, status=status.HTTP_400_BAD_REQUEST)
+            cls.name = clean_name
         if 'year_number' in request.data:
-            cls.year_number = int(request.data['year_number'])
+            try:
+                yn = int(request.data['year_number'])
+                if yn < 1 or yn > 6:
+                    return Response({"error": "year_number must be between 1 and 6."}, status=status.HTTP_400_BAD_REQUEST)
+                cls.year_number = yn
+            except (ValueError, TypeError):
+                return Response({"error": "year_number must be an integer between 1 and 6."}, status=status.HTTP_400_BAD_REQUEST)
         if 'section' in request.data:
-            cls.section = request.data['section'].strip().upper()
+            sec = str(request.data['section']).strip().upper()
+            if len(sec) > 5:
+                return Response({"error": "section cannot exceed 5 characters."}, status=status.HTTP_400_BAD_REQUEST)
+            cls.section = sec
         if 'batch_start_year' in request.data:
-            cls.batch_start_year = int(request.data['batch_start_year']) if request.data['batch_start_year'] else None
+            bsy = request.data['batch_start_year']
+            if bsy:
+                try:
+                    bsy_int = int(bsy)
+                    if bsy_int < 2000 or bsy_int > 2100:
+                        return Response({"error": "batch_start_year must be between 2000 and 2100."}, status=status.HTTP_400_BAD_REQUEST)
+                    cls.batch_start_year = bsy_int
+                except (ValueError, TypeError):
+                    return Response({"error": "batch_start_year must be an integer between 2000 and 2100."}, status=status.HTTP_400_BAD_REQUEST)
+            else:
+                cls.batch_start_year = None
         if 'course' in request.data:
             try:
                 cls.course = Course.objects.get(pk=request.data['course'])
@@ -1481,11 +1723,24 @@ class UserManagementView(APIView):
         if not email:
             return Response({"error": "email is required"}, status=status.HTTP_400_BAD_REQUEST)
 
-        username = email.split('@')[0]
+        clean_email = str(email).strip().lower()
+        import re
+        if not re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', clean_email) or len(clean_email) > 254:
+            return Response({"error": "Invalid email address format."}, status=status.HTTP_400_BAD_REQUEST)
+
+        valid_roles = [c[0] for c in User.ROLE_CHOICES]
+        if role not in valid_roles:
+            return Response({"error": f"Invalid role '{role}'. Allowed roles: {', '.join(valid_roles)}."}, status=status.HTTP_400_BAD_REQUEST)
+
+        clean_name = str(name).strip()
+        if clean_name and len(clean_name) > 150:
+            return Response({"error": "name cannot exceed 150 characters."}, status=status.HTTP_400_BAD_REQUEST)
+
+        username = clean_email.split('@')[0]
         dept = Department.objects.filter(code=dept_code).first() if dept_code else None
         cls = Class.objects.filter(name=class_name_str).first() if class_name_str else None
 
-        names = name.split(' ', 1)
+        names = clean_name.split(' ', 1) if clean_name else [username, ""]
         first_name = names[0]
         last_name = names[1] if len(names) > 1 else ""
 
@@ -1674,11 +1929,11 @@ class SubmissionListView(APIView):
                 queryset = queryset.filter(user=user)
         elif getattr(user, 'role', None) == 'faculty':
             advised_classes = Class.objects.filter(class_teacher=user)
-            if advised_classes.exists():
-                queryset = queryset.filter(
-                    Q(user__class_name__in=advised_classes) |
-                    Q(user__department=user.department)
-                )
+            dept_q = Q(user__department=user.department) if user.department else Q(pk__in=[])
+            if advised_classes.exists() or user.department:
+                queryset = queryset.filter(Q(user__class_name__in=advised_classes) | dept_q)
+            else:
+                queryset = queryset.none()
             
         academic_year = request.query_params.get('academicYear')
         if academic_year:
@@ -1724,8 +1979,34 @@ class SubmissionListView(APIView):
             return Response({"error": "Authentication credentials were not provided."}, status=status.HTTP_401_UNAUTHORIZED)
 
         criteria_id = request.data.get('criteriaId')
+        if not criteria_id:
+            return Response({"error": "criteriaId is required"}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            criteria_id_int = int(criteria_id)
+        except (ValueError, TypeError):
+            return Response({"error": "criteriaId must be a valid integer ID."}, status=status.HTTP_400_BAD_REQUEST)
+
+        criteria_item = CriteriaItem.objects.filter(pk=criteria_id_int).first()
+        if not criteria_item:
+            return Response({"error": f"Criteria item with id '{criteria_id_int}' does not exist."}, status=status.HTTP_404_NOT_FOUND)
+
         academic_year = request.data.get('academicYear', '2025-2026')
+        clean_ay = str(academic_year).strip()
+        import re
+        if not re.match(r'^\d{4}-\d{4}$', clean_ay) or len(clean_ay) > 20:
+            return Response({"error": "academicYear must be in format 'YYYY-YYYY' (e.g. '2025-2026') and cannot exceed 20 characters."}, status=status.HTTP_400_BAD_REQUEST)
+        if not (AcademicYear.objects.filter(year=clean_ay).exists() or CriteriaVersion.objects.filter(academic_year=clean_ay).exists()):
+            return Response({"error": f"Academic year '{clean_ay}' does not exist in the system."}, status=status.HTTP_400_BAD_REQUEST)
+        academic_year = clean_ay
+
         description = request.data.get('description', '')
+        clean_desc = str(description).strip()
+        if not clean_desc:
+            return Response({"error": "description is required and cannot be empty."}, status=status.HTTP_400_BAD_REQUEST)
+        if len(clean_desc) > 5000:
+            return Response({"error": "description cannot exceed 5000 characters."}, status=status.HTTP_400_BAD_REQUEST)
+        description = clean_desc
+
         raw_status = request.data.get('status')
         user_role = getattr(user, 'role', None)
 
@@ -1744,45 +2025,55 @@ class SubmissionListView(APIView):
                 return Response({"error": f"Invalid status: '{status_val}'."}, status=status.HTTP_400_BAD_REQUEST)
 
         remarks = request.data.get('remarks', '')
+        if remarks and len(str(remarks)) > 2000:
+            return Response({"error": "remarks cannot exceed 2000 characters."}, status=status.HTTP_400_BAD_REQUEST)
+
+        proof = request.data.get('proof', '')
+        if proof and len(str(proof)) > 255:
+            return Response({"error": "proof reference cannot exceed 255 characters."}, status=status.HTTP_400_BAD_REQUEST)
+
+        event_id = request.data.get('eventId', '')
+        if event_id and len(str(event_id)) > 100:
+            return Response({"error": "eventId cannot exceed 100 characters."}, status=status.HTTP_400_BAD_REQUEST)
+
         evidence = request.data.get('evidence')
+        start_date = request.data.get('start_date') or request.data.get('startDate')
+        if not start_date and isinstance(evidence, dict):
+            start_date = evidence.get('startDate') or evidence.get('examDate')
+        if start_date and len(str(start_date)) > 50:
+            return Response({"error": "start_date cannot exceed 50 characters."}, status=status.HTTP_400_BAD_REQUEST)
+
+        end_date = request.data.get('end_date') or request.data.get('endDate')
+        if not end_date and isinstance(evidence, dict):
+            end_date = evidence.get('endDate')
+        if end_date and len(str(end_date)) > 50:
+            return Response({"error": "end_date cannot exceed 50 characters."}, status=status.HTTP_400_BAD_REQUEST)
+
         marks = request.data.get('marks')
         if marks is not None and user and user_role == 'student':
             marks = None
         elif marks is not None:
             try:
                 req_marks = float(marks)
-                criteria_item = CriteriaItem.objects.filter(pk=criteria_id).first()
-                if criteria_item:
-                    allowed_min, allowed_max, details = get_criteria_allowed_bounds(criteria_item, evidence)
-                    is_negative = (criteria_item.type in ('negative', 'academic_grades')) or (allowed_min < 0)
-                    if req_marks < 0 and not is_negative:
-                        return Response(
-                            {"error": f"Score ({req_marks}) cannot be negative for non-penalty criteria."},
-                            status=status.HTTP_400_BAD_REQUEST
-                        )
-                    if req_marks > (allowed_max + 1e-5):
-                        return Response(
-                            {"error": f"Requested score ({req_marks}) exceeds the maximum allowed limit ({allowed_max}) for criteria '{criteria_item.title}'{details}."},
-                            status=status.HTTP_400_BAD_REQUEST
-                        )
-                    if allowed_min is not None and req_marks < (allowed_min - 1e-5):
-                        return Response(
-                            {"error": f"Requested score ({req_marks}) is below the minimum allowed limit ({allowed_min}) for criteria '{criteria_item.title}'."},
-                            status=status.HTTP_400_BAD_REQUEST
-                        )
+                allowed_min, allowed_max, details = get_criteria_allowed_bounds(criteria_item, evidence)
+                is_negative = (criteria_item.type in ('negative', 'academic_grades')) or (allowed_min < 0)
+                if req_marks < 0 and not is_negative:
+                    return Response(
+                        {"error": f"Score ({req_marks}) cannot be negative for non-penalty criteria."},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+                if req_marks > (allowed_max + 1e-5):
+                    return Response(
+                        {"error": f"Requested score ({req_marks}) exceeds the maximum allowed limit ({allowed_max}) for criteria '{criteria_item.title}'{details}."},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+                if allowed_min is not None and req_marks < (allowed_min - 1e-5):
+                    return Response(
+                        {"error": f"Requested score ({req_marks}) is below the minimum allowed limit ({allowed_min}) for criteria '{criteria_item.title}'."},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
             except (ValueError, TypeError):
                 return Response({"error": "Invalid marks value provided."}, status=status.HTTP_400_BAD_REQUEST)
-        proof = request.data.get('proof', '')
-        event_id = request.data.get('eventId', '')
-        start_date = request.data.get('start_date') or request.data.get('startDate')
-        if not start_date and isinstance(evidence, dict):
-            start_date = evidence.get('startDate') or evidence.get('examDate')
-        end_date = request.data.get('end_date') or request.data.get('endDate')
-        if not end_date and isinstance(evidence, dict):
-            end_date = evidence.get('endDate')
-        
-        if not criteria_id:
-            return Response({"error": "criteriaId is required"}, status=status.HTTP_400_BAD_REQUEST)
             
         # Check submission limits for Online Courses and UPSC/PSC Exams
         try:
@@ -1842,6 +2133,8 @@ class SubmissionListView(APIView):
         cert_id = request.data.get('certificateId') or request.data.get('eventId')
         if not cert_id and isinstance(evidence, dict):
             cert_id = evidence.get('certificateId') or evidence.get('certId') or evidence.get('startupGovtId') or evidence.get('eventId')
+        if cert_id and len(str(cert_id)) > 100:
+            return Response({"error": "certificateId/identifier cannot exceed 100 characters."}, status=status.HTTP_400_BAD_REQUEST)
         
         proof_h = request.data.get('proofHash')
         if not proof_h and isinstance(evidence, dict):
@@ -1860,11 +2153,6 @@ class SubmissionListView(APIView):
         )
         if dup_err:
             return Response({"error": dup_err}, status=status.HTTP_400_BAD_REQUEST)
-
-        try:
-            criteria_id_int = int(criteria_id)
-        except (ValueError, TypeError):
-            criteria_id_int = abs(int(hashlib.md5(str(criteria_id).encode()).hexdigest(), 16)) % 1000000
 
         # Resolve active CriteriaVersion for submission's academic_year
         active_cv = CriteriaVersion.objects.filter(academic_year=academic_year, is_locked=False).order_by('-version').first()
@@ -1922,7 +2210,8 @@ class SubmissionListView(APIView):
                 end_date=end_date
             )
         except Exception as e:
-            return Response({"error": f"Failed to create submission: {str(e)}"}, status=status.HTTP_400_BAD_REQUEST)
+            logger.exception("Failed to create submission")
+            return Response({"error": "Failed to create submission. Please verify your input data."}, status=status.HTTP_400_BAD_REQUEST)
         
         # Sync relational models (AcademicGradeBreakdown & WorkflowAuditTrail)
         try:
@@ -2093,7 +2382,39 @@ class SubmissionDetailView(APIView):
                     {"error": "Faculty cannot modify submissions outside their advised class or department."},
                     status=status.HTTP_403_FORBIDDEN
                 )
-        elif user.is_superuser or user_role in ('admin', 'iqac', 'evaluation'):
+            if 'marks' in request.data and request.data.get('marks') is not None and request.data.get('marks') != submission.marks:
+                return Response(
+                    {"error": "Unauthorized: Faculty cannot assign evaluation marks."},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+            if 'evaluatorRemarks' in request.data and request.data.get('evaluatorRemarks') != submission.evaluator_remarks:
+                return Response(
+                    {"error": "Unauthorized: Faculty cannot assign evaluator remarks."},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+            if 'evaluatorVerified' in request.data and request.data.get('evaluatorVerified') != submission.evaluator_verified:
+                return Response(
+                    {"error": "Unauthorized: Faculty cannot alter evaluator verification status."},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+        elif user_role == 'evaluation':
+            req_c_val = request.data.get('criteriaId', submission.criteria_id)
+            try:
+                req_criteria_id = int(req_c_val)
+            except (ValueError, TypeError):
+                return Response({"error": "criteriaId must be a valid integer ID."}, status=status.HTTP_400_BAD_REQUEST)
+            criteria_item = CriteriaItem.objects.filter(pk=req_criteria_id).select_related('category').first()
+            if not criteria_item:
+                return Response({"error": f"Criteria item with id '{req_criteria_id}' does not exist."}, status=status.HTTP_404_NOT_FOUND)
+            if criteria_item and criteria_item.category and criteria_item.category.evaluators:
+                cat_evaluators = [str(e).strip().lower() for e in criteria_item.category.evaluators if e]
+                user_email = (user.email or '').strip().lower()
+                if cat_evaluators and user_email not in cat_evaluators:
+                    return Response(
+                        {"error": "Unauthorized: Evaluator is not assigned to evaluate this criteria category."},
+                        status=status.HTTP_403_FORBIDDEN
+                    )
+        elif user.is_superuser or user_role in ('admin', 'iqac'):
             pass
         else:
             return Response(
@@ -2101,8 +2422,50 @@ class SubmissionDetailView(APIView):
                 status=status.HTTP_403_FORBIDDEN
             )
 
+        # Validate criteriaId existence on update
+        if 'criteriaId' in request.data and request.data.get('criteriaId') is not None:
+            try:
+                target_criteria_id = int(request.data['criteriaId'])
+            except (ValueError, TypeError):
+                return Response({"error": "criteriaId must be a valid integer ID."}, status=status.HTTP_400_BAD_REQUEST)
+            c_check = CriteriaItem.objects.filter(pk=target_criteria_id).first()
+            if not c_check:
+                return Response({"error": f"Criteria item with id '{target_criteria_id}' does not exist."}, status=status.HTTP_404_NOT_FOUND)
+        else:
+            target_criteria_id = int(submission.criteria_id)
+
+        # Validate academicYear on update
+        if 'academicYear' in request.data and request.data.get('academicYear') is not None:
+            upd_ay = str(request.data['academicYear']).strip()
+            import re
+            if not re.match(r'^\d{4}-\d{4}$', upd_ay) or len(upd_ay) > 20:
+                return Response({"error": "academicYear must be in format 'YYYY-YYYY' (e.g. '2025-2026') and cannot exceed 20 characters."}, status=status.HTTP_400_BAD_REQUEST)
+            if not (AcademicYear.objects.filter(year=upd_ay).exists() or CriteriaVersion.objects.filter(academic_year=upd_ay).exists()):
+                return Response({"error": f"Academic year '{upd_ay}' does not exist in the system."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Validate string lengths on update
+        if 'description' in request.data:
+            clean_d = str(request.data['description']).strip()
+            if not clean_d:
+                return Response({"error": "description cannot be empty."}, status=status.HTTP_400_BAD_REQUEST)
+            if len(clean_d) > 5000:
+                return Response({"error": "description cannot exceed 5000 characters."}, status=status.HTTP_400_BAD_REQUEST)
+        if 'remarks' in request.data and request.data.get('remarks') and len(str(request.data['remarks'])) > 2000:
+            return Response({"error": "remarks cannot exceed 2000 characters."}, status=status.HTTP_400_BAD_REQUEST)
+        if 'proof' in request.data and request.data.get('proof') and len(str(request.data['proof'])) > 255:
+            return Response({"error": "proof cannot exceed 255 characters."}, status=status.HTTP_400_BAD_REQUEST)
+        if 'eventId' in request.data and request.data.get('eventId') and len(str(request.data['eventId'])) > 100:
+            return Response({"error": "eventId cannot exceed 100 characters."}, status=status.HTTP_400_BAD_REQUEST)
+        if 'certificateId' in request.data and request.data.get('certificateId') and len(str(request.data['certificateId'])) > 100:
+            return Response({"error": "certificateId cannot exceed 100 characters."}, status=status.HTTP_400_BAD_REQUEST)
+        if 'repRemarks' in request.data and request.data.get('repRemarks') and len(str(request.data['repRemarks'])) > 2000:
+            return Response({"error": "repRemarks cannot exceed 2000 characters."}, status=status.HTTP_400_BAD_REQUEST)
+        if 'teacherRemarks' in request.data and request.data.get('teacherRemarks') and len(str(request.data['teacherRemarks'])) > 2000:
+            return Response({"error": "teacherRemarks cannot exceed 2000 characters."}, status=status.HTTP_400_BAD_REQUEST)
+        if 'evaluatorRemarks' in request.data and request.data.get('evaluatorRemarks') and len(str(request.data['evaluatorRemarks'])) > 2000:
+            return Response({"error": "evaluatorRemarks cannot exceed 2000 characters."}, status=status.HTTP_400_BAD_REQUEST)
+
         # Check online courses & UPSC/PSC limits on update if changing criteriaId or status
-        target_criteria_id = int(request.data.get('criteriaId', submission.criteria_id))
         target_status = request.data.get('status', submission.status)
         online_item_ids = get_online_courses_item_ids()
         if target_criteria_id in online_item_ids and target_status != 'Rejected':
@@ -2315,20 +2678,56 @@ class SubmissionDetailView(APIView):
             prev_status = submission.status
             if 'status' in request.data:
                 submission.status = request.data.get('status')
-                if user and user.role != 'student':
-                    submission.verified_by_name = user.get_full_name() or user.username
-            if 'verifiedByName' in request.data and request.data.get('verifiedByName'):
-                submission.verified_by_name = request.data.get('verifiedByName')
+
+            # Authoritative verifier tracking based on authenticated session actor
+            actor_name = user.get_full_name() or user.username
+            if user_role == 'student':
+                if is_rep and submission.status in ('Student Rep Verified', 'Correction Requested', 'Rejected', 'Pending Rep Verification'):
+                    submission.rep_verified_by_name = actor_name
+                    if 'repRemarks' in request.data:
+                        submission.rep_remarks = request.data.get('repRemarks')
+                    submission.verified_by_name = actor_name
+            elif user_role == 'faculty':
+                if submission.status in ('Teacher Verified', 'Correction Requested', 'Rejected', 'Student Rep Verified'):
+                    submission.teacher_verified_by_name = actor_name
+                    if 'teacherRemarks' in request.data:
+                        submission.teacher_remarks = request.data.get('teacherRemarks')
+                    submission.verified_by_name = actor_name
+                elif 'teacherRemarks' in request.data:
+                    submission.teacher_remarks = request.data.get('teacherRemarks')
+            elif user_role == 'evaluation':
+                if submission.status in ('Evaluated', 'Approved', 'Verified'):
+                    submission.evaluator_verified_by_name = actor_name
+                    submission.evaluator_verified = True
+                    submission.verified_by_name = actor_name
+                if 'evaluatorRemarks' in request.data:
+                    submission.evaluator_remarks = request.data.get('evaluatorRemarks')
+                if 'marks' in request.data and request.data.get('marks') is not None:
+                    submission.marks = request.data.get('marks')
+            elif user_role in ('admin', 'iqac') or user.is_superuser:
+                submission.verified_by_name = actor_name
+                if 'teacherRemarks' in request.data:
+                    submission.teacher_remarks = request.data.get('teacherRemarks')
+                    submission.teacher_verified_by_name = actor_name
+                if 'repRemarks' in request.data:
+                    submission.rep_remarks = request.data.get('repRemarks')
+                    submission.rep_verified_by_name = actor_name
+                if 'evaluatorRemarks' in request.data:
+                    submission.evaluator_remarks = request.data.get('evaluatorRemarks')
+                    submission.evaluator_verified_by_name = actor_name
+                if 'marks' in request.data and request.data.get('marks') is not None:
+                    submission.marks = request.data.get('marks')
+                if 'evaluatorVerified' in request.data:
+                    submission.evaluator_verified = bool(request.data.get('evaluatorVerified'))
+
             if 'remarks' in request.data:
                 submission.remarks = request.data.get('remarks')
-            if 'marks' in request.data:
-                submission.marks = request.data.get('marks')
             if 'proof' in request.data:
                 submission.proof = request.data.get('proof')
             if 'eventId' in request.data:
                 submission.event_id = request.data.get('eventId')
             if 'evidence' in request.data:
-                submission.evidence = request.data.get('evidence')
+                submission.evidence = upd_ev
             if 'start_date' in request.data or 'startDate' in request.data:
                 submission.start_date = request.data.get('start_date') or request.data.get('startDate')
             elif 'evidence' in request.data and isinstance(request.data.get('evidence'), dict):
@@ -2342,18 +2741,6 @@ class SubmissionDetailView(APIView):
                 ev = request.data.get('evidence')
                 if ev.get('endDate'):
                     submission.end_date = ev.get('endDate')
-            if 'repVerifiedByName' in request.data:
-                submission.rep_verified_by_name = request.data.get('repVerifiedByName')
-            if 'repRemarks' in request.data:
-                submission.rep_remarks = request.data.get('repRemarks')
-            if 'teacherVerifiedByName' in request.data:
-                submission.teacher_verified_by_name = request.data.get('teacherVerifiedByName')
-            if 'teacherRemarks' in request.data:
-                submission.teacher_remarks = request.data.get('teacherRemarks')
-            if 'evaluatorVerifiedByName' in request.data:
-                submission.evaluator_verified_by_name = request.data.get('evaluatorVerifiedByName')
-            if 'evaluatorRemarks' in request.data:
-                submission.evaluator_remarks = request.data.get('evaluatorRemarks')
 
             submission.save()
 
@@ -2435,15 +2822,22 @@ class SystemSettingView(APIView):
         return Response(data, status=status.HTTP_200_OK)
 
     def post(self, request):
+        if not isinstance(request.data, dict):
+            return Response({"error": "Payload must be a dictionary of key-value settings."}, status=status.HTTP_400_BAD_REQUEST)
         for key, value in request.data.items():
+            clean_k = str(key).strip()
+            if not clean_k or len(clean_k) > 100:
+                return Response({"error": "Setting key must be non-empty and <= 100 characters."}, status=status.HTTP_400_BAD_REQUEST)
             if isinstance(value, bool):
                 val_str = 'true' if value else 'false'
             elif value is None:
                 val_str = ''
             else:
                 val_str = str(value)
+            if len(val_str) > 5000:
+                return Response({"error": f"Setting value for '{clean_k}' cannot exceed 5000 characters."}, status=status.HTTP_400_BAD_REQUEST)
             SystemSetting.objects.update_or_create(
-                key=key,
+                key=clean_k,
                 defaults={'value': val_str}
             )
         return Response({"success": True}, status=status.HTTP_200_OK)
@@ -2474,11 +2868,22 @@ class UserGroupListView(APIView):
         if not group_id or not name:
             return Response({"error": "id and name are required"}, status=status.HTTP_400_BAD_REQUEST)
 
+        clean_id = str(group_id).strip()
+        clean_name = str(name).strip()
+        if len(clean_id) > 100:
+            return Response({"error": "id cannot exceed 100 characters."}, status=status.HTTP_400_BAD_REQUEST)
+        if len(clean_name) > 150:
+            return Response({"error": "name cannot exceed 150 characters."}, status=status.HTTP_400_BAD_REQUEST)
+        if description and len(str(description)) > 2000:
+            return Response({"error": "description cannot exceed 2000 characters."}, status=status.HTTP_400_BAD_REQUEST)
+        if not isinstance(members, list):
+            return Response({"error": "members must be a list of email strings."}, status=status.HTTP_400_BAD_REQUEST)
+
         group, _ = UserGroupModel.objects.update_or_create(
-            group_id=group_id,
+            group_id=clean_id,
             defaults={
-                'name': name,
-                'description': description,
+                'name': clean_name,
+                'description': str(description),
                 'members': members
             }
         )

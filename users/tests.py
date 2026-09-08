@@ -1270,6 +1270,735 @@ class Phase1SecurityRemediationRegressionTest(TestCase):
         self.assertEqual(validate_google_client_id(debug=False, client_id='google-id-123'), 'google-id-123')
 
 
+class Phase2AuthorizationHardeningRegressionTest(TestCase):
+    """
+    Phase 2 Regression Tests: Backend RBAC, Object-Level Authorization,
+    Privilege Escalation Prevention, and Authentication Lifecycle Hardening.
+    """
+    def setUp(self):
+        self.client = APIClient()
+        self.ay = AcademicYear.objects.create(year='2026-2027', is_active=True)
+
+        # Departments & Classes
+        self.dept_cs = Department.objects.create(name='Dept of Computer Science', code='DCS', email_prefix='u', level='UG')
+        self.dept_comm = Department.objects.create(name='Dept of Commerce', code='DCOM', email_prefix='u', level='UG')
+
+        self.course_bca = Course.objects.create(department=self.dept_cs, name='BCA', abbreviation='BCA', email_code='bc')
+        self.course_bcom = Course.objects.create(department=self.dept_comm, name='BCom', abbreviation='BCOM', email_code='cm')
+
+        self.class_bca_a = Class.objects.create(department=self.dept_cs, course=self.course_bca, year_number=1, name='I BCA A')
+        self.class_bca_b = Class.objects.create(department=self.dept_cs, course=self.course_bca, year_number=1, name='I BCA B')
+        self.class_bcom = Class.objects.create(department=self.dept_comm, course=self.course_bcom, year_number=1, name='I BCOM')
+
+        # Users
+        self.student_a = User.objects.create(
+            username='student_a.25ubc101@mariancollege.org',
+            email='student_a.25ubc101@mariancollege.org',
+            role='student',
+            class_name=self.class_bca_a,
+            department=self.dept_cs,
+            first_name='Student',
+            last_name='A'
+        )
+        self.student_b = User.objects.create(
+            username='student_b.25ubc202@mariancollege.org',
+            email='student_b.25ubc202@mariancollege.org',
+            role='student',
+            class_name=self.class_bca_b,
+            department=self.dept_cs,
+            first_name='Student',
+            last_name='B'
+        )
+        self.rep_a = User.objects.create(
+            username='rep_a.25ubc199@mariancollege.org',
+            email='rep_a.25ubc199@mariancollege.org',
+            role='student',
+            class_name=self.class_bca_a,
+            department=self.dept_cs,
+            first_name='Rep',
+            last_name='A'
+        )
+        self.class_bca_a.dqc_member = self.rep_a
+        self.class_bca_a.save()
+
+        self.teacher_a = User.objects.create(
+            username='teacher.a@mariancollege.org',
+            email='teacher.a@mariancollege.org',
+            role='faculty',
+            department=self.dept_cs,
+            class_name=self.class_bca_a,
+            first_name='Teacher',
+            last_name='A'
+        )
+        self.class_bca_a.class_teacher = self.teacher_a
+        self.class_bca_a.save()
+
+        self.teacher_b = User.objects.create(
+            username='teacher.b@mariancollege.org',
+            email='teacher.b@mariancollege.org',
+            role='faculty',
+            department=self.dept_cs,
+            class_name=self.class_bca_b,
+            first_name='Teacher',
+            last_name='B'
+        )
+        self.class_bca_b.class_teacher = self.teacher_b
+        self.class_bca_b.save()
+
+        self.evaluator_cat1 = User.objects.create(
+            username='eval.cat1@mariancollege.org',
+            email='eval.cat1@mariancollege.org',
+            role='evaluation',
+            first_name='Evaluator',
+            last_name='One'
+        )
+        self.evaluator_cat2 = User.objects.create(
+            username='eval.cat2@mariancollege.org',
+            email='eval.cat2@mariancollege.org',
+            role='evaluation',
+            first_name='Evaluator',
+            last_name='Two'
+        )
+
+        self.iqac_user = User.objects.create(
+            username='iqac.officer@mariancollege.org',
+            email='iqac.officer@mariancollege.org',
+            role='iqac',
+            first_name='IQAC',
+            last_name='Officer'
+        )
+        self.admin = User.objects.create(
+            username='admin.inst@mariancollege.org',
+            email='admin.inst@mariancollege.org',
+            role='admin',
+            first_name='Admin',
+            last_name='User',
+            is_staff=True,
+            is_superuser=True
+        )
+
+        # Criteria & Categories
+        self.cat1 = CriteriaCategory.objects.create(
+            code='cat-academics-eval1',
+            category='Academic Honors',
+            evaluators=['eval.cat1@mariancollege.org']
+        )
+        self.item1 = CriteriaItem.objects.create(
+            category=self.cat1,
+            title='Gold Medal',
+            type='fixed',
+            marks=10.0
+        )
+
+        self.cat2 = CriteriaCategory.objects.create(
+            code='cat-sports-eval2',
+            category='Sports Excellence',
+            evaluators=['eval.cat2@mariancollege.org']
+        )
+        self.item2 = CriteriaItem.objects.create(
+            category=self.cat2,
+            title='State Championship',
+            type='fixed',
+            marks=15.0
+        )
+
+        # Submissions
+        self.sub_a = Submission.objects.create(
+            user=self.student_a,
+            criteria_id=self.item1.id,
+            academic_year='2026-2027',
+            description='Student A Academic Gold Medal',
+            status='Draft'
+        )
+        self.sub_b = Submission.objects.create(
+            user=self.student_b,
+            criteria_id=self.item2.id,
+            academic_year='2026-2027',
+            description='Student B Sports Championship',
+            status='Draft'
+        )
+
+    # 1. Student -> own data vs other student data
+    def test_student_can_read_own_submission_but_denied_other_student_submission(self):
+        self.client.force_authenticate(user=self.student_a)
+
+        # Student A reads own submission
+        res_own = self.client.get(f'/api/submissions/{self.sub_a.id}/')
+        self.assertEqual(res_own.status_code, status.HTTP_200_OK)
+
+        # Student A attempts to read Student B's submission -> 403
+        res_other = self.client.get(f'/api/submissions/{self.sub_b.id}/')
+        self.assertEqual(res_other.status_code, status.HTTP_403_FORBIDDEN)
+
+        # Student A attempts to edit Student B's submission -> 403
+        res_edit = self.client.put(f'/api/submissions/{self.sub_b.id}/', {
+            'description': 'Malicious overwrite'
+        }, format='json')
+        self.assertEqual(res_edit.status_code, status.HTTP_403_FORBIDDEN)
+
+        # Student A attempts to delete Student B's submission -> 403
+        res_del = self.client.delete(f'/api/submissions/{self.sub_b.id}/')
+        self.assertEqual(res_del.status_code, status.HTTP_403_FORBIDDEN)
+
+    # 2. Student privilege escalation: profile class spoofing
+    def test_student_cannot_alter_class_assignment_in_profile(self):
+        self.client.force_authenticate(user=self.student_a)
+        res = self.client.put('/api/auth/profile/', {
+            'class_name': 'I BCA B'
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+        self.student_a.refresh_from_db()
+        self.assertEqual(self.student_a.class_name, self.class_bca_a)
+
+    # 3. Student privilege escalation: spoofing verifier identity or marks
+    def test_student_cannot_spoof_verifier_identity_or_marks(self):
+        self.client.force_authenticate(user=self.student_a)
+
+        # Student attempts to self-assign marks
+        res_marks = self.client.put(f'/api/submissions/{self.sub_a.id}/', {
+            'marks': 100
+        }, format='json')
+        self.assertEqual(res_marks.status_code, status.HTTP_403_FORBIDDEN)
+
+        # Student attempts to spoof teacherVerifiedByName or evaluatorVerifiedByName
+        res_spoof = self.client.put(f'/api/submissions/{self.sub_a.id}/', {
+            'description': 'Updated description',
+            'teacherVerifiedByName': 'Faked Principal Name',
+            'evaluatorVerifiedByName': 'Faked Evaluator Name',
+            'teacherRemarks': 'Faked Approval'
+        }, format='json')
+        self.assertEqual(res_spoof.status_code, status.HTTP_200_OK)
+        self.sub_a.refresh_from_db()
+        self.assertIsNone(self.sub_a.teacher_verified_by_name)
+        self.assertIsNone(self.sub_a.evaluator_verified_by_name)
+        self.assertIsNone(self.sub_a.teacher_remarks)
+
+    # 4. Student -> Administrative endpoints (RBAC)
+    def test_student_cannot_access_administrative_endpoints(self):
+        self.client.force_authenticate(user=self.student_a)
+
+        # User management endpoint
+        res_users = self.client.get('/api/users/')
+        self.assertEqual(res_users.status_code, status.HTTP_403_FORBIDDEN)
+
+        # System settings mutate
+        res_settings = self.client.post('/api/settings/', {'smallest_class_size': '10'}, format='json')
+        self.assertEqual(res_settings.status_code, status.HTTP_403_FORBIDDEN)
+
+        # Class create
+        res_class_create = self.client.post('/api/auth/classes/', {'name': 'New Class'}, format='json')
+        self.assertEqual(res_class_create.status_code, status.HTTP_403_FORBIDDEN)
+
+        # User group create
+        res_ug = self.client.post('/api/user-groups/', {'id': 'grp-hack', 'name': 'Hacker Group'}, format='json')
+        self.assertEqual(res_ug.status_code, status.HTTP_403_FORBIDDEN)
+
+    # 5. DQC Representative -> unauthorized class
+    def test_dqc_rep_cannot_verify_or_view_unauthorized_class(self):
+        self.client.force_authenticate(user=self.rep_a)
+
+        # Rep A can view Student A (their advised class I BCA A)
+        res_own_class = self.client.get(f'/api/submissions/{self.sub_a.id}/')
+        self.assertEqual(res_own_class.status_code, status.HTTP_200_OK)
+
+        # Rep A cannot view Student B (I BCA B) -> 403
+        res_unauth_view = self.client.get(f'/api/submissions/{self.sub_b.id}/')
+        self.assertEqual(res_unauth_view.status_code, status.HTTP_403_FORBIDDEN)
+
+        # Rep A cannot verify Student B's submission -> 403
+        res_unauth_verify = self.client.put(f'/api/submissions/{self.sub_b.id}/', {
+            'status': 'Student Rep Verified'
+        }, format='json')
+        self.assertEqual(res_unauth_verify.status_code, status.HTTP_403_FORBIDDEN)
+
+    # 6. Advisor -> unauthorized class
+    def test_advisor_cannot_modify_unauthorized_class(self):
+        self.client.force_authenticate(user=self.teacher_a)
+
+        # Teacher A attempts to modify Teacher B's class moderation parameters -> 403
+        res_mod_b = self.client.patch(f'/api/auth/classes/{self.class_bca_b.id}/', {
+            'num_students': 40
+        }, format='json')
+        self.assertEqual(res_mod_b.status_code, status.HTTP_403_FORBIDDEN)
+
+        # Teacher A attempts to reassign Teacher B's class advisor -> 403
+        res_reassign = self.client.put(f'/api/auth/classes/{self.class_bca_b.id}/', {
+            'classTeacher': self.teacher_a.email
+        }, format='json')
+        self.assertEqual(res_reassign.status_code, status.HTTP_403_FORBIDDEN)
+
+    # 7. Faculty cannot perform evaluator operations
+    def test_faculty_cannot_assign_evaluation_marks_or_evaluator_remarks(self):
+        self.client.force_authenticate(user=self.teacher_a)
+
+        res_marks = self.client.put(f'/api/submissions/{self.sub_a.id}/', {
+            'marks': 25
+        }, format='json')
+        self.assertEqual(res_marks.status_code, status.HTTP_403_FORBIDDEN)
+
+        res_remarks = self.client.put(f'/api/submissions/{self.sub_a.id}/', {
+            'evaluatorRemarks': 'Teacher attempting evaluator remarks'
+        }, format='json')
+        self.assertEqual(res_remarks.status_code, status.HTTP_403_FORBIDDEN)
+
+    # 8. Evaluator -> unauthorized evaluation category
+    def test_evaluator_cannot_evaluate_unrelated_criteria_category(self):
+        # Move submission B to Teacher Verified so it is ready for evaluation
+        self.sub_b.status = 'Teacher Verified'
+        self.sub_b.save()
+
+        # Evaluator 1 is assigned only to Category 1 (Academics). Submission B is Category 2 (Sports).
+        self.client.force_authenticate(user=self.evaluator_cat1)
+        res_eval1 = self.client.put(f'/api/submissions/{self.sub_b.id}/', {
+            'status': 'Evaluated',
+            'marks': 15.0
+        }, format='json')
+        self.assertEqual(res_eval1.status_code, status.HTTP_403_FORBIDDEN)
+
+        # Evaluator 2 is assigned to Category 2 (Sports) -> allowed
+        self.client.force_authenticate(user=self.evaluator_cat2)
+        res_eval2 = self.client.put(f'/api/submissions/{self.sub_b.id}/', {
+            'status': 'Evaluated',
+            'marks': 15.0
+        }, format='json')
+        self.assertEqual(res_eval2.status_code, status.HTTP_200_OK)
+        self.sub_b.refresh_from_db()
+        self.assertEqual(self.sub_b.status, 'Evaluated')
+        self.assertEqual(self.sub_b.marks, 15)
+        self.assertEqual(self.sub_b.evaluator_verified_by_name, 'Evaluator Two')
+
+    # 9. Evaluator cannot mutate classes
+    def test_evaluator_cannot_modify_classes(self):
+        self.client.force_authenticate(user=self.evaluator_cat1)
+        res = self.client.patch(f'/api/auth/classes/{self.class_bca_a.id}/', {
+            'num_students': 99
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+    # 10. Admin -> authorized administrative operations
+    def test_admin_authorized_operations(self):
+        self.client.force_authenticate(user=self.admin)
+
+        # Admin creates academic year
+        res_ay = self.client.post('/api/academic-years/', {'year': '2027-2028'}, format='json')
+        self.assertEqual(res_ay.status_code, status.HTTP_200_OK)
+
+        # Admin updates system settings
+        res_set = self.client.post('/api/settings/', {'smallest_class_size': '35'}, format='json')
+        self.assertEqual(res_set.status_code, status.HTTP_200_OK)
+
+        # Admin manages user groups
+        res_ug = self.client.post('/api/user-groups/', {
+            'id': 'grp-test-committee',
+            'name': 'Test Committee'
+        }, format='json')
+        self.assertEqual(res_ug.status_code, status.HTTP_200_OK)
+
+    # 11. Authentication Lifecycle: Disabled User Rejection
+    def test_disabled_user_login_and_token_refresh_rejected(self):
+        # Create disabled user
+        disabled_user = User.objects.create(
+            username='disabled.user.25ubc333@mariancollege.org',
+            email='disabled.user.25ubc333@mariancollege.org',
+            role='student',
+            is_active=False
+        )
+
+        # 1. Bypass login denied for disabled user
+        with self.settings(DEBUG=True, ENABLE_DEV_BYPASS=True):
+            res_bypass = self.client.post('/api/auth/bypass/', {
+                'email': disabled_user.email
+            }, format='json')
+            self.assertEqual(res_bypass.status_code, status.HTTP_403_FORBIDDEN)
+
+        # 2. Token refresh denied for disabled user
+        from rest_framework_simplejwt.tokens import RefreshToken
+        token = RefreshToken.for_user(disabled_user)
+        res_refresh = self.client.post('/api/auth/token/refresh/', {
+            'refresh': str(token)
+        }, format='json')
+        self.assertEqual(res_refresh.status_code, status.HTTP_401_UNAUTHORIZED)
+
+
+class Phase3APISecurityAndValidationRegressionTest(TestCase):
+    """
+    Comprehensive regression tests for Phase 3 API Security & Input Validation:
+    1. Missing Required Fields
+    2. Invalid and Non-Existent IDs (Foreign Key / Criteria Item Integrity)
+    3. Invalid State Transitions
+    4. Oversized Values & String Length Bounds
+    5. Numeric Range Bounds
+    6. Enum and Choice Validation
+    7. Mass Assignment Protections (BugReport read_only_fields, etc.)
+    8. User Profile and Management Validations
+    """
+
+    def setUp(self):
+        self.client = APIClient()
+        self.ay = AcademicYear.objects.create(year='2025-2026', is_active=True)
+
+        self.dept = Department.objects.create(
+            name='Department of Computer Applications',
+            code='MCA',
+            email_prefix='p',
+            level='PG'
+        )
+        self.course = Course.objects.create(
+            department=self.dept,
+            name='Master of Computer Applications',
+            abbreviation='MCA',
+            email_code='mc',
+            duration_years=2
+        )
+        self.cls = Class.objects.create(
+            name='I MCA',
+            department=self.dept,
+            course=self.course,
+            year_number=1,
+            num_students=30,
+            negative_points=0.0
+        )
+        self.student = User.objects.create(
+            username='student.test.25pmc101@mariancollege.org',
+            email='student.test.25pmc101@mariancollege.org',
+            role='student',
+            department=self.dept,
+            class_name=self.cls,
+            is_active=True
+        )
+        self.admin = User.objects.create(
+            username='admin.test@mariancollege.org',
+            email='admin.test@mariancollege.org',
+            role='admin',
+            is_staff=True,
+            is_superuser=True,
+            is_active=True
+        )
+        self.cat = CriteriaCategory.objects.create(
+            code='cat-academic',
+            category='Academic Activities',
+            access_level='all_students'
+        )
+        self.criteria_item = CriteriaItem.objects.create(
+            category=self.cat,
+            title='Conference Paper Presentation',
+            type='fixed',
+            marks=10.0
+        )
+        self.rule = CriteriaRule.objects.create(
+            item=self.criteria_item,
+            rule_type='fixed',
+            maximum_marks=10.0,
+            is_negative=False
+        )
+
+    # 1. Missing Required Fields
+    def test_submission_missing_required_fields(self):
+        self.client.force_authenticate(user=self.student)
+
+        # Missing criteriaId -> 400
+        res_no_criteria = self.client.post('/api/submissions/', {
+            'academicYear': '2025-2026',
+            'description': 'Valid description',
+        }, format='json')
+        self.assertEqual(res_no_criteria.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('criteriaId', res_no_criteria.data.get('error', ''))
+
+        # Missing description -> 400
+        res_no_desc = self.client.post('/api/submissions/', {
+            'criteriaId': self.criteria_item.id,
+            'academicYear': '2025-2026',
+            'description': '   ',
+        }, format='json')
+        self.assertEqual(res_no_desc.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('description', res_no_desc.data.get('error', ''))
+
+    # 2. Invalid or Non-Existent IDs
+    def test_submission_invalid_or_nonexistent_ids(self):
+        self.client.force_authenticate(user=self.student)
+
+        # Non-integer criteriaId -> 400
+        res_bad_id = self.client.post('/api/submissions/', {
+            'criteriaId': 'not-an-id',
+            'academicYear': '2025-2026',
+            'description': 'Testing non-int ID',
+        }, format='json')
+        self.assertEqual(res_bad_id.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Non-existent criteriaId -> 404
+        res_nonexistent_id = self.client.post('/api/submissions/', {
+            'criteriaId': 999999,
+            'academicYear': '2025-2026',
+            'description': 'Testing non-existent criteria ID',
+        }, format='json')
+        self.assertEqual(res_nonexistent_id.status_code, status.HTTP_404_NOT_FOUND)
+
+        # Non-existent academicYear -> 400
+        res_bad_ay = self.client.post('/api/submissions/', {
+            'criteriaId': self.criteria_item.id,
+            'academicYear': '2099-2100',
+            'description': 'Testing non-existent year',
+        }, format='json')
+        self.assertEqual(res_bad_ay.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Malformed academicYear format -> 400
+        res_malformed_ay = self.client.post('/api/submissions/', {
+            'criteriaId': self.criteria_item.id,
+            'academicYear': '2025/2026',
+            'description': 'Testing malformed year',
+        }, format='json')
+        self.assertEqual(res_malformed_ay.status_code, status.HTTP_400_BAD_REQUEST)
+
+    # 3. Oversized Values
+    def test_submission_oversized_values(self):
+        self.client.force_authenticate(user=self.student)
+
+        # Description > 5000 chars -> 400
+        res_big_desc = self.client.post('/api/submissions/', {
+            'criteriaId': self.criteria_item.id,
+            'academicYear': '2025-2026',
+            'description': 'A' * 5001,
+        }, format='json')
+        self.assertEqual(res_big_desc.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('5000', res_big_desc.data.get('error', ''))
+
+        # Remarks > 2000 chars -> 400
+        res_big_remarks = self.client.post('/api/submissions/', {
+            'criteriaId': self.criteria_item.id,
+            'academicYear': '2025-2026',
+            'description': 'Valid description',
+            'remarks': 'R' * 2001,
+        }, format='json')
+        self.assertEqual(res_big_remarks.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Proof > 255 chars -> 400
+        res_big_proof = self.client.post('/api/submissions/', {
+            'criteriaId': self.criteria_item.id,
+            'academicYear': '2025-2026',
+            'description': 'Valid description',
+            'proof': 'https://example.com/' + ('x' * 250),
+        }, format='json')
+        self.assertEqual(res_big_proof.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Certificate ID > 100 chars -> 400
+        res_big_cert = self.client.post('/api/submissions/', {
+            'criteriaId': self.criteria_item.id,
+            'academicYear': '2025-2026',
+            'description': 'Valid description',
+            'certificateId': 'CERT-' + ('9' * 100),
+        }, format='json')
+        self.assertEqual(res_big_cert.status_code, status.HTTP_400_BAD_REQUEST)
+
+    # 4. Submission Update Validation & Invalid State Guard
+    def test_submission_update_invalid_state_and_ids(self):
+        self.client.force_authenticate(user=self.student)
+
+        # Create valid submission
+        res_create = self.client.post('/api/submissions/', {
+            'criteriaId': self.criteria_item.id,
+            'academicYear': '2025-2026',
+            'description': 'Original submission',
+        }, format='json')
+        self.assertEqual(res_create.status_code, status.HTTP_201_CREATED)
+        sub_id = res_create.data['id']
+
+        # Update with non-existent criteriaId -> 404
+        res_upd_bad_cid = self.client.put(f'/api/submissions/{sub_id}/', {
+            'criteriaId': 888888,
+        }, format='json')
+        self.assertEqual(res_upd_bad_cid.status_code, status.HTTP_404_NOT_FOUND)
+
+        # Update with non-existent academicYear -> 400
+        res_upd_bad_ay = self.client.put(f'/api/submissions/{sub_id}/', {
+            'academicYear': '2090-2091',
+        }, format='json')
+        self.assertEqual(res_upd_bad_ay.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Update with oversized description -> 400
+        res_upd_big_desc = self.client.put(f'/api/submissions/{sub_id}/', {
+            'description': 'D' * 5001,
+        }, format='json')
+        self.assertEqual(res_upd_big_desc.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Student attempting privileged transition -> 403
+        res_upd_status = self.client.put(f'/api/submissions/{sub_id}/', {
+            'status': 'Approved',
+        }, format='json')
+        self.assertEqual(res_upd_status.status_code, status.HTTP_403_FORBIDDEN)
+
+    # 5. Mass Assignment Protection on Bug Reports
+    def test_bug_report_mass_assignment_protection(self):
+        # Public submitter tries to pass status='Resolved' and arbitrary whatsapp_numbers
+        res = self.client.post('/api/bug-reports/', {
+            'title': 'Broken layout in navigation bar',
+            'description': 'The navigation dropdown does not expand on mobile screens.',
+            'bug_type': 'UI',
+            'priority': 'High',
+            'status': 'Resolved',
+            'whatsapp_numbers': '+919999999999',
+            'reporter_name': 'Anonymous Student',
+            'reporter_email': 'anon@mariancollege.org'
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+
+        report_id = res.data['id']
+        from .models import BugReport
+        report = BugReport.objects.get(id=report_id)
+
+        # Crucial security check: read_only_fields protected status and whatsapp_numbers
+        self.assertEqual(report.status, 'Open')
+        self.assertEqual(report.whatsapp_numbers, '')
+
+    # 6. Bug Report Field Validation
+    def test_bug_report_validation_bounds(self):
+        # Title too short (<3 chars) -> 400
+        res_short_title = self.client.post('/api/bug-reports/', {
+            'title': 'Hi',
+            'description': 'Valid description here',
+        }, format='json')
+        self.assertEqual(res_short_title.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Description too short (<5 chars) -> 400
+        res_short_desc = self.client.post('/api/bug-reports/', {
+            'title': 'Valid Title',
+            'description': 'No',
+        }, format='json')
+        self.assertEqual(res_short_desc.status_code, status.HTTP_400_BAD_REQUEST)
+
+    # 7. Class Numeric Ranges & String Length Bounds
+    def test_class_numeric_ranges_and_lengths(self):
+        self.client.force_authenticate(user=self.admin)
+
+        # Negative num_students -> 400
+        res_neg_students = self.client.patch(f'/api/auth/classes/{self.cls.id}/', {
+            'num_students': -10
+        }, format='json')
+        self.assertEqual(res_neg_students.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Oversized num_students (>1000) -> 400
+        res_big_students = self.client.patch(f'/api/auth/classes/{self.cls.id}/', {
+            'num_students': 1001
+        }, format='json')
+        self.assertEqual(res_big_students.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Oversized negative_points (>10000) -> 400
+        res_big_penalties = self.client.patch(f'/api/auth/classes/{self.cls.id}/', {
+            'negative_points': 15000.0
+        }, format='json')
+        self.assertEqual(res_big_penalties.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Invalid year_number (>6) -> 400
+        res_bad_yr = self.client.patch(f'/api/auth/classes/{self.cls.id}/', {
+            'year_number': 9
+        }, format='json')
+        self.assertEqual(res_bad_yr.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Oversized class name (>100 chars) -> 400
+        res_big_name = self.client.patch(f'/api/auth/classes/{self.cls.id}/', {
+            'name': 'C' * 101
+        }, format='json')
+        self.assertEqual(res_big_name.status_code, status.HTTP_400_BAD_REQUEST)
+
+    # 8. Department Validation & Enum Enforceability
+    def test_department_validation(self):
+        self.client.force_authenticate(user=self.admin)
+
+        # Invalid level -> 400
+        res_bad_level = self.client.post('/api/departments/', {
+            'name': 'Department of Economics',
+            'code': 'ECON',
+            'level': 'Doctorate'  # Invalid!
+        }, format='json')
+        self.assertEqual(res_bad_level.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Oversized name -> 400
+        res_big_dept_name = self.client.post('/api/departments/', {
+            'name': 'D' * 101,
+            'code': 'TESTDEPT',
+            'level': 'UG'
+        }, format='json')
+        self.assertEqual(res_big_dept_name.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Oversized code -> 400
+        res_big_code = self.client.post('/api/departments/', {
+            'name': 'Department of Statistics',
+            'code': 'STATISTICS_EXTREMELY_LONG_CODE',
+            'level': 'UG'
+        }, format='json')
+        self.assertEqual(res_big_code.status_code, status.HTTP_400_BAD_REQUEST)
+
+    # 9. Course Validation & Duration Bounds
+    def test_course_validation(self):
+        self.client.force_authenticate(user=self.admin)
+
+        # Invalid duration (>6 years) -> 400
+        res_big_duration = self.client.post('/api/courses/', {
+            'department': self.dept.id,
+            'name': 'Ph.D. Computer Applications',
+            'abbreviation': 'PHDCA',
+            'email_code': 'ph',
+            'duration_years': 8
+        }, format='json')
+        self.assertEqual(res_big_duration.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Duration < 1 year -> 400
+        res_zero_duration = self.client.post('/api/courses/', {
+            'department': self.dept.id,
+            'name': 'Certificate Program',
+            'abbreviation': 'CERT',
+            'email_code': 'cp',
+            'duration_years': 0
+        }, format='json')
+        self.assertEqual(res_zero_duration.status_code, status.HTTP_400_BAD_REQUEST)
+
+    # 10. User Profile Name Length Bound
+    def test_user_profile_name_length_bound(self):
+        self.client.force_authenticate(user=self.student)
+
+        # Oversized name (>150 chars) -> 400
+        res_big_name = self.client.put('/api/auth/profile/', {
+            'name': 'N' * 151
+        }, format='json')
+        self.assertEqual(res_big_name.status_code, status.HTTP_400_BAD_REQUEST)
+
+    # 11. User Management Validation
+    def test_user_management_validation(self):
+        self.client.force_authenticate(user=self.admin)
+
+        # Invalid email format -> 400
+        res_bad_email = self.client.post('/api/users/', {
+            'email': 'not-an-email',
+            'role': 'student'
+        }, format='json')
+        self.assertEqual(res_bad_email.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Invalid role -> 400
+        res_bad_role = self.client.post('/api/users/', {
+            'email': 'valid.user@mariancollege.org',
+            'role': 'superuser_god'
+        }, format='json')
+        self.assertEqual(res_bad_role.status_code, status.HTTP_400_BAD_REQUEST)
+
+    # 12. System Settings Key & Value Bounds
+    def test_system_settings_bounds(self):
+        self.client.force_authenticate(user=self.admin)
+
+        # Setting key > 100 chars -> 400
+        bad_key = 'K' * 101
+        res_big_key = self.client.post('/api/settings/', {
+            bad_key: 'value'
+        }, format='json')
+        self.assertEqual(res_big_key.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Setting value > 5000 chars -> 400
+        res_big_val = self.client.post('/api/settings/', {
+            'test_key': 'V' * 5001
+        }, format='json')
+        self.assertEqual(res_big_val.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+
+
 
 
 

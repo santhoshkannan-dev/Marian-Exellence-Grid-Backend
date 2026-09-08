@@ -12,6 +12,12 @@ class AcademicYearSerializer(serializers.ModelSerializer):
         model = AcademicYear
         fields = '__all__'
 
+    def validate_year(self, value):
+        import re
+        if not re.match(r'^\d{4}-\d{4}$', str(value).strip()):
+            raise serializers.ValidationError("Academic year must be in format 'YYYY-YYYY' (e.g. '2025-2026').")
+        return str(value).strip()
+
 
 class CourseSerializer(serializers.ModelSerializer):
     department_name = serializers.CharField(source='department.name', read_only=True)
@@ -25,6 +31,11 @@ class CourseSerializer(serializers.ModelSerializer):
             'is_multi_batch', 'duration_years',
             'created_at', 'updated_at'
         ]
+
+    def validate_duration_years(self, value):
+        if value < 1 or value > 6:
+            raise serializers.ValidationError("Course duration must be between 1 and 6 years.")
+        return value
 
 
 class ClassSerializer(serializers.ModelSerializer):
@@ -58,6 +69,21 @@ class ClassSerializer(serializers.ModelSerializer):
             'created_at', 'updated_at'
         ]
 
+    def validate_num_students(self, value):
+        if value < 0 or value > 1000:
+            raise serializers.ValidationError("Number of students must be between 0 and 1000.")
+        return value
+
+    def validate_negative_points(self, value):
+        if value < 0 or value > 10000:
+            raise serializers.ValidationError("Negative points must be between 0 and 10000.")
+        return value
+
+    def validate_year_number(self, value):
+        if value is not None and (value < 1 or value > 6):
+            raise serializers.ValidationError("Year number must be between 1 and 6.")
+        return value
+
 
 class DepartmentSerializer(serializers.ModelSerializer):
     courses = CourseSerializer(many=True, read_only=True)
@@ -70,6 +96,12 @@ class DepartmentSerializer(serializers.ModelSerializer):
             'courses', 'classes',
             'created_at', 'updated_at'
         ]
+
+    def validate_level(self, value):
+        allowed = [c[0] for c in Department.LEVEL_CHOICES]
+        if value not in allowed:
+            raise serializers.ValidationError(f"Invalid level '{value}'. Allowed: {', '.join(allowed)}.")
+        return value
 
 
 class CriteriaVersionSerializer(serializers.ModelSerializer):
@@ -114,6 +146,7 @@ class UserSerializer(serializers.ModelSerializer):
             'class_name_display', 'roll_number', 'batch_year',
             'is_student_rep', 'is_staff', 'is_superuser', 'is_active'
         ]
+        read_only_fields = ['is_staff', 'is_superuser']
 
 
 class AcademicGradeBreakdownSerializer(serializers.ModelSerializer):
@@ -137,6 +170,11 @@ class SubmissionSerializer(serializers.ModelSerializer):
             'teacher_verified_by_name', 'teacher_remarks', 'evaluator_verified_by_name',
             'evaluator_remarks', 'grade_breakdown', 'created_at', 'updated_at'
         ]
+        read_only_fields = [
+            'user', 'verified_by_name', 'rep_verified_by_name',
+            'teacher_verified_by_name', 'evaluator_verified_by_name',
+            'evaluator_verified', 'created_at', 'updated_at'
+        ]
 
 
 class WorkflowAuditTrailSerializer(serializers.ModelSerializer):
@@ -150,6 +188,7 @@ class WorkflowAuditTrailSerializer(serializers.ModelSerializer):
             'ip_address', 'user_agent', 'request_id', 'previous_hash',
             'record_hash', 'created_at'
         ]
+        read_only_fields = '__all__'
 
 
 class ClassIndexResultSerializer(serializers.ModelSerializer):
@@ -159,18 +198,42 @@ class ClassIndexResultSerializer(serializers.ModelSerializer):
     class Meta:
         model = ClassIndexResult
         fields = ['id', 'class_name', 'class_name_display', 'academic_year', 'academic_year_display', 'academic_score', 'co_curricular_score', 'extra_curricular_score', 'final_index', 'rank', 'updated_at']
+        read_only_fields = '__all__'
 
 
 class ChampionSerializer(serializers.ModelSerializer):
     class Meta:
         model = Champion
         fields = '__all__'
+        read_only_fields = ['created_at']
+
+    def validate_rank(self, value):
+        if value < 1 or value > 100:
+            raise serializers.ValidationError("Rank must be between 1 and 100.")
+        return value
 
 
 class BugReportSerializer(serializers.ModelSerializer):
     class Meta:
         model = BugReport
         fields = '__all__'
+        read_only_fields = ['status', 'whatsapp_numbers', 'created_at', 'updated_at']
+
+    def validate_title(self, value):
+        clean_val = str(value).strip()
+        if len(clean_val) < 3:
+            raise serializers.ValidationError("Title must be at least 3 characters long.")
+        if len(clean_val) > 255:
+            raise serializers.ValidationError("Title cannot exceed 255 characters.")
+        return clean_val
+
+    def validate_description(self, value):
+        clean_val = str(value).strip()
+        if len(clean_val) < 5:
+            raise serializers.ValidationError("Description must be at least 5 characters long.")
+        if len(clean_val) > 5000:
+            raise serializers.ValidationError("Description cannot exceed 5000 characters.")
+        return clean_val
 
 
 
