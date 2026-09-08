@@ -17,7 +17,7 @@ if env_path.exists():
             line = line.strip()
             if line and not line.startswith('#') and '=' in line:
                 key, val = line.split('=', 1)
-                os.environ[key.strip()] = val.strip()
+                os.environ.setdefault(key.strip(), val.strip())
 
 from django.core.exceptions import ImproperlyConfigured
 
@@ -38,7 +38,18 @@ ENABLE_DEV_BYPASS = (
     os.environ.get("ENABLE_DEV_BYPASS", "False").lower() == "true"
 )
 
-ALLOWED_HOSTS = os.environ.get('DJANGO_ALLOWED_HOSTS', '*').split(',')
+if DEBUG:
+    ALLOWED_HOSTS = [
+        h.strip() for h in os.environ.get('DJANGO_ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',')
+        if h.strip()
+    ]
+else:
+    _allowed_hosts = os.environ.get('DJANGO_ALLOWED_HOSTS')
+    if not _allowed_hosts:
+        raise ImproperlyConfigured("DJANGO_ALLOWED_HOSTS environment variable is required in production.")
+    ALLOWED_HOSTS = [h.strip() for h in _allowed_hosts.split(',') if h.strip()]
+    if '*' in ALLOWED_HOSTS:
+        raise ImproperlyConfigured("Wildcard '*' in DJANGO_ALLOWED_HOSTS is forbidden in production.")
 
 
 
@@ -118,11 +129,11 @@ else:
     DATABASES = {
         'default': {
             'ENGINE': 'django.db.backends.postgresql',
-            'NAME': 'marian_best_class',
-            'USER': 'postgres',
-            'PASSWORD': 'santhosh',
-            'HOST': 'localhost',
-            'PORT': '5432',
+            'NAME': db_name or 'marian_best_class',
+            'USER': db_user or 'postgres',
+            'PASSWORD': db_password,
+            'HOST': db_host,
+            'PORT': db_port,
         }
     }
 
@@ -162,10 +173,13 @@ MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 # CORS Settings (Restricted to authorized origins)
-CORS_ALLOWED_ORIGINS = os.environ.get(
-    'CORS_ALLOWED_ORIGINS',
-    'http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173'
-).split(',')
+_cors_origins = os.environ.get('CORS_ALLOWED_ORIGINS')
+if not DEBUG and not _cors_origins:
+    raise ImproperlyConfigured("CORS_ALLOWED_ORIGINS environment variable is required in production.")
+CORS_ALLOWED_ORIGINS = [
+    origin.strip() for origin in (_cors_origins or 'http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173').split(',')
+    if origin.strip()
+]
 CORS_ALLOW_CREDENTIALS = True
 
 # REST Framework settings
@@ -206,7 +220,21 @@ SIMPLE_JWT = {
 }
 
 # Google OAuth Client ID loaded from environment variable
-GOOGLE_CLIENT_ID = os.environ.get(
-    'GOOGLE_CLIENT_ID',
-    '844955988511-9f9oh4sjrp3eqoimenpkdg0ho3ljr1bo.apps.googleusercontent.com'
-)
+GOOGLE_CLIENT_ID = os.environ.get('GOOGLE_CLIENT_ID')
+if not DEBUG and not GOOGLE_CLIENT_ID:
+    raise ImproperlyConfigured("GOOGLE_CLIENT_ID environment variable is required in production.")
+
+# Production Security Defaults (Fail-Safe HTTPS, HSTS, Secure Cookies, Security Headers)
+if not DEBUG:
+    SECURE_SSL_REDIRECT = os.environ.get('SECURE_SSL_REDIRECT', 'True').lower() == 'true'
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+    SESSION_COOKIE_HTTPONLY = True
+    CSRF_COOKIE_HTTPONLY = True
+    SECURE_HSTS_SECONDS = int(os.environ.get('SECURE_HSTS_SECONDS', 31536000))
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = True
+    SECURE_HSTS_PRELOAD = True
+    SECURE_CONTENT_TYPE_NOSNIFF = True
+    X_FRAME_OPTIONS = 'DENY'
+    SECURE_REFERRER_POLICY = 'same-origin'
+    SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')

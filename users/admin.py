@@ -4,7 +4,7 @@ from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
 from django.core.exceptions import ValidationError
 from .models import (
     User, Department, Class, AcademicYear,
-    CriteriaCategory, CriteriaItem, Submission,
+    CriteriaCategory, CriteriaItem, CriteriaRule, CriteriaVersion, Submission,
     AcademicGradeBreakdown, WorkflowAuditTrail, ClassIndexResult,
     BugReport
 )
@@ -114,9 +114,24 @@ class CriteriaCategoryAdmin(admin.ModelAdmin):
 
 @admin.register(CriteriaItem)
 class CriteriaItemAdmin(admin.ModelAdmin):
-    list_display = ('title', 'category', 'type', 'marks', 'created_at')
-    list_filter = ('type', 'category')
-    search_fields = ('title', 'category__category')
+    list_display = ('id', 'title', 'category', 'version', 'type', 'marks', 'created_at')
+    list_filter = ('version', 'category', 'type')
+    search_fields = ('title', 'category__category', 'category__code')
+
+
+
+@admin.register(CriteriaVersion)
+class CriteriaVersionAdmin(admin.ModelAdmin):
+    list_display = ('academic_year', 'version', 'name', 'is_locked', 'published_at', 'created_at')
+    list_filter = ('academic_year', 'is_locked')
+    search_fields = ('academic_year', 'name')
+
+
+@admin.register(CriteriaRule)
+class CriteriaRuleAdmin(admin.ModelAdmin):
+    list_display = ('id', 'item', 'rule_type', 'maximum_marks', 'is_negative', 'multiplier')
+    list_filter = ('rule_type', 'is_negative')
+    search_fields = ('item__title', 'item__category__category')
 
 
 class AcademicGradeBreakdownInline(admin.StackedInline):

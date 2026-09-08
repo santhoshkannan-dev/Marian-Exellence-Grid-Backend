@@ -127,6 +127,7 @@ class Submission(models.Model):
 
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='submissions')
     criteria_id = models.IntegerField()
+    criteria_version = models.ForeignKey('CriteriaVersion', on_delete=models.SET_NULL, null=True, blank=True, related_name='submissions')
     academic_year = models.CharField(max_length=50, blank=True, null=True)
     submission_type = models.CharField(max_length=50, blank=True, null=True) # e.g. 'Sem Result', 'SAVE Sem Result'
     description = models.TextField()
@@ -155,6 +156,23 @@ class Submission(models.Model):
         return f"Submission {self.id} - {self.user.email} - {self.status}"
 
 
+class CriteriaVersion(models.Model):
+    academic_year = models.CharField(max_length=20)  # e.g. '2025-2026'
+    version = models.IntegerField(default=1)
+    name = models.CharField(max_length=100, blank=True, default='')  # e.g. '2025-2026 Official v1'
+    created_at = models.DateTimeField(auto_now_add=True)
+    published_at = models.DateTimeField(null=True, blank=True)
+    is_locked = models.BooleanField(default=False)
+
+    class Meta:
+        unique_together = ('academic_year', 'version')
+        ordering = ['academic_year', '-version']
+
+    def __str__(self):
+        status = "Locked" if self.is_locked else "Active"
+        return f"{self.academic_year} v{self.version} ({status})"
+
+
 class CriteriaCategory(models.Model):
     code = models.CharField(max_length=50, unique=True) # e.g. 'cat-academics'
     category = models.CharField(max_length=100)
@@ -169,12 +187,29 @@ class CriteriaCategory(models.Model):
 
 class CriteriaItem(models.Model):
     category = models.ForeignKey(CriteriaCategory, on_delete=models.CASCADE, related_name='items')
+    version = models.ForeignKey(CriteriaVersion, on_delete=models.SET_NULL, null=True, blank=True, related_name='items')
     title = models.CharField(max_length=255)
     type = models.CharField(max_length=20) # 'count', 'fixed', 'range', 'negative', 'academic_grades'
     marks = models.FloatField(default=0.0)
-    rules_json = models.JSONField(blank=True, null=True)
+    rules_json = models.JSONField(blank=True, null=True) # Deprecated flexible metadata
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    def get_authoritative_rule(self):
+        """Retrieve the primary authoritative CriteriaRule for this item."""
+        rule = self.rules.first()
+        if not rule:
+            rule, _ = CriteriaRule.objects.get_or_create(
+                item=self,
+                defaults={
+                    'rule_type': self.type,
+                    'maximum_marks': self.marks,
+                    'min_count': 1 if self.type == 'count' else None,
+                    'is_negative': self.type == 'negative',
+                    'extra_config': self.rules_json
+                }
+            )
+        return rule
 
     def __str__(self):
         return f"{self.category.category} - {self.title}"

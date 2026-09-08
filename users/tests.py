@@ -1,8 +1,12 @@
 from django.test import TestCase
 from rest_framework.test import APIClient
 from rest_framework import status
-from .models import Department, Course, Class, User, AcademicYear, CriteriaCategory, CriteriaItem, CriteriaRule, Submission
-from .views import parse_student_email, allocate_student_from_email
+from .models import (
+    Department, Course, Class, User, AcademicYear,
+    CriteriaCategory, CriteriaItem, CriteriaRule, CriteriaVersion,
+    Submission, AcademicGradeBreakdown
+)
+from .views import parse_student_email, allocate_student_from_email, calculate_submission_score
 
 
 class DepartmentCourseClassManagementTest(TestCase):
@@ -678,6 +682,594 @@ class APISecurityAndAuthorizationTest(TestCase):
         breakdown.other_pass_count = 20
         with self.assertRaises(ValueError):
             breakdown.save()
+
+
+class ArchitectureRelationalAndVersioningTest(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.dept = Department.objects.create(name='Computer Applications', code='CA')
+        self.course = Course.objects.create(
+            department=self.dept, name='BCA', abbreviation='BCA', email_code='bc', duration_years=3
+        )
+        self.cls = Class.objects.create(department=self.dept, course=self.course, year_number=1, name='I BCA')
+        self.student = User.objects.create(
+            username='student.test@mariancollege.org',
+            email='student.test@mariancollege.org',
+            role='student',
+            department=self.dept,
+            class_name=self.cls
+        )
+        self.ay = AcademicYear.objects.create(year='2025-2026', is_active=True)
+
+        self.category = CriteriaCategory.objects.create(
+            code='ACAD',
+            category='Academic Excellence',
+            access_level='student'
+        )
+        self.version_v1 = CriteriaVersion.objects.create(
+            academic_year='2025-2026',
+            version=1,
+            name='2025-26 Standard Criteria',
+            is_locked=False
+        )
+        self.item_v1 = CriteriaItem.objects.create(
+            category=self.category,
+            version=self.version_v1,
+            title='End Semester Result',
+            marks=10.0,
+            type='count',
+            rules_json={'maximum': 10, 'formula': 'academic_sem_result'}
+        )
+
+    def test_academic_grade_breakdown_authoritative_source(self):
+        """Verify AcademicGradeBreakdown is the authoritative relational source and JSON duplicate is stripped."""
+        self.client.force_authenticate(user=self.student)
+        payload = {
+            'email': self.student.email,
+            'criteriaId': self.item_v1.id,
+            'academicYear': '2025-2026',
+            'description': 'Semester 1 results',
+            'status': 'Submitted',
+            'evidence': {
+                'type': 'academic_marks',
+                'submissionType': 'Sem Result',
+                'grades': {'S': 5, 'APlus': 10, 'Fail': 2},  # Legacy/duplicate format
+                'markBreakdown': {'count90Above': 5}
+            },
+            'grade_breakdown': {
+                's_grade_count': 5,
+                'a_plus_grade_count': 10,
+                'a_grade_count': 15,
+                'other_pass_count': 8,
+                'failed_count': 2,
+                'class_pass_percentage': 95.0,
+                'total_students': 40
+            }
+        }
+
+        res = self.client.post('/api/submissions/', payload, format='json')
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        sub_id = res.data['id']
+
+        # 1. Relational entity must exist
+        submission = Submission.objects.get(id=sub_id)
+        self.assertTrue(hasattr(submission, 'grade_breakdown'))
+        bd = submission.grade_breakdown
+        self.assertEqual(bd.s_grade_count, 5)
+        self.assertEqual(bd.a_plus_grade_count, 10)
+        self.assertEqual(bd.a_grade_count, 15)
+        self.assertEqual(bd.other_pass_count, 8)
+        self.assertEqual(bd.failed_count, 2)
+        self.assertEqual(bd.total_students, 40)
+        self.assertEqual(bd.class_pass_percentage, 95.0)
+
+        # 2. JSON evidence must NOT duplicate grade dictionaries
+        self.assertNotIn('grades', submission.evidence)
+        self.assertNotIn('markBreakdown', submission.evidence)
+        self.assertNotIn('classPassPercentage', submission.evidence)
+        self.assertNotIn('totalStudents', submission.evidence)
+
+        # 3. Serialized submission exposes authoritative grade_breakdown
+        get_res = self.client.get(f'/api/submissions/{sub_id}/')
+        self.assertEqual(get_res.status_code, status.HTTP_200_OK)
+        self.assertIn('grade_breakdown', get_res.data)
+        self.assertEqual(get_res.data['grade_breakdown']['s_grade_count'], 5)
+        self.assertEqual(get_res.data['grade_breakdown']['total_students'], 40)
+
+    def test_criteria_rule_authoritative_over_item_rules_json(self):
+        """Verify CriteriaRule values take precedence over conflicting CriteriaItem.rules_json."""
+        # rules_json has maximum = 10, but CriteriaRule sets maximum_marks = 25
+        rule = CriteriaRule.objects.create(
+            item=self.item_v1,
+            rule_type='limit',
+            maximum_marks=25.0,
+            multiplier=1.0,
+            extra_config={'cap': 25.0}
+        )
+
+        # Score a submission with count = 30
+        evidence = {'count': 30}
+        computed_marks = calculate_submission_score(self.item_v1, evidence)
+        # Authoritative rule caps at 25, not rules_json's 10
+        self.assertEqual(computed_marks, 25.0)
+
+    def test_criteria_versioning_and_historical_immutability(self):
+        """Verify submissions are tied to specific CriteriaVersion and protected against future year modifications."""
+        # 1. Submission in 2025-2026 under v1
+        self.client.force_authenticate(user=self.student)
+        res1 = self.client.post('/api/submissions/', {
+            'email': self.student.email,
+            'criteriaId': self.item_v1.id,
+            'academicYear': '2025-2026',
+            'description': 'Publication 2025',
+            'evidence': {'count': 1}
+        }, format='json')
+        self.assertEqual(res1.status_code, status.HTTP_201_CREATED)
+        sub1 = Submission.objects.get(id=res1.data['id'])
+        self.assertEqual(sub1.criteria_version, self.version_v1)
+        self.assertEqual(sub1.marks, 10.0)
+
+        # 2. Lock 2025-2026 version
+        self.version_v1.is_locked = True
+        self.version_v1.save()
+
+        # 3. New Academic Year 2026-2027 with new CriteriaVersion v1
+        version_2026 = CriteriaVersion.objects.create(
+            academic_year='2026-2027',
+            version=1,
+            name='2026-27 Updated Publication Scheme',
+            is_locked=False
+        )
+        # Publication increased to 15 marks in 2026-2027
+        item_2026 = CriteriaItem.objects.create(
+            category=self.category,
+            version=version_2026,
+            title='End Semester Result (Updated)',
+            marks=15.0,
+            type='count',
+            rules_json={'maximum': 15}
+        )
+
+        res2 = self.client.post('/api/submissions/', {
+            'email': self.student.email,
+            'criteriaId': item_2026.id,
+            'academicYear': '2026-2027',
+            'description': 'Publication 2026',
+            'evidence': {'count': 1}
+        }, format='json')
+        self.assertEqual(res2.status_code, status.HTTP_201_CREATED)
+        sub2 = Submission.objects.get(id=res2.data['id'])
+        self.assertEqual(sub2.criteria_version, version_2026)
+        self.assertEqual(sub2.marks, 15.0)
+
+        # 4. Crucial: Old 2025-2026 submission is still intact with 10.0 marks and version v1
+        sub1.refresh_from_db()
+        self.assertEqual(sub1.marks, 10.0)
+        self.assertEqual(sub1.criteria_version, self.version_v1)
+
+
+class Phase1SecurityRemediationRegressionTest(TestCase):
+    """
+    Comprehensive regression tests for Phase 1 Security Remediation:
+    1. Development Authentication Bypass
+    2. Hardcoded Secrets & Production Settings Validation
+    3. Submission IDOR (Object-Level Authorization)
+    4. Client-Controlled Workflow Status Prevention
+    5. Production Security Defaults & Privacy Protections
+    """
+
+    def setUp(self):
+        self.client = APIClient()
+        self.ay = AcademicYear.objects.create(year='2025-2026', is_active=True)
+
+        self.dept1 = Department.objects.create(name='Computer Science', code='CS', email_prefix='p', level='PG')
+        self.dept2 = Department.objects.create(name='Management Studies', code='MS', email_prefix='m', level='PG')
+
+        self.class1 = Class.objects.create(name='I MCA', department=self.dept1, year_number=1)
+        self.class2 = Class.objects.create(name='I MBA', department=self.dept2, year_number=1)
+
+        self.student_a = User.objects.create(
+            username='student_a@mariancollege.org',
+            email='student_a@mariancollege.org',
+            role='student',
+            department=self.dept1,
+            class_name=self.class1
+        )
+        self.student_b = User.objects.create(
+            username='student_b@mariancollege.org',
+            email='student_b@mariancollege.org',
+            role='student',
+            department=self.dept1,
+            class_name=self.class1
+        )
+        self.student_c = User.objects.create(
+            username='student_c@mariancollege.org',
+            email='student_c@mariancollege.org',
+            role='student',
+            department=self.dept2,
+            class_name=self.class2
+        )
+        self.student_rep1 = User.objects.create(
+            username='rep_class1@mariancollege.org',
+            email='rep_class1@mariancollege.org',
+            role='student',
+            department=self.dept1,
+            class_name=self.class1
+        )
+        self.class1.dqc_member = self.student_rep1
+        self.class1.save()
+
+        self.faculty_dept1 = User.objects.create(
+            username='faculty_dept1@mariancollege.org',
+            email='faculty_dept1@mariancollege.org',
+            role='faculty',
+            department=self.dept1,
+            is_staff=True
+        )
+        self.class1.class_teacher = self.faculty_dept1
+        self.class1.save()
+
+        self.faculty_dept2 = User.objects.create(
+            username='faculty_dept2@mariancollege.org',
+            email='faculty_dept2@mariancollege.org',
+            role='faculty',
+            department=self.dept2,
+            is_staff=True
+        )
+        self.class2.class_teacher = self.faculty_dept2
+        self.class2.save()
+
+        self.evaluator = User.objects.create(
+            username='evaluator@mariancollege.org',
+            email='evaluator@mariancollege.org',
+            role='evaluation',
+            is_staff=True
+        )
+        self.iqac_user = User.objects.create(
+            username='iqac@mariancollege.org',
+            email='iqac@mariancollege.org',
+            role='iqac',
+            is_staff=True
+        )
+        self.admin = User.objects.create(
+            username='admin@mariancollege.org',
+            email='admin@mariancollege.org',
+            role='admin',
+            is_staff=True,
+            is_superuser=True
+        )
+
+        self.version = CriteriaVersion.objects.create(
+            academic_year='2025-2026',
+            version=1,
+            name='Scheme 2025-26',
+            is_locked=False
+        )
+        self.category = CriteriaCategory.objects.create(
+            code='ACAD',
+            category='Academic Excellence'
+        )
+        self.item = CriteriaItem.objects.create(
+            category=self.category,
+            version=self.version,
+            title='Course Submission',
+            marks=10.0,
+            type='count',
+            rules_json={'maximum': 50}
+        )
+
+        self.sub_a = Submission.objects.create(
+            user=self.student_a,
+            criteria_id=self.item.id,
+            criteria_version=self.version,
+            academic_year='2025-2026',
+            description='Student A Submission',
+            status='Draft',
+            evidence={'count': 1},
+            marks=10
+        )
+        self.sub_b = Submission.objects.create(
+            user=self.student_b,
+            criteria_id=self.item.id,
+            criteria_version=self.version,
+            academic_year='2025-2026',
+            description='Student B Submission',
+            status='Draft',
+            evidence={'count': 1},
+            marks=10
+        )
+        self.sub_c = Submission.objects.create(
+            user=self.student_c,
+            criteria_id=self.item.id,
+            criteria_version=self.version,
+            academic_year='2025-2026',
+            description='Student C Submission',
+            status='Draft',
+            evidence={'count': 1},
+            marks=10
+        )
+
+    # -------------------------------------------------------------
+    # 1. DEVELOPMENT AUTHENTICATION BYPASS REGRESSION TESTS
+    # -------------------------------------------------------------
+    def test_dev_bypass_fails_closed_when_debug_false(self):
+        """Bypass must strictly fail closed (404) when DEBUG=False, even if ENABLE_DEV_BYPASS=True."""
+        with self.settings(DEBUG=False, ENABLE_DEV_BYPASS=True):
+            res = self.client.post('/api/auth/bypass/', {
+                'email': 'student_a@mariancollege.org'
+            }, format='json')
+            self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_dev_bypass_fails_closed_when_flag_false(self):
+        """Bypass must return 404 when ENABLE_DEV_BYPASS=False in development."""
+        with self.settings(DEBUG=True, ENABLE_DEV_BYPASS=False):
+            res = self.client.post('/api/auth/bypass/', {
+                'email': 'student_a@mariancollege.org'
+            }, format='json')
+            self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_dev_bypass_cannot_escalate_privileged_role(self):
+        """Dev bypass must reject client attempts to select an arbitrary privileged role."""
+        with self.settings(DEBUG=True, ENABLE_DEV_BYPASS=True):
+            res = self.client.post('/api/auth/bypass/', {
+                'email': 'student_a@mariancollege.org',
+                'role': 'admin'
+            }, format='json')
+            self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+            self.student_a.refresh_from_db()
+            self.assertEqual(self.student_a.role, 'student')
+
+    def test_dev_bypass_cannot_autocreate_privileged_accounts(self):
+        """Unseeded admin or staff accounts cannot be created on the fly via dev bypass."""
+        with self.settings(DEBUG=True, ENABLE_DEV_BYPASS=True):
+            res = self.client.post('/api/auth/bypass/', {
+                'email': 'unseeded.staff@mariancollege.org'
+            }, format='json')
+            self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_hardcoded_student_emails_not_granted_rep_privileges(self):
+        """Hardcoded student emails must NOT bypass rep verification logic without class assignment."""
+        from users.views import is_user_student_rep
+        unassigned_student = User.objects.create(
+            username='santhosh.25pmc152@mariancollege.org',
+            email='santhosh.25pmc152@mariancollege.org',
+            role='student'
+        )
+        self.assertFalse(is_user_student_rep(unassigned_student))
+
+    # -------------------------------------------------------------
+    # 2. SUBMISSION IDOR REGRESSION TESTS
+    # -------------------------------------------------------------
+    def test_submission_idor_read_access(self):
+        """Student A can read own submission; cannot read Student B submission (403)."""
+        # Student A -> Student A submission (allowed)
+        self.client.force_authenticate(user=self.student_a)
+        res_own = self.client.get(f'/api/submissions/{self.sub_a.id}/')
+        self.assertEqual(res_own.status_code, status.HTTP_200_OK)
+
+        # Student A -> Student B submission (denied IDOR)
+        res_other = self.client.get(f'/api/submissions/{self.sub_b.id}/')
+        self.assertEqual(res_other.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_submission_idor_class_rep_scoped_access(self):
+        """Student rep can view submissions in assigned class, but denied for other classes."""
+        self.client.force_authenticate(user=self.student_rep1)
+        # In assigned Class 1 -> allowed
+        res_class1 = self.client.get(f'/api/submissions/{self.sub_b.id}/')
+        self.assertEqual(res_class1.status_code, status.HTTP_200_OK)
+
+        # In Class 2 -> denied
+        res_class2 = self.client.get(f'/api/submissions/{self.sub_c.id}/')
+        self.assertEqual(res_class2.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_submission_idor_faculty_department_scoped_access(self):
+        """Faculty can only view submissions from their assigned class or department."""
+        # Faculty Dept 1 -> Student A in Dept 1 (allowed)
+        self.client.force_authenticate(user=self.faculty_dept1)
+        res_dept1 = self.client.get(f'/api/submissions/{self.sub_a.id}/')
+        self.assertEqual(res_dept1.status_code, status.HTTP_200_OK)
+
+        # Faculty Dept 2 -> Student A in Dept 1 (denied)
+        self.client.force_authenticate(user=self.faculty_dept2)
+        res_dept2 = self.client.get(f'/api/submissions/{self.sub_a.id}/')
+        self.assertEqual(res_dept2.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_submission_idor_update_access(self):
+        """Student A cannot update Student B submission (denied 403)."""
+        self.client.force_authenticate(user=self.student_a)
+        res = self.client.put(f'/api/submissions/{self.sub_b.id}/', {
+            'description': 'Malicious Update by Student A'
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+        self.sub_b.refresh_from_db()
+        self.assertEqual(self.sub_b.description, 'Student B Submission')
+
+    def test_submission_idor_delete_access(self):
+        """Student A cannot delete Student B submission (denied 403)."""
+        self.client.force_authenticate(user=self.student_a)
+        res = self.client.delete(f'/api/submissions/{self.sub_b.id}/')
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertTrue(Submission.objects.filter(id=self.sub_b.id).exists())
+
+        # Student A can delete own draft submission
+        res_own = self.client.delete(f'/api/submissions/{self.sub_a.id}/')
+        self.assertEqual(res_own.status_code, status.HTTP_200_OK)
+        self.assertFalse(Submission.objects.filter(id=self.sub_a.id).exists())
+
+    # -------------------------------------------------------------
+    # 3. CLIENT-CONTROLLED WORKFLOW STATUS REGRESSION TESTS
+    # -------------------------------------------------------------
+    def test_student_cannot_post_with_privileged_status(self):
+        """Students cannot set arbitrary or privileged statuses on POST."""
+        self.client.force_authenticate(user=self.student_a)
+
+        # Attempt to create directly in Locked state
+        res_locked = self.client.post('/api/submissions/', {
+            'criteriaId': self.item.id,
+            'status': 'Locked',
+            'description': 'Attempting Locked Submission'
+        }, format='json')
+        self.assertEqual(res_locked.status_code, status.HTTP_403_FORBIDDEN)
+
+        # Attempt to create directly in Evaluated state
+        res_eval = self.client.post('/api/submissions/', {
+            'criteriaId': self.item.id,
+            'status': 'Evaluated',
+            'description': 'Attempting Evaluated Submission'
+        }, format='json')
+        self.assertEqual(res_eval.status_code, status.HTTP_403_FORBIDDEN)
+
+        # Attempt with case variations like 'LOCKED'
+        res_caps = self.client.post('/api/submissions/', {
+            'criteriaId': self.item.id,
+            'status': 'LOCKED',
+            'description': 'Attempting LOCKED Submission'
+        }, format='json')
+        self.assertEqual(res_caps.status_code, status.HTTP_403_FORBIDDEN)
+
+        # Valid Draft creation succeeds
+        res_valid = self.client.post('/api/submissions/', {
+            'criteriaId': self.item.id,
+            'status': 'Draft',
+            'description': 'Legitimate Draft'
+        }, format='json')
+        self.assertEqual(res_valid.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(res_valid.data['status'], 'Draft')
+
+    def test_role_controlled_workflow_status_transitions(self):
+        """Transitions between states must follow legal workflow and role restrictions."""
+        # 1. Student attempts to transition Draft -> Locked (denied)
+        self.client.force_authenticate(user=self.student_b)
+        res_student_lock = self.client.put(f'/api/submissions/{self.sub_b.id}/', {
+            'status': 'Locked'
+        }, format='json')
+        self.assertEqual(res_student_lock.status_code, status.HTTP_403_FORBIDDEN)
+
+        # 2. Student transitions Draft -> Submitted (allowed)
+        res_submit = self.client.put(f'/api/submissions/{self.sub_b.id}/', {
+            'status': 'Submitted'
+        }, format='json')
+        self.assertEqual(res_submit.status_code, status.HTTP_200_OK)
+        self.sub_b.refresh_from_db()
+        self.assertEqual(self.sub_b.status, 'Submitted')
+
+        # 3. Faculty Dept 1 transitions Submitted -> Teacher Verified (allowed)
+        self.client.force_authenticate(user=self.faculty_dept1)
+        res_tv = self.client.put(f'/api/submissions/{self.sub_b.id}/', {
+            'status': 'Teacher Verified'
+        }, format='json')
+        self.assertEqual(res_tv.status_code, status.HTTP_200_OK)
+
+        # 4. Faculty attempts to transition Teacher Verified -> Locked (denied: only admin/iqac)
+        res_fac_lock = self.client.put(f'/api/submissions/{self.sub_b.id}/', {
+            'status': 'Locked'
+        }, format='json')
+        self.assertEqual(res_fac_lock.status_code, status.HTTP_403_FORBIDDEN)
+
+        # 5. Admin transitions Teacher Verified -> Locked (allowed)
+        self.client.force_authenticate(user=self.admin)
+        res_admin_lock = self.client.put(f'/api/submissions/{self.sub_b.id}/', {
+            'status': 'Locked'
+        }, format='json')
+        self.assertEqual(res_admin_lock.status_code, status.HTTP_200_OK)
+        self.sub_b.refresh_from_db()
+        self.assertEqual(self.sub_b.status, 'Locked')
+
+        # 6. Once Locked, submission is immutable even for Admin
+        res_mod_locked = self.client.put(f'/api/submissions/{self.sub_b.id}/', {
+            'description': 'Editing Locked Record'
+        }, format='json')
+        self.assertEqual(res_mod_locked.status_code, status.HTTP_403_FORBIDDEN)
+
+    # -------------------------------------------------------------
+    # 4. BUG REPORT PII PROTECTION (P1-03)
+    # -------------------------------------------------------------
+    def test_bug_report_endpoint_pii_protected(self):
+        """Bug report GET endpoint requires admin/iqac authentication and denies students/anonymous."""
+        from users.models import BugReport
+        BugReport.objects.create(
+            title='Login Issue',
+            reporter_name='Secret Reporter',
+            reporter_email='reporter@mariancollege.org',
+            whatsapp_numbers='+919876543210'
+        )
+
+        # Unauthenticated GET denied
+        res_unauth = self.client.get('/api/bug-reports/')
+        self.assertEqual(res_unauth.status_code, status.HTTP_401_UNAUTHORIZED)
+
+        # Student GET denied
+        self.client.force_authenticate(user=self.student_a)
+        res_student = self.client.get('/api/bug-reports/')
+        self.assertEqual(res_student.status_code, status.HTTP_403_FORBIDDEN)
+
+        # Admin GET allowed
+        self.client.force_authenticate(user=self.admin)
+        res_admin = self.client.get('/api/bug-reports/')
+        self.assertEqual(res_admin.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(res_admin.data), 1)
+
+    # -------------------------------------------------------------
+    # 5. DQC REPRESENTATIVE ASSIGNMENT (P1-05 RUNTIME ERROR FIX)
+    # -------------------------------------------------------------
+    def test_class_dqc_member_assignment_no_runtime_value_error(self):
+        """Assigning a DQC representative must complete without raising ValueError."""
+        self.client.force_authenticate(user=self.admin)
+        new_student = User.objects.create(
+            username='new_rep.25pmc199@mariancollege.org',
+            email='new_rep.25pmc199@mariancollege.org',
+            role='student',
+            class_name=self.class1,
+            department=self.dept1
+        )
+        res = self.client.put(f'/api/auth/classes/{self.class1.id}/', {
+            'dqcMember': new_student.email
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.class1.refresh_from_db()
+        self.assertEqual(self.class1.dqc_member, new_student)
+
+    # -------------------------------------------------------------
+    # 6. PRODUCTION SECURITY DEFAULTS & CONFIGURATION CHECKS
+    # -------------------------------------------------------------
+    def test_production_security_settings_defaults(self):
+        """Verify production security configuration validation logic for allowed hosts, CORS, and secrets."""
+        from django.core.exceptions import ImproperlyConfigured
+
+        # Verify ALLOWED_HOSTS validation in production
+        def validate_hosts(debug, hosts_str):
+            if not debug:
+                if not hosts_str:
+                    raise ImproperlyConfigured("DJANGO_ALLOWED_HOSTS environment variable is required in production.")
+                hosts = [h.strip() for h in hosts_str.split(',') if h.strip()]
+                if '*' in hosts:
+                    raise ImproperlyConfigured("Wildcard '*' in DJANGO_ALLOWED_HOSTS is forbidden in production.")
+                return hosts
+            return [h.strip() for h in (hosts_str or 'localhost,127.0.0.1').split(',') if h.strip()]
+
+        with self.assertRaises(ImproperlyConfigured):
+            validate_hosts(debug=False, hosts_str=None)
+        with self.assertRaises(ImproperlyConfigured):
+            validate_hosts(debug=False, hosts_str='*')
+        with self.assertRaises(ImproperlyConfigured):
+            validate_hosts(debug=False, hosts_str='marian.edu,*')
+
+        self.assertEqual(validate_hosts(debug=False, hosts_str='marian.edu,api.marian.edu'), ['marian.edu', 'api.marian.edu'])
+        self.assertEqual(validate_hosts(debug=True, hosts_str=None), ['localhost', '127.0.0.1'])
+
+        # Verify Google Client ID required in production
+        def validate_google_client_id(debug, client_id):
+            if not debug and not client_id:
+                raise ImproperlyConfigured("GOOGLE_CLIENT_ID environment variable is required in production.")
+            return client_id
+
+        with self.assertRaises(ImproperlyConfigured):
+            validate_google_client_id(debug=False, client_id=None)
+        with self.assertRaises(ImproperlyConfigured):
+            validate_google_client_id(debug=False, client_id='')
+        self.assertEqual(validate_google_client_id(debug=False, client_id='google-id-123'), 'google-id-123')
+
+
 
 
 

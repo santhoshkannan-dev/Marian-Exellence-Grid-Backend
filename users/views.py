@@ -1,6 +1,10 @@
 
 from .models import Champion, BugReport
-from .serializers import ChampionSerializer, BugReportSerializer
+from .serializers import (
+    ChampionSerializer, BugReportSerializer,
+    SubmissionSerializer, AcademicGradeBreakdownSerializer,
+    CriteriaCategorySerializer, CriteriaItemSerializer, CriteriaRuleSerializer, CriteriaVersionSerializer
+)
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 import logging
 import hashlib
@@ -33,7 +37,7 @@ except ImportError:
 
 from django.db import transaction
 from django.db.models import Q, Sum
-from .models import User, Class, Department, Course, Submission, AcademicYear, SystemSetting, UserGroupModel, CriteriaCategory, CriteriaItem, CriteriaRule
+from .models import User, Class, Department, Course, Submission, AcademicYear, SystemSetting, UserGroupModel, CriteriaCategory, CriteriaItem, CriteriaRule, CriteriaVersion, AcademicGradeBreakdown
 
 
 VALID_STATE_TRANSITIONS = {
@@ -125,8 +129,6 @@ def is_user_student_rep(user):
         return True
     user_email = (getattr(user, 'email', '') or '').strip().lower()
     if user_email:
-        if user_email in ('santhosh.25pmc152@mariancollege.org', 'santhosh.25ubc154@mariancollege.org'):
-            return True
         if Class.objects.filter(dqc_member__email__iexact=user_email).exists():
             return True
         rep_group = UserGroupModel.objects.filter(
@@ -636,44 +638,32 @@ class DevBypassLoginView(APIView):
         try:
             user = User.objects.get(email=email)
             
-            # Allow frontend to override the role for testing specific flows with one user
-            if override_role and user.role != override_role:
-                user.role = override_role
-                user.save(update_fields=['role'])
-                
-            # Fix incorrect role assignment for special users in dev environment
-            if email == 'admin@mariancollege.org' and user.role != 'admin':
-                user.role = 'admin'
-                user.save(update_fields=['role'])
-            elif email == 'iqac@mariancollege.org' and user.role != 'iqac':
-                user.role = 'iqac'
-                user.save(update_fields=['role'])
-        except User.DoesNotExist:
-            if email == 'admin@mariancollege.org':
-                user = User.objects.create(username=email, email=email, first_name="System", last_name="Administrator", role='admin', is_staff=True, is_superuser=True)
-            elif email == 'iqac@mariancollege.org':
-                user = User.objects.create(username=email, email=email, first_name="IQAC", last_name="Coordinator", role='iqac', is_staff=True)
-            elif email == 'kochumol.abraham@mariancollege.org':
-                user = User.objects.create(username=email, email=email, first_name="Kochumol", last_name="Abraham", role=override_role or 'faculty', is_staff=True)
-            elif email == 'allen.george@mariancollege.org':
-                user = User.objects.create(username=email, email=email, first_name="Allen", last_name="George", role=override_role or 'evaluation', is_staff=True)
-            else:
-                detected_role = determine_role_from_email(email)
-                if detected_role == 'student':
-                    derived_name = parse_name_from_email(email)
-                    names = derived_name.split(" ", 1)
-                    user = User.objects.create(
-                        username=email,
-                        email=email,
-                        first_name=names[0],
-                        last_name=names[1] if len(names) > 1 else "",
-                        role='student'
-                    )
-                else:
+            # Security: A user must never be able to select an arbitrary privileged role
+            if override_role and override_role != user.role:
+                if override_role in ('admin', 'iqac', 'faculty', 'evaluation'):
                     return Response(
-                        {"error": "User not found. Only student accounts can be auto-created."},
-                        status=status.HTTP_404_NOT_FOUND
+                        {"error": "Selecting an arbitrary privileged role via development bypass is strictly prohibited."},
+                        status=status.HTTP_403_FORBIDDEN
                     )
+                # Only non-privileged role switching (e.g. testing student role variations) without mutating DB
+                user.role = override_role
+        except User.DoesNotExist:
+            detected_role = determine_role_from_email(email)
+            if detected_role == 'student':
+                derived_name = parse_name_from_email(email)
+                names = derived_name.split(" ", 1)
+                user = User.objects.create(
+                    username=email,
+                    email=email,
+                    first_name=names[0],
+                    last_name=names[1] if len(names) > 1 else "",
+                    role='student'
+                )
+            else:
+                return Response(
+                    {"error": "User not found. Privileged accounts (admin/faculty/evaluator) must be provisioned through administrative channels."},
+                    status=status.HTTP_404_NOT_FOUND
+                )
 
         user = allocate_student_from_email(user)
         tokens = get_tokens_for_user(user)
@@ -1188,8 +1178,6 @@ class ClassListView(APIView):
                         }, status=status.HTTP_400_BAD_REQUEST)
 
                     cls.dqc_member = student
-                    student.is_student_rep = True
-                    student.save(update_fields=['is_student_rep'])
                 except User.DoesNotExist:
                     return Response({"error": f"Student with email '{dqc_email}' not found"}, status=status.HTTP_404_NOT_FOUND)
 
@@ -1344,8 +1332,6 @@ class ClassDetailView(APIView):
                             status=status.HTTP_400_BAD_REQUEST
                         )
                     cls.dqc_member = student
-                    student.is_student_rep = True
-                    student.save(update_fields=['is_student_rep'])
                 except User.DoesNotExist:
                     return Response({"error": f"Student with email '{dqc_email}' not found"}, status=status.HTTP_404_NOT_FOUND)
 
@@ -1567,13 +1553,18 @@ def get_criteria_allowed_bounds(criteria_item, evidence=None):
 
     rule = CriteriaRule.objects.filter(item=criteria_item).first()
     
-    # Base mark calculation
-    base_mark = float(criteria_item.marks or 0.0)
+    # Base mark calculation: CriteriaRule is authoritative
+    if rule and rule.maximum_marks is not None:
+        base_mark = float(rule.maximum_marks)
+    else:
+        base_mark = float(criteria_item.marks or 0.0)
     details = ""
 
-    # 1. SubItems mapping in rules_json (Publications, Patents, Book Publications, Prizes, etc.)
+    # 1. SubItems mapping in CriteriaRule.extra_config (authoritative) or rules_json (fallback)
     sub_items = None
-    if isinstance(criteria_item.rules_json, dict) and 'subItems' in criteria_item.rules_json:
+    if rule and isinstance(rule.extra_config, dict) and 'subItems' in rule.extra_config:
+        sub_items = rule.extra_config.get('subItems')
+    elif isinstance(criteria_item.rules_json, dict) and 'subItems' in criteria_item.rules_json:
         sub_items = criteria_item.rules_json.get('subItems')
 
     if isinstance(sub_items, dict) and len(sub_items) > 0:
@@ -1643,7 +1634,7 @@ def get_criteria_allowed_bounds(criteria_item, evidence=None):
                 allowed_max = min(allowed_max, rule_max)
             else:
                 allowed_max = rule_max
-        if rule.minimum_marks is not None:
+        if getattr(rule, 'minimum_marks', None) is not None:
             allowed_min = float(rule.minimum_marks)
         if rule.is_negative:
             is_negative = True
@@ -1652,6 +1643,15 @@ def get_criteria_allowed_bounds(criteria_item, evidence=None):
         allowed_min = -1000.0
 
     return allowed_min, allowed_max, details
+
+
+def calculate_submission_score(criteria_item, evidence=None):
+    """
+    Evaluates the authoritative marks for a submission against a CriteriaItem and its CriteriaRule.
+    CriteriaRule is authoritative for base marks, sub-items, caps, and multipliers.
+    """
+    allowed_min, allowed_max, _ = get_criteria_allowed_bounds(criteria_item, evidence)
+    return allowed_max
 
 
 class SubmissionListView(APIView):
@@ -1726,11 +1726,27 @@ class SubmissionListView(APIView):
         criteria_id = request.data.get('criteriaId')
         academic_year = request.data.get('academicYear', '2025-2026')
         description = request.data.get('description', '')
-        status_val = request.data.get('status', 'Pending Verification')
+        raw_status = request.data.get('status')
+        user_role = getattr(user, 'role', None)
+
+        # Validate workflow status on creation: client cannot set privileged or terminal states
+        if user_role == 'student':
+            # Students are strictly restricted to non-privileged initial statuses
+            if raw_status is not None and raw_status not in ('Draft', 'Submitted', 'Pending Verification', 'Pending Rep Verification'):
+                return Response(
+                    {"error": "Unauthorized: Students cannot create submissions in verified, evaluated, or locked status."},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+            status_val = raw_status if raw_status else 'Draft'
+        else:
+            status_val = raw_status if raw_status else 'Pending Verification'
+            if status_val not in dict(Submission.STATUS_CHOICES):
+                return Response({"error": f"Invalid status: '{status_val}'."}, status=status.HTTP_400_BAD_REQUEST)
+
         remarks = request.data.get('remarks', '')
         evidence = request.data.get('evidence')
         marks = request.data.get('marks')
-        if marks is not None and user and getattr(user, 'role', None) == 'student':
+        if marks is not None and user and user_role == 'student':
             marks = None
         elif marks is not None:
             try:
@@ -1850,10 +1866,48 @@ class SubmissionListView(APIView):
         except (ValueError, TypeError):
             criteria_id_int = abs(int(hashlib.md5(str(criteria_id).encode()).hexdigest(), 16)) % 1000000
 
+        # Resolve active CriteriaVersion for submission's academic_year
+        active_cv = CriteriaVersion.objects.filter(academic_year=academic_year, is_locked=False).order_by('-version').first()
+        if not active_cv:
+            active_cv = CriteriaVersion.objects.filter(academic_year=academic_year).order_by('-version').first()
+        if not active_cv:
+            active_cv, _ = CriteriaVersion.objects.get_or_create(
+                academic_year=academic_year or '2025-2026',
+                version=1,
+                defaults={'name': f'{academic_year} v1', 'is_locked': False}
+            )
+
+        # Academic Grade Breakdown: AcademicGradeBreakdown is the authoritative relational source
+        gb_data = request.data.get('grade_breakdown')
+        if not gb_data and isinstance(evidence, dict) and "grades" in evidence:
+            ev_g = evidence.get('grades') or {}
+            gb_data = {
+                "s_grade_count": ev_g.get("S", 0),
+                "a_plus_grade_count": ev_g.get("APlus", 0),
+                "a_grade_count": ev_g.get("A", 0),
+                "other_pass_count": ev_g.get("OtherPass", 0) or ev_g.get("B", 0),
+                "failed_count": ev_g.get("Fail", 0),
+                "total_students": evidence.get("totalStudents", 0)
+            }
+
+        # Clean evidence to avoid duplicating grade data in JSON
+        clean_evidence = dict(evidence or {}) if isinstance(evidence, dict) else {}
+        clean_evidence.pop("grades", None)
+        clean_evidence.pop("markBreakdown", None)
+        clean_evidence.pop("classPassPercentage", None)
+        clean_evidence.pop("totalStudents", None)
+        clean_evidence.pop("passCount", None)
+
+        if marks is None:
+            c_item = CriteriaItem.objects.filter(pk=criteria_id_int).first()
+            if c_item:
+                marks = calculate_submission_score(c_item, evidence)
+
         try:
             submission = Submission.objects.create(
                 user=user,
                 criteria_id=criteria_id_int,
+                criteria_version=active_cv,
                 academic_year=academic_year,
                 description=description,
                 status=status_val,
@@ -1863,7 +1917,7 @@ class SubmissionListView(APIView):
                 proof_hash=proof_h,
                 certificate_id=cert_id,
                 event_id=event_id,
-                evidence=evidence,
+                evidence=clean_evidence,
                 start_date=start_date,
                 end_date=end_date
             )
@@ -1872,20 +1926,19 @@ class SubmissionListView(APIView):
         
         # Sync relational models (AcademicGradeBreakdown & WorkflowAuditTrail)
         try:
-            from users.models import AcademicGradeBreakdown, WorkflowAuditTrail
-            sub_evidence = evidence or {}
-            sub_type = sub_evidence.get("submissionType")
+            from users.models import WorkflowAuditTrail
+            sub_type = clean_evidence.get("submissionType")
             if sub_type:
                 submission.submission_type = sub_type
                 submission.save(update_fields=["submission_type"])
-            grades = sub_evidence.get("grades")
-            if isinstance(grades, dict):
-                s_c = int(grades.get("S", 0) or 0)
-                ap_c = int(grades.get("APlus", 0) or 0)
-                a_c = int(grades.get("A", 0) or 0)
-                other_c = int(grades.get("OtherPass", 0) or grades.get("B", 0) or 0)
-                fail_c = int(grades.get("Fail", 0) or 0)
-                total_c = int(sub_evidence.get("totalStudents", 0) or 0)
+
+            if isinstance(gb_data, dict):
+                s_c = int(gb_data.get("s_grade_count", 0) or 0)
+                ap_c = int(gb_data.get("a_plus_grade_count", 0) or 0)
+                a_c = int(gb_data.get("a_grade_count", 0) or 0)
+                other_c = int(gb_data.get("other_pass_count", 0) or 0)
+                fail_c = int(gb_data.get("failed_count", 0) or 0)
+                total_c = int(gb_data.get("total_students", 0) or 0)
                 AcademicGradeBreakdown.objects.update_or_create(
                     submission=submission,
                     defaults={
@@ -1894,7 +1947,6 @@ class SubmissionListView(APIView):
                         "a_grade_count": a_c,
                         "other_pass_count": other_c,
                         "failed_count": fail_c,
-                        "class_pass_percentage": float(sub_evidence.get("classPassPercentage", 0.0) or 0.0),
                         "total_students": total_c
                     }
                 )
@@ -1944,6 +1996,39 @@ class SubmissionListView(APIView):
 
 class SubmissionDetailView(APIView):
     permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        try:
+            submission = Submission.objects.select_related('user', 'user__class_name', 'user__department').get(pk=pk)
+        except Submission.DoesNotExist:
+            return Response({"error": "Submission not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        user = request.user
+        user_role = getattr(user, 'role', None)
+
+        # Object-level authorization for reading submissions (Area 3: IDOR prevention)
+        if user.is_superuser or user_role in ('admin', 'iqac', 'evaluation'):
+            pass
+        elif user_role == 'faculty':
+            advised_classes = Class.objects.filter(class_teacher=user)
+            is_class_teacher = bool(submission.user and submission.user.class_name in advised_classes)
+            is_same_dept = bool(submission.user and user.department_id and (submission.user.department_id == user.department_id))
+            if not (is_class_teacher or is_same_dept):
+                return Response({"error": "You do not have permission to view this submission."}, status=status.HTTP_403_FORBIDDEN)
+        elif user_role == 'student':
+            if submission.user_id != user.id:
+                if not is_user_student_rep(user):
+                    return Response({"error": "You do not have permission to view this submission."}, status=status.HTTP_403_FORBIDDEN)
+                rep_classes = Class.objects.filter(
+                    Q(dqc_member=user) | Q(dqc_member__email__iexact=user.email)
+                )
+                if not (submission.user and submission.user.class_name in rep_classes):
+                    return Response({"error": "You do not have permission to view this submission."}, status=status.HTTP_403_FORBIDDEN)
+        else:
+            return Response({"error": "You do not have permission to view this submission."}, status=status.HTTP_403_FORBIDDEN)
+
+        serializer = SubmissionSerializer(submission)
+        return Response(serializer.data, status=status.HTTP_200_OK)
 
     def put(self, request, pk):
         user = request.user
@@ -1999,6 +2084,22 @@ class SubmissionDetailView(APIView):
                     {"error": "You do not have permission to modify this submission."},
                     status=status.HTTP_403_FORBIDDEN
                 )
+        elif user_role == 'faculty':
+            advised_classes = Class.objects.filter(class_teacher=user)
+            is_class_teacher = bool(submission.user and submission.user.class_name in advised_classes)
+            is_same_dept = bool(submission.user and user.department_id and (submission.user.department_id == user.department_id))
+            if not (is_class_teacher or is_same_dept):
+                return Response(
+                    {"error": "Faculty cannot modify submissions outside their advised class or department."},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+        elif user.is_superuser or user_role in ('admin', 'iqac', 'evaluation'):
+            pass
+        else:
+            return Response(
+                {"error": "You do not have permission to modify this submission."},
+                status=status.HTTP_403_FORBIDDEN
+            )
 
         # Check online courses & UPSC/PSC limits on update if changing criteriaId or status
         target_criteria_id = int(request.data.get('criteriaId', submission.criteria_id))
@@ -2050,31 +2151,63 @@ class SubmissionDetailView(APIView):
             description=request.data.get('description', submission.description),
             submission_id=submission.id
         )
-        # Academic Grade Breakdown Validation on update
+        # Academic Grade Breakdown: AcademicGradeBreakdown is the authoritative relational source
+        gb_data = request.data.get('grade_breakdown')
+        if not gb_data and isinstance(request.data.get('evidence'), dict) and "grades" in request.data.get('evidence'):
+            ev_g = request.data.get('evidence').get('grades') or {}
+            gb_data = {
+                "s_grade_count": ev_g.get("S", 0),
+                "a_plus_grade_count": ev_g.get("APlus", 0),
+                "a_grade_count": ev_g.get("A", 0),
+                "other_pass_count": ev_g.get("OtherPass", 0) or ev_g.get("B", 0),
+                "failed_count": ev_g.get("Fail", 0),
+                "total_students": request.data.get('evidence').get("totalStudents", 0)
+            }
+        
         upd_ev = request.data.get('evidence', submission.evidence)
-        if isinstance(upd_ev, dict) and "grades" in upd_ev:
-            grades_data = upd_ev.get("grades") or {}
-            s_cnt = int(grades_data.get("S", 0))
-            ap_cnt = int(grades_data.get("APlus", 0))
-            a_cnt = int(grades_data.get("A", 0))
-            fail_cnt = int(grades_data.get("Fail", 0))
-            t_students = int(upd_ev.get("totalStudents", 0))
+        if isinstance(gb_data, dict):
+            s_cnt = int(gb_data.get('s_grade_count', 0) or 0)
+            ap_cnt = int(gb_data.get('a_plus_grade_count', 0) or 0)
+            a_cnt = int(gb_data.get('a_grade_count', 0) or 0)
+            oth_cnt = int(gb_data.get('other_pass_count', 0) or 0)
+            fail_cnt = int(gb_data.get('failed_count', 0) or 0)
+            t_students = int(gb_data.get('total_students', 0) or 0)
 
-            if s_cnt < 0 or ap_cnt < 0 or a_cnt < 0 or fail_cnt < 0 or t_students < 0:
+            if s_cnt < 0 or ap_cnt < 0 or a_cnt < 0 or oth_cnt < 0 or fail_cnt < 0 or t_students < 0:
                 return Response({"error": "Grade counts and total students cannot be negative."}, status=status.HTTP_400_BAD_REQUEST)
 
-            g_sum = s_cnt + ap_cnt + a_cnt + fail_cnt
+            passed = max(0, t_students - fail_cnt)
+            if oth_cnt <= 0 and passed > (s_cnt + ap_cnt + a_cnt):
+                oth_cnt = passed - (s_cnt + ap_cnt + a_cnt)
+
+            g_sum = s_cnt + ap_cnt + a_cnt + oth_cnt + fail_cnt
             if t_students <= 0:
                 t_students = max(1, g_sum)
-                upd_ev["totalStudents"] = t_students
 
-            if g_sum > t_students:
-                return Response({"error": f"Sum of student grades ({g_sum}) exceeds total class students ({t_students})."}, status=status.HTTP_400_BAD_REQUEST)
+            if g_sum != t_students:
+                return Response({"error": f"Sum of grade counts ({g_sum}) must strictly equal total students ({t_students})."}, status=status.HTTP_400_BAD_REQUEST)
 
-            passed = max(0, t_students - fail_cnt)
             pass_pct = round((passed / float(t_students)) * 100.0, 2)
-            upd_ev["classPassPercentage"] = pass_pct
-            upd_ev["passCount"] = passed
+            AcademicGradeBreakdown.objects.update_or_create(
+                submission=submission,
+                defaults={
+                    "s_grade_count": s_cnt,
+                    "a_plus_grade_count": ap_cnt,
+                    "a_grade_count": a_cnt,
+                    "other_pass_count": oth_cnt,
+                    "failed_count": fail_cnt,
+                    "class_pass_percentage": pass_pct,
+                    "total_students": t_students
+                }
+            )
+            # Ensure evidence does not duplicate grade data in JSON
+            if isinstance(upd_ev, dict):
+                upd_ev = dict(upd_ev)
+                upd_ev.pop("grades", None)
+                upd_ev.pop("markBreakdown", None)
+                upd_ev.pop("classPassPercentage", None)
+                upd_ev.pop("totalStudents", None)
+                upd_ev.pop("passCount", None)
 
         # 1. Locked Record Guard
         if submission.status == 'Locked':
@@ -2090,6 +2223,22 @@ class SubmissionDetailView(APIView):
                 return Response(
                     {"error": f"Invalid workflow state transition from '{submission.status}' to '{target_status}'."},
                     status=status.HTTP_400_BAD_REQUEST
+                )
+            # Role-specific destination status checks
+            if target_status == 'Locked' and user_role not in ('admin', 'iqac') and not user.is_superuser:
+                return Response(
+                    {"error": "Unauthorized: Only administrators and IQAC coordinators can lock submissions."},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+            if target_status == 'Evaluated' and user_role not in ('evaluation', 'iqac', 'admin') and not user.is_staff:
+                return Response(
+                    {"error": "Unauthorized: Only the evaluation committee can evaluate submissions."},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+            if target_status == 'Teacher Verified' and user_role not in ('faculty', 'iqac', 'admin') and not user.is_staff:
+                return Response(
+                    {"error": "Unauthorized: Only faculty members can transition submissions to 'Teacher Verified'."},
+                    status=status.HTTP_403_FORBIDDEN
                 )
 
         # 1c. Student Evidence Locking Guard
@@ -2340,8 +2489,129 @@ class UserGroupListView(APIView):
             "description": group.description,
             "members": group.members
         }, status=status.HTTP_200_OK)
-from .models import CriteriaCategory, CriteriaItem
-from .serializers import CriteriaCategorySerializer, CriteriaItemSerializer
+
+
+class UserGroupDetailView(APIView):
+    permission_classes = [IsAdminOrReadOnly]
+
+    def get(self, request, pk):
+        try:
+            g = UserGroupModel.objects.get(group_id=pk)
+            return Response({
+                "id": g.group_id,
+                "name": g.name,
+                "description": g.description,
+                "members": g.members or []
+            }, status=status.HTTP_200_OK)
+        except UserGroupModel.DoesNotExist:
+            return Response({"error": "Group not found"}, status=status.HTTP_404_NOT_FOUND)
+
+    def put(self, request, pk):
+        try:
+            g = UserGroupModel.objects.get(group_id=pk)
+            g.name = request.data.get('name', g.name)
+            g.description = request.data.get('description', g.description)
+            if 'members' in request.data:
+                g.members = request.data.get('members')
+            g.save()
+            return Response({
+                "id": g.group_id,
+                "name": g.name,
+                "description": g.description,
+                "members": g.members
+            }, status=status.HTTP_200_OK)
+        except UserGroupModel.DoesNotExist:
+            return Response({"error": "Group not found"}, status=status.HTTP_404_NOT_FOUND)
+
+    def delete(self, request, pk):
+        try:
+            g = UserGroupModel.objects.get(group_id=pk)
+            g.delete()
+            return Response({"success": True}, status=status.HTTP_200_OK)
+        except UserGroupModel.DoesNotExist:
+            return Response({"error": "Group not found"}, status=status.HTTP_404_NOT_FOUND)
+
+
+from .models import CriteriaCategory, CriteriaItem, CriteriaRule, CriteriaVersion
+from .serializers import CriteriaCategorySerializer, CriteriaItemSerializer, CriteriaRuleSerializer, CriteriaVersionSerializer
+
+class CriteriaVersionListView(APIView):
+    permission_classes = [IsAdminOrReadOnly]
+
+    def get(self, request):
+        year = request.query_params.get('year', None)
+        qs = CriteriaVersion.objects.all()
+        if year:
+            qs = qs.filter(academic_year=year)
+        serializer = CriteriaVersionSerializer(qs, many=True)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    def post(self, request):
+        academic_year = request.data.get('academic_year')
+        if not academic_year:
+            return Response({"error": "academic_year is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        latest = CriteriaVersion.objects.filter(academic_year=academic_year).order_by('-version').first()
+        next_v = (latest.version + 1) if latest else 1
+
+        name = request.data.get('name', f"{academic_year} v{next_v}")
+        new_version = CriteriaVersion.objects.create(
+            academic_year=academic_year,
+            version=next_v,
+            name=name,
+            is_locked=False
+        )
+
+        clone_from_id = request.data.get('clone_from_version_id')
+        if clone_from_id:
+            source_items = CriteriaItem.objects.filter(version_id=clone_from_id).prefetch_related('rules')
+            for src_item in source_items:
+                new_item = CriteriaItem.objects.create(
+                    category=src_item.category,
+                    version=new_version,
+                    title=src_item.title,
+                    type=src_item.type,
+                    marks=src_item.marks,
+                    rules_json=src_item.rules_json
+                )
+                for src_rule in src_item.rules.all():
+                    CriteriaRule.objects.create(
+                        item=new_item,
+                        rule_type=src_rule.rule_type,
+                        maximum_marks=src_rule.maximum_marks,
+                        min_count=src_rule.min_count,
+                        max_count=src_rule.max_count,
+                        is_negative=src_rule.is_negative,
+                        multiplier=src_rule.multiplier,
+                        extra_config=src_rule.extra_config
+                    )
+
+        serializer = CriteriaVersionSerializer(new_version)
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+
+class CriteriaVersionDetailView(APIView):
+    permission_classes = [IsAdminRole]
+
+    def put(self, request, pk):
+        try:
+            cv = CriteriaVersion.objects.get(pk=pk)
+        except CriteriaVersion.DoesNotExist:
+            return Response({"error": "Criteria version not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        if 'is_locked' in request.data:
+            cv.is_locked = bool(request.data['is_locked'])
+            if cv.is_locked and not cv.published_at:
+                from django.utils import timezone
+                cv.published_at = timezone.now()
+
+        if 'name' in request.data:
+            cv.name = request.data['name']
+
+        cv.save()
+        serializer = CriteriaVersionSerializer(cv)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
 
 class CriteriaCategoryListView(APIView):
     permission_classes = [IsAdminOrReadOnly]
@@ -2505,7 +2775,12 @@ class BugReportView(APIView):
     parser_classes = [MultiPartParser, FormParser, JSONParser]
 
     def get(self, request):
-        # Authenticated users with admin/staff role can view all reports, others get minimal or own
+        user = request.user
+        if not (user and user.is_authenticated and (getattr(user, 'role', None) in ('admin', 'iqac') or user.is_staff or user.is_superuser)):
+            return Response(
+                {"error": "Authentication required. Only administrators and IQAC coordinators can view bug reports."},
+                status=status.HTTP_401_UNAUTHORIZED if not (user and user.is_authenticated) else status.HTTP_403_FORBIDDEN
+            )
         reports = BugReport.objects.all()
         status_filter = request.query_params.get('status')
         if status_filter:

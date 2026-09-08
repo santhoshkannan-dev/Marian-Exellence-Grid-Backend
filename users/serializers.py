@@ -1,7 +1,7 @@
 from rest_framework import serializers
 from .models import (
     Department, Course, AcademicYear, Class, User,
-    CriteriaCategory, CriteriaItem, CriteriaRule, Submission,
+    CriteriaCategory, CriteriaItem, CriteriaRule, CriteriaVersion, Submission,
     AcademicGradeBreakdown, WorkflowAuditTrail, ClassIndexResult,
     Champion, BugReport
 )
@@ -72,6 +72,14 @@ class DepartmentSerializer(serializers.ModelSerializer):
         ]
 
 
+class CriteriaVersionSerializer(serializers.ModelSerializer):
+    item_count = serializers.IntegerField(source='items.count', read_only=True)
+
+    class Meta:
+        model = CriteriaVersion
+        fields = ['id', 'academic_year', 'version', 'name', 'created_at', 'published_at', 'is_locked', 'item_count']
+
+
 class CriteriaRuleSerializer(serializers.ModelSerializer):
     class Meta:
         model = CriteriaRule
@@ -83,7 +91,7 @@ class CriteriaItemSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = CriteriaItem
-        fields = ['id', 'category', 'title', 'type', 'marks', 'rules_json', 'rules', 'created_at', 'updated_at']
+        fields = ['id', 'category', 'version', 'title', 'type', 'marks', 'rules_json', 'rules', 'created_at', 'updated_at']
 
 
 class CriteriaCategorySerializer(serializers.ModelSerializer):
@@ -122,7 +130,7 @@ class SubmissionSerializer(serializers.ModelSerializer):
     class Meta:
         model = Submission
         fields = [
-            'id', 'user', 'user_email', 'user_name', 'criteria_id',
+            'id', 'user', 'user_email', 'user_name', 'criteria_id', 'criteria_version',
             'academic_year', 'submission_type', 'description', 'status',
             'remarks', 'marks', 'proof', 'proof_hash', 'certificate_id', 'event_id', 'start_date', 'end_date', 'evaluator_verified',
             'evidence', 'verified_by_name', 'rep_verified_by_name', 'rep_remarks',

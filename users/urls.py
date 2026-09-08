@@ -20,6 +20,8 @@ from .views import (
     SystemSettingView,
     UserGroupListView,
     UserGroupDetailView,
+    CriteriaVersionListView,
+    CriteriaVersionDetailView,
     CriteriaCategoryListView,
     CriteriaCategoryDetailView,
     CriteriaItemListView,
@@ -48,6 +50,8 @@ urlpatterns = [
     path('settings/', SystemSettingView.as_view(), name='system-settings'),
     path('user-groups/', UserGroupListView.as_view(), name='user-groups'),
     path('user-groups/<str:pk>/', UserGroupDetailView.as_view(), name='user-group-detail'),
+    path('criteria-versions/', CriteriaVersionListView.as_view(), name='criteria-versions'),
+    path('criteria-versions/<int:pk>/', CriteriaVersionDetailView.as_view(), name='criteria-version-detail'),
     path('criteria-categories/', CriteriaCategoryListView.as_view(), name='criteria-categories'),
     path('criteria-categories/<str:pk>/', CriteriaCategoryDetailView.as_view(), name='criteria-category-detail'),
     path('criteria-items/', CriteriaItemListView.as_view(), name='criteria-items'),
@@ -55,9 +59,6 @@ urlpatterns = [
     path('champions/', ChampionListView.as_view(), name='champions-list'),
     path('champions/<int:pk>/', ChampionDetailView.as_view(), name='champions-detail'),
     path('bug-reports/', BugReportView.as_view(), name='bug-reports'),
+    path('auth/bypass/', DevBypassLoginView.as_view(), name='dev-bypass-login'),
 ]
-
-# Development bypass login endpoint is strictly registered ONLY when ENABLE_DEV_BYPASS is explicitly enabled
-if getattr(settings, 'ENABLE_DEV_BYPASS', False):
-    urlpatterns.insert(1, path('auth/bypass/', DevBypassLoginView.as_view(), name='dev-bypass-login'))
 
