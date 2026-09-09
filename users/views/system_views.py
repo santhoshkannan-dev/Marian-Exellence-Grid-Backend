@@ -10,7 +10,7 @@ from users.models import SystemSetting, UserGroupModel, BugReport, SystemAuditLo
 from users.serializers import BugReportSerializer, BugReportSafeSerializer, SystemAuditLogSerializer, WorkflowAuditTrailSerializer
 from users.permissions import IsAdminOrReadOnly
 from users.file_security import validate_file_upload, ALLOWED_IMAGE_EXTENSIONS, MAX_IMAGE_SIZE_BYTES
-from .base import record_system_audit_event, is_user_student_rep
+from .base import record_system_audit_event, is_user_student_rep, is_staff_email, is_student_email
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +88,48 @@ class UserGroupListView(APIView):
 
         clean_id = str(group_id).strip()
         clean_name = str(name).strip()
+
+        if clean_id in ['grp-evaluators', 'grp-evaluation-committee'] or 'evaluat' in clean_name.lower() or 'evaluat' in clean_id.lower():
+            return Response(
+                {"error": "Evaluators cannot be managed through User Groups. Please use Evaluator Management."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        is_class_teachers_group = (clean_id == 'grp-class-teachers' or 'class teacher' in clean_name.lower())
+        if is_class_teachers_group and members and isinstance(members, list):
+            invalid_staff_emails = [m for m in members if isinstance(m, str) and not is_staff_email(m)]
+            if invalid_staff_emails:
+                return Response(
+                    {"error": f"Class Teachers Council only permits staff emails (name.name@mariancollege.org, e.g. kochumol.abraham@mariancollege.org). Student emails are not permitted. Invalid emails: {', '.join(invalid_staff_emails)}"},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+        is_dqc_group = (
+            clean_id == 'grp-dqc-student-rep' or
+            'dqc' in clean_name.lower() or 'dac' in clean_name.lower() or
+            'dqc' in clean_id.lower() or 'dac' in clean_id.lower()
+        )
+        if is_dqc_group and members and isinstance(members, list):
+            invalid_student_emails = [m for m in members if isinstance(m, str) and not is_student_email(m)]
+            if invalid_student_emails:
+                return Response(
+                    {"error": f"DQC Student Rep Group only permits student emails (name.startingwithnumber@mariancollege.org, e.g. amal.25pmc114@mariancollege.org). Staff emails are not permitted. Invalid emails: {', '.join(invalid_student_emails)}"},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+        is_student_rep_group = (
+            clean_id == 'grp-student-reps' or
+            'student rep' in clean_name.lower() or
+            'student rep' in clean_id.lower()
+        ) and not is_dqc_group
+        if is_student_rep_group and members and isinstance(members, list):
+            invalid_student_emails = [m for m in members if isinstance(m, str) and not is_student_email(m)]
+            if invalid_student_emails:
+                return Response(
+                    {"error": f"Student Rep Group only permits student emails (name.startingwithnumber@mariancollege.org, e.g. amal.25pmc114@mariancollege.org). Staff emails are not permitted. Invalid emails: {', '.join(invalid_student_emails)}"},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
         if len(clean_id) > 100:
             return Response({"error": "id cannot exceed 100 characters."}, status=status.HTTP_400_BAD_REQUEST)
         if len(clean_name) > 150:
@@ -132,10 +174,50 @@ class UserGroupDetailView(APIView):
     def put(self, request, pk):
         try:
             g = UserGroupModel.objects.get(group_id=pk)
-            g.name = request.data.get('name', g.name)
-            g.description = request.data.get('description', g.description)
+            name = request.data.get('name', g.name)
+            description = request.data.get('description', g.description)
+            members = request.data.get('members', g.members)
+
+            is_class_teachers_group = (pk == 'grp-class-teachers' or 'class teacher' in str(name).lower() or 'class teacher' in str(g.name).lower())
+            if is_class_teachers_group and members and isinstance(members, list):
+                invalid_staff_emails = [m for m in members if isinstance(m, str) and not is_staff_email(m)]
+                if invalid_staff_emails:
+                    return Response(
+                        {"error": f"Class Teachers Council only permits staff emails (name.name@mariancollege.org, e.g. kochumol.abraham@mariancollege.org). Student emails are not permitted. Invalid emails: {', '.join(invalid_staff_emails)}"},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+
+            is_dqc_group = (
+                pk == 'grp-dqc-student-rep' or
+                'dqc' in str(name).lower() or 'dqc' in str(g.name).lower() or
+                'dac' in str(name).lower() or 'dac' in str(g.name).lower() or
+                'dqc' in str(pk).lower() or 'dac' in str(pk).lower()
+            )
+            if is_dqc_group and members and isinstance(members, list):
+                invalid_student_emails = [m for m in members if isinstance(m, str) and not is_student_email(m)]
+                if invalid_student_emails:
+                    return Response(
+                        {"error": f"DQC Student Rep Group only permits student emails (name.startingwithnumber@mariancollege.org, e.g. amal.25pmc114@mariancollege.org). Staff emails are not permitted. Invalid emails: {', '.join(invalid_student_emails)}"},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+
+            is_student_rep_group = (
+                pk == 'grp-student-reps' or
+                'student rep' in str(name).lower() or 'student rep' in str(g.name).lower() or
+                'student rep' in str(pk).lower()
+            ) and not is_dqc_group
+            if is_student_rep_group and members and isinstance(members, list):
+                invalid_student_emails = [m for m in members if isinstance(m, str) and not is_student_email(m)]
+                if invalid_student_emails:
+                    return Response(
+                        {"error": f"Student Rep Group only permits student emails (name.startingwithnumber@mariancollege.org, e.g. amal.25pmc114@mariancollege.org). Staff emails are not permitted. Invalid emails: {', '.join(invalid_student_emails)}"},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+
+            g.name = name
+            g.description = description
             if 'members' in request.data:
-                g.members = request.data.get('members')
+                g.members = members
             g.save()
             return Response({
                 "id": g.group_id,
@@ -143,6 +225,7 @@ class UserGroupDetailView(APIView):
                 "description": g.description,
                 "members": g.members
             }, status=status.HTTP_200_OK)
+
         except UserGroupModel.DoesNotExist:
             return Response({"error": "Group not found"}, status=status.HTTP_404_NOT_FOUND)
 

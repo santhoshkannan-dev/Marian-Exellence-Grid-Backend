@@ -298,24 +298,124 @@ class UserService:
         return "student"
 
     @staticmethod
+    def is_staff_email(email):
+        """
+        Validates that the email belongs to a Marian College staff member.
+        Staff email format: name.name@mariancollege.org (e.g. kochumol.abraham@mariancollege.org).
+        Student email format: name.startingwithnumber@mariancollege.org (e.g. amal.25pmc114@mariancollege.org).
+        """
+        if not email or not isinstance(email, str):
+            return False
+        clean = email.strip().lower()
+        if not clean.endswith('@mariancollege.org'):
+            return False
+
+        local_part = clean[:-len('@mariancollege.org')]
+        parts = local_part.split('.')
+        if len(parts) < 2:
+            return False
+
+        for p in parts:
+            if not p or not p.isalpha():
+                return False
+
+        if UserService.parse_email_code(clean) is not None:
+            return False
+
+        return True
+
+    @staticmethod
+    def is_student_email(email):
+        """
+        Validates that the email belongs to a Marian College student.
+        Student email format: name.startingwithnumber@mariancollege.org (e.g. amal.25pmc114@mariancollege.org).
+        Staff email format: name.name@mariancollege.org (e.g. kochumol.abraham@mariancollege.org).
+        """
+        if not email or not isinstance(email, str):
+            return False
+        clean = email.strip().lower()
+        if not clean.endswith('@mariancollege.org'):
+            return False
+
+        local_part = clean[:-len('@mariancollege.org')]
+        parts = local_part.split('.')
+        if len(parts) < 2:
+            return False
+
+        if UserService.parse_email_code(clean) is not None:
+            return True
+
+        return False
+
+    @staticmethod
+    def is_user_dqc_rep(user):
+        from users.models import UserGroupModel
+        if not user or not getattr(user, 'is_authenticated', False):
+            return False
+        user_email = (getattr(user, 'email', '') or '').strip().lower()
+        if not user_email or not UserService.is_student_email(user_email):
+            return False
+
+        dqc_groups = UserGroupModel.objects.filter(
+            Q(group_id='grp-dqc-student-rep') |
+            Q(group_id__icontains='dqc') |
+            Q(name__icontains='dqc') |
+            Q(name__icontains='dac')
+        )
+        for rg in dqc_groups:
+            if rg.members and any(isinstance(e, str) and e.strip().lower() == user_email for e in rg.members):
+                return True
+        return False
+
+    @staticmethod
     def is_user_student_rep(user):
         from users.models import Class, UserGroupModel
         if not user or not getattr(user, 'is_authenticated', False):
             return False
+        user_email = (getattr(user, 'email', '') or '').strip().lower()
+        if not user_email or not UserService.is_student_email(user_email):
+            return False
+
+        if UserService.is_user_dqc_rep(user):
+            return True
+
         if getattr(user, 'is_student_rep', False) or getattr(user, 'is_dqc_member', False):
             return True
         if Class.objects.filter(dqc_member=user).exists():
             return True
-        user_email = (getattr(user, 'email', '') or '').strip().lower()
         if user_email:
             if Class.objects.filter(dqc_member__email__iexact=user_email).exists():
                 return True
             rep_group = UserGroupModel.objects.filter(
-                Q(group_id='grp-student-reps') | Q(name__icontains='student rep') | Q(name__icontains='dqc')
+                Q(group_id='grp-student-reps') | Q(name__icontains='student rep')
             ).first()
             if rep_group and rep_group.members and any(isinstance(e, str) and e.strip().lower() == user_email for e in rep_group.members):
                 return True
         return False
+
+    @staticmethod
+    def get_student_rep_classes(user):
+        from users.models import Class
+        if not user or not getattr(user, 'is_authenticated', False):
+            return Class.objects.none()
+
+        if not UserService.is_user_student_rep(user):
+            return Class.objects.none()
+
+        user_email = (getattr(user, 'email', '') or '').strip().lower()
+        q = Q(dqc_member=user)
+        if user_email:
+            q |= Q(dqc_member__email__iexact=user_email)
+
+        if getattr(user, 'class_name', None):
+            q |= Q(id=user.class_name_id)
+
+        if user_email:
+            parsed = UserService.parse_student_email(user_email)
+            if parsed and parsed.get('class_name'):
+                q |= Q(name__iexact=parsed['class_name'])
+
+        return Class.objects.filter(q).distinct()
 
 
 # Standalone alias exports for backward-compatibility
@@ -327,4 +427,9 @@ get_year_roman = UserService.get_year_roman
 parse_student_email = UserService.parse_student_email
 allocate_student_from_email = UserService.allocate_student_from_email
 determine_role_from_email = UserService.determine_role_from_email
+is_staff_email = UserService.is_staff_email
+is_student_email = UserService.is_student_email
+is_user_dqc_rep = UserService.is_user_dqc_rep
 is_user_student_rep = UserService.is_user_student_rep
+get_student_rep_classes = UserService.get_student_rep_classes
+
