@@ -1,15 +1,28 @@
 
-from .models import Champion, BugReport
+from .models import Champion, BugReport, SystemAuditLog, WorkflowAuditTrail
 from .serializers import (
-    ChampionSerializer, BugReportSerializer,
+    ChampionSerializer, BugReportSerializer, BugReportSafeSerializer,
     SubmissionSerializer, AcademicGradeBreakdownSerializer,
-    CriteriaCategorySerializer, CriteriaItemSerializer, CriteriaRuleSerializer, CriteriaVersionSerializer
+    CriteriaCategorySerializer, CriteriaItemSerializer, CriteriaRuleSerializer, CriteriaVersionSerializer,
+    SystemAuditLogSerializer, WorkflowAuditTrailSerializer
 )
+from .audit import record_system_audit_event
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
+import os
 import logging
 import hashlib
 from datetime import datetime
 from django.conf import settings
+from django.http import FileResponse
+from .file_security import (
+    validate_file_upload,
+    save_private_evidence_file,
+    resolve_safe_private_path,
+    ALLOWED_EVIDENCE_EXTENSIONS,
+    ALLOWED_IMAGE_EXTENSIONS,
+    MAX_EVIDENCE_SIZE_BYTES,
+    MAX_IMAGE_SIZE_BYTES,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -813,11 +826,12 @@ class AcademicYearListView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        ay, created = AcademicYear.objects.get_or_create(year=year_str)
-        if is_active:
-            AcademicYear.objects.all().update(is_active=False)
-            ay.is_active = True
-            ay.save()
+        with transaction.atomic():
+            ay, created = AcademicYear.objects.get_or_create(year=year_str)
+            if is_active:
+                AcademicYear.objects.exclude(pk=ay.pk).update(is_active=False)
+                ay.is_active = True
+                ay.save()
         
         return Response({"year": ay.year, "status": "Active" if ay.is_active else "Inactive"})
 
@@ -838,18 +852,19 @@ class AcademicYearListView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        try:
-            ay = AcademicYear.objects.get(year=year_str)
-        except AcademicYear.DoesNotExist:
-            ay = AcademicYear.objects.create(year=year_str, is_active=is_active)
+        with transaction.atomic():
+            try:
+                ay = AcademicYear.objects.select_for_update().get(year=year_str)
+            except AcademicYear.DoesNotExist:
+                ay = AcademicYear.objects.create(year=year_str, is_active=is_active)
 
-        if is_active:
-            AcademicYear.objects.all().update(is_active=False)
-            ay.is_active = True
-            ay.save()
-        else:
-            ay.is_active = False
-            ay.save()
+            if is_active:
+                AcademicYear.objects.exclude(pk=ay.pk).update(is_active=False)
+                ay.is_active = True
+                ay.save()
+            else:
+                ay.is_active = False
+                ay.save()
 
         return Response({"year": ay.year, "status": "Active" if ay.is_active else "Inactive"})
 
@@ -1148,6 +1163,14 @@ class ClassListView(APIView):
             return (dept_idx, class_idx)
 
         classes.sort(key=class_sort_key)
+        user = request.user
+        is_staff_or_admin = bool(
+            user and getattr(user, 'is_authenticated', False) and (
+                getattr(user, 'role', '') in ('admin', 'iqac', 'faculty') or
+                getattr(user, 'is_staff', False) or
+                getattr(user, 'is_superuser', False)
+            )
+        )
         return Response([
             {
                 "id": c.id,
@@ -1160,9 +1183,9 @@ class ClassListView(APIView):
                 "year_number": c.year_number,
                 "section": c.section,
                 "batch_start_year": c.batch_start_year,
-                "classTeacher": c.class_teacher.email if c.class_teacher else None,
+                "classTeacher": (c.class_teacher.email if is_staff_or_admin else None) if c.class_teacher else None,
                 "classTeacherName": c.class_teacher.get_full_name() or c.class_teacher.username if c.class_teacher else None,
-                "dqcMember": c.dqc_member.email if c.dqc_member else None,
+                "dqcMember": (c.dqc_member.email if is_staff_or_admin else None) if c.dqc_member else None,
                 "dqcMemberName": c.dqc_member.get_full_name() or c.dqc_member.username if c.dqc_member else None,
                 "num_students": c.num_students,
                 "negative_points": c.negative_points,
@@ -1607,7 +1630,7 @@ class ClassDetailView(APIView):
 
 
 class ClassIndexView(APIView):
-    """Compute and return the moderated class index M for all classes.
+    """Compute and return the moderated class index M for all classes using authoritative ScoringEngine.
 
     Authoritative Marian Evaluation Formula:
       Step 1: Net Obtained Score = S - P
@@ -1620,78 +1643,120 @@ class ClassIndexView(APIView):
       Step 3: Total Score = max(0.0, (S - P) + Moderation Mark)
       Step 4: Class Index M = Total Score / N
 
-    Query param: ?year=2025-2026 (optional, filters by submission academic_year)
+    Query params:
+      ?year=2025-2026 (optional, filters by submission academic_year)
+      ?explain=true (optional, returns full 4-step explanation breakdown)
     """
     permission_classes = [IsAdminOrPublicReadOnly]
 
     def get(self, request):
         year = request.query_params.get('year', None)
+        explain = request.query_params.get('explain', '').lower() in ('true', '1', 'yes')
 
-        # Fetch n (smallest class size) from system settings
-        try:
-            n_setting = SystemSetting.objects.get(key='smallest_class_size')
-            n = float(n_setting.value) if n_setting.value else 0.0
-        except SystemSetting.DoesNotExist:
-            n = 0.0
+        # 1. Historical Snapshot: If academic year has published locked results, serve directly from ClassIndexResult
+        if year:
+            from users.models import AcademicYear, ClassIndexResult
+            ay = AcademicYear.objects.filter(year=year).first()
+            if ay:
+                locked_snaps = ClassIndexResult.objects.filter(academic_year=ay, is_locked=True).select_related('class_name', 'class_name__department')
+                if locked_snaps.exists():
+                    snap_ranked = []
+                    snap_unranked = []
+                    for snap in locked_snaps:
+                        if snap.snapshot_data:
+                            entry = dict(snap.snapshot_data)
+                        else:
+                            entry = {
+                                "class_id": snap.class_name.id,
+                                "class_name": snap.class_name.name,
+                                "department": snap.class_name.department.name if snap.class_name.department else 'General',
+                                "department_code": snap.class_name.department.code if snap.class_name.department else 'GEN',
+                                "N": snap.class_name.num_students,
+                                "M": snap.final_index,
+                                "rank": snap.rank,
+                                "academic_score": snap.academic_score,
+                                "co_curricular_score": snap.co_curricular_score,
+                                "extra_curricular_score": snap.extra_curricular_score,
+                                "scoring_version": snap.scoring_version,
+                                "is_locked": snap.is_locked,
+                            }
+                        if snap.rank is not None:
+                            snap_ranked.append(entry)
+                        else:
+                            snap_unranked.append(entry)
+                    snap_ranked.sort(key=lambda x: (-(x["M"] if x["M"] is not None else -1.0), x["class_name"].lower() if x.get("class_name") else ""))
+                    return Response(snap_ranked + snap_unranked, status=status.HTTP_200_OK)
 
-        all_classes = Class.objects.select_related('department').all()
-        ranked = []
-        unranked = []  # classes with N=0
+        # 2. Dynamic Live Calculation
+        from users.scoring_engine import compute_all_rankings, explain_class_score
+        if explain:
+            from users.models import Class
+            all_classes = Class.objects.select_related('department').all()
+            explanations = [explain_class_score(cls, academic_year=year) for cls in all_classes]
+            ranked_exp = [e for e in explanations if e["N"] > 0]
+            unranked_exp = [e for e in explanations if e["N"] == 0]
+            ranked_exp.sort(key=lambda x: (
+                -(x["M"] if x["M"] is not None else -1.0),
+                x["class_name"].lower() if x["class_name"] else ""
+            ))
+            for idx, item in enumerate(ranked_exp):
+                if idx > 0:
+                    prev = ranked_exp[idx - 1]
+                    prev_m = prev["M"] if prev["M"] is not None else 0.0
+                    curr_m = item["M"] if item["M"] is not None else 0.0
+                    if abs(curr_m - prev_m) < 1e-5:
+                        item["rank"] = prev["rank"]
+                    else:
+                        item["rank"] = idx + 1
+                else:
+                    item["rank"] = 1
+            for item in unranked_exp:
+                item["rank"] = None
+            return Response(ranked_exp + unranked_exp, status=status.HTTP_200_OK)
 
-        for cls in all_classes:
-            N = cls.num_students
-            P = cls.negative_points
-
-            # Build submission queryset for this class
-            sub_qs = Submission.objects.filter(
-                status__in=['Locked', 'Evaluated'],
-                user__class_name=cls,
-                marks__isnull=False
-            )
-            if year:
-                sub_qs = sub_qs.filter(academic_year=year)
-
-            S = sub_qs.aggregate(total=Sum('marks'))['total'] or 0.0
-
-            if N > 0:
-                net_score = float(S) - float(P)
-                moderation_mark = min(200.0, max(0.0, 2.0 * (float(N) - float(n))))
-                total_score = max(0.0, net_score + moderation_mark)
-                M = total_score / float(N)
-
-                ranked.append({
-                    "class_name": cls.name,
-                    "department": cls.department.name,
-                    "department_code": cls.department.code,
-                    "N": N,
-                    "S": round(float(S), 2),
-                    "P": round(float(P), 2),
-                    "n": n,
-                    "moderation_mark": round(float(moderation_mark), 2),
-                    "total_score": round(float(total_score), 2),
-                    "M": round(float(M), 4),
-                })
-            else:
-                unranked.append({
-                    "class_name": cls.name,
-                    "department": cls.department.name,
-                    "department_code": cls.department.code,
-                    "N": 0,
-                    "S": round(float(S), 2),
-                    "P": round(float(P), 2),
-                    "n": n,
-                    "moderation_mark": 0.0,
-                    "total_score": 0.0,
-                    "M": None,
-                    "rank": None,
-                })
-
-        # Sort by M descending and assign ranks
-        ranked.sort(key=lambda x: x['M'], reverse=True)
-        for i, entry in enumerate(ranked):
-            entry['rank'] = i + 1
-
+        ranked, unranked = compute_all_rankings(academic_year=year)
         return Response(ranked + unranked, status=status.HTTP_200_OK)
+
+    def post(self, request):
+        """Allow IQAC or Admin to snapshot official class index results for an academic year."""
+        user = request.user
+        user_role = getattr(user, 'role', None)
+        if not (user.is_superuser or user_role in ('admin', 'iqac')):
+            return Response({"error": "Only IQAC and Administrators can snapshot official rankings."}, status=status.HTTP_403_FORBIDDEN)
+
+        year = request.data.get('year')
+        if not year:
+            return Response({"error": "year parameter is required for snapshotting."}, status=status.HTTP_400_BAD_REQUEST)
+
+        force = request.data.get('force', False)
+        lock = request.data.get('lock', True)
+
+        from users.scoring_engine import snapshot_academic_year_results
+        try:
+            results = snapshot_academic_year_results(year, force=force, mark_locked=lock)
+
+            record_system_audit_event(
+                action='RANKING_PUBLISH' if lock else 'RANKING_CALCULATE',
+                object_type='AcademicYear',
+                object_id=year,
+                actor=user,
+                object_repr=f"Official Rankings for Academic Year {year} ({len(results)} classes, locked={lock})",
+                old_value=None,
+                new_value={'academic_year': year, 'class_count': len(results), 'is_locked': lock},
+                reason=f"Rankings {'published and locked' if lock else 'calculated and snapshotted'} by {getattr(user, 'email', '')}",
+                request=request
+            )
+
+            return Response({
+                "message": f"Successfully snapshotted rankings for academic year '{year}'.",
+                "count": len(results),
+                "is_locked": lock
+            }, status=status.HTTP_201_CREATED)
+        except PermissionError as pe:
+            return Response({"error": str(pe)}, status=status.HTTP_403_FORBIDDEN)
+        except Exception as e:
+            logger.exception("Snapshotting rankings failed")
+            return Response({"error": "Failed to snapshot rankings."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 class UserManagementView(APIView):
@@ -1756,6 +1821,7 @@ class UserManagementView(APIView):
                 "is_active": True
             }
         )
+        old_role = None if created else user.role
         if not created:
             user.role = role
             user.department = dept
@@ -1763,6 +1829,18 @@ class UserManagementView(APIView):
             user.first_name = first_name
             user.last_name = last_name
             user.save()
+
+        record_system_audit_event(
+            action='USER_ROLE_CHANGE',
+            object_type='User',
+            object_id=user.id,
+            actor=request.user,
+            object_repr=f"User {user.email} (Role: {user.role})",
+            old_value={'role': old_role} if not created else None,
+            new_value={'role': user.role, 'email': user.email, 'is_active': user.is_active},
+            reason=f"User {'created' if created else 'updated'} via UserManagementView by {getattr(request.user, 'email', '')}",
+            request=request
+        )
 
         return Response({
             "id": user.id,
@@ -1785,132 +1863,16 @@ class UserManagementView(APIView):
         except User.DoesNotExist:
             return Response({"error": "User not found"}, status=status.HTTP_404_NOT_FOUND)
 
-def get_criteria_allowed_bounds(criteria_item, evidence=None):
-    """
-    Computes (allowed_min, allowed_max, details) for a given CriteriaItem based on:
-    1. Dynamic subItems in rules_json (e.g. Publications, Patents, Book Publications, Prizes, etc.)
-    2. Academic grade rules in rules_json (e.g. Class Pass Percentage)
-    3. Count multipliers for count-based criteria
-    4. Associated CriteriaRule bounds (minimum_marks, maximum_marks, is_negative)
-    """
-    if not criteria_item:
-        return 0.0, 100.0, ""
+from users.scoring_engine import (
+    get_criteria_allowed_bounds,
+    calculate_submission_score,
+)
 
-    ev = evidence
-    if isinstance(ev, str):
-        try:
-            import json
-            ev = json.loads(ev)
-        except Exception:
-            ev = {}
-    elif not isinstance(ev, dict):
-        ev = {}
-
-    rule = CriteriaRule.objects.filter(item=criteria_item).first()
-    
-    # Base mark calculation: CriteriaRule is authoritative
-    if rule and rule.maximum_marks is not None:
-        base_mark = float(rule.maximum_marks)
-    else:
-        base_mark = float(criteria_item.marks or 0.0)
-    details = ""
-
-    # 1. SubItems mapping in CriteriaRule.extra_config (authoritative) or rules_json (fallback)
-    sub_items = None
-    if rule and isinstance(rule.extra_config, dict) and 'subItems' in rule.extra_config:
-        sub_items = rule.extra_config.get('subItems')
-    elif isinstance(criteria_item.rules_json, dict) and 'subItems' in criteria_item.rules_json:
-        sub_items = criteria_item.rules_json.get('subItems')
-
-    if isinstance(sub_items, dict) and len(sub_items) > 0:
-        submitted_sub_item = (
-            ev.get('subItem') or 
-            ev.get('researchSubItem') or 
-            ev.get('prizesSubItem')
-        )
-        matched_val = None
-        if submitted_sub_item:
-            # Check exact match
-            if submitted_sub_item in sub_items:
-                matched_val = float(sub_items[submitted_sub_item])
-                details = f" (subcategory '{submitted_sub_item}': {matched_val})"
-            else:
-                # Case-insensitive / trimmed match
-                sub_norm = str(submitted_sub_item).strip().lower()
-                for k, v in sub_items.items():
-                    if str(k).strip().lower() == sub_norm:
-                        matched_val = float(v)
-                        details = f" (subcategory '{k}': {matched_val})"
-                        break
-        
-        if matched_val is not None:
-            base_mark = matched_val
-        else:
-            # Fallback to maximum mark among defined subItems if specific sub-item not identified
-            base_mark = float(max(sub_items.values()))
-            details = f" (max subcategory: {base_mark})"
-
-    # 2. Count multiplier for count-based items
-    count_val = 1
-    if criteria_item.type == 'count' or 'count' in ev:
-        try:
-            count_val = max(1, int(ev.get('count', 1)))
-        except (ValueError, TypeError):
-            count_val = 1
-
-    allowed_max = base_mark * count_val
-
-    # 3. Dynamic handling for Academic Grades
-    if criteria_item.type == 'academic_grades' or (
-        isinstance(criteria_item.rules_json, dict) and 'pass_percentage_ranges' in criteria_item.rules_json
-    ):
-        rules = criteria_item.rules_json or {}
-        m90 = float(rules.get('90_above', 5.0))
-        m80 = float(rules.get('80_90', 4.0))
-        m70 = float(rules.get('70_80', 3.0))
-        ranges = rules.get('pass_percentage_ranges', [])
-        max_pass_mark = max([float(r.get('marks', 0)) for r in ranges], default=5.0) if ranges else 5.0
-        
-        total_students = 100
-        try:
-            total_students = max(1, int(ev.get('totalStudents', 100)))
-        except (ValueError, TypeError):
-            total_students = 100
-        allowed_max = (total_students * max(m90, m80, m70)) + max_pass_mark
-        details = " (academic grades breakdown)"
-
-    # 4. CriteriaRule overrides/caps
-    allowed_min = 0.0
-    is_negative = (criteria_item.type in ('negative', 'academic_grades')) or (rule and rule.is_negative)
-    if rule:
-        if rule.maximum_marks is not None:
-            rule_max = float(rule.maximum_marks)
-            if allowed_max > 0:
-                allowed_max = min(allowed_max, rule_max)
-            else:
-                allowed_max = rule_max
-        if getattr(rule, 'minimum_marks', None) is not None:
-            allowed_min = float(rule.minimum_marks)
-        if rule.is_negative:
-            is_negative = True
-
-    if is_negative and allowed_min == 0.0:
-        allowed_min = -1000.0
-
-    return allowed_min, allowed_max, details
-
-
-def calculate_submission_score(criteria_item, evidence=None):
-    """
-    Evaluates the authoritative marks for a submission against a CriteriaItem and its CriteriaRule.
-    CriteriaRule is authoritative for base marks, sub-items, caps, and multipliers.
-    """
-    allowed_min, allowed_max, _ = get_criteria_allowed_bounds(criteria_item, evidence)
-    return allowed_max
 
 
 class SubmissionListView(APIView):
     permission_classes = [IsAuthenticated]
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
 
     def get(self, request):
         user = request.user
@@ -1939,8 +1901,19 @@ class SubmissionListView(APIView):
         if academic_year:
             queryset = queryset.filter(academic_year=academic_year)
             
+        is_staff_or_eval = bool(
+            user and getattr(user, 'is_authenticated', False) and (
+                getattr(user, 'role', '') in ('admin', 'iqac', 'faculty', 'evaluation') or
+                getattr(user, 'is_staff', False) or
+                getattr(user, 'is_superuser', False)
+            )
+        )
+
         data = []
         for s in queryset:
+            is_owner = bool(user and getattr(user, 'is_authenticated', False) and s.user_id == user.id)
+            can_see_eval_remarks = is_owner or is_staff_or_eval
+
             data.append({
                 "id": s.id,
                 "studentId": s.user.id if s.user else 1,
@@ -1968,8 +1941,8 @@ class SubmissionListView(APIView):
                 "repRemarks": s.rep_remarks,
                 "teacherVerifiedByName": s.teacher_verified_by_name,
                 "teacherRemarks": s.teacher_remarks,
-                "evaluatorVerifiedByName": s.evaluator_verified_by_name,
-                "evaluatorRemarks": s.evaluator_remarks
+                "evaluatorVerifiedByName": s.evaluator_verified_by_name if can_see_eval_remarks else None,
+                "evaluatorRemarks": s.evaluator_remarks if can_see_eval_remarks else None
             })
         return Response(data)
 
@@ -2029,8 +2002,26 @@ class SubmissionListView(APIView):
             return Response({"error": "remarks cannot exceed 2000 characters."}, status=status.HTTP_400_BAD_REQUEST)
 
         proof = request.data.get('proof', '')
-        if proof and len(str(proof)) > 255:
-            return Response({"error": "proof reference cannot exceed 255 characters."}, status=status.HTTP_400_BAD_REQUEST)
+        if proof:
+            raw_proof = str(proof).strip()
+            if '..' in raw_proof or raw_proof.startswith('/') or raw_proof.startswith('\\'):
+                return Response({"error": "Invalid proof path specification."}, status=status.HTTP_400_BAD_REQUEST)
+            if len(raw_proof) > 255:
+                return Response({"error": "proof reference cannot exceed 255 characters."}, status=status.HTTP_400_BAD_REQUEST)
+            proof = raw_proof
+
+        proof_file = request.FILES.get('proof_file') or request.FILES.get('file') or request.FILES.get('evidence_file')
+        uploaded_proof_hash = None
+        if proof_file:
+            try:
+                rel_p, f_h, _, _ = save_private_evidence_file(proof_file, academic_year=academic_year)
+                proof = rel_p
+                uploaded_proof_hash = f_h
+            except ValueError as ve:
+                return Response({"error": str(ve)}, status=status.HTTP_400_BAD_REQUEST)
+            except Exception as e:
+                logger.exception("Failed to save uploaded evidence file")
+                return Response({"error": f"Failed to save evidence file: {str(e)}"}, status=status.HTTP_400_BAD_REQUEST)
 
         event_id = request.data.get('eventId', '')
         if event_id and len(str(event_id)) > 100:
@@ -2136,7 +2127,7 @@ class SubmissionListView(APIView):
         if cert_id and len(str(cert_id)) > 100:
             return Response({"error": "certificateId/identifier cannot exceed 100 characters."}, status=status.HTTP_400_BAD_REQUEST)
         
-        proof_h = request.data.get('proofHash')
+        proof_h = uploaded_proof_hash or request.data.get('proofHash')
         if not proof_h and isinstance(evidence, dict):
             proof_h = evidence.get('proofHash')
         if not proof_h and proof:
@@ -2191,66 +2182,84 @@ class SubmissionListView(APIView):
             if c_item:
                 marks = calculate_submission_score(c_item, evidence)
 
+        from django.db import IntegrityError
         try:
-            submission = Submission.objects.create(
-                user=user,
-                criteria_id=criteria_id_int,
-                criteria_version=active_cv,
-                academic_year=academic_year,
-                description=description,
-                status=status_val,
-                remarks=remarks,
-                marks=marks,
-                proof=proof,
-                proof_hash=proof_h,
-                certificate_id=cert_id,
-                event_id=event_id,
-                evidence=clean_evidence,
-                start_date=start_date,
-                end_date=end_date
+            with transaction.atomic():
+                submission = Submission.objects.create(
+                    user=user,
+                    criteria_id=criteria_id_int,
+                    criteria_version=active_cv,
+                    academic_year=academic_year,
+                    description=description,
+                    status=status_val,
+                    remarks=remarks,
+                    marks=marks,
+                    proof=proof,
+                    proof_hash=proof_h,
+                    certificate_id=cert_id,
+                    event_id=event_id,
+                    evidence=clean_evidence,
+                    start_date=start_date,
+                    end_date=end_date
+                )
+
+                sub_type = clean_evidence.get("submissionType")
+                if sub_type:
+                    submission.submission_type = sub_type
+                    submission.save(update_fields=["submission_type"])
+
+                if isinstance(gb_data, dict):
+                    s_c = int(gb_data.get("s_grade_count", 0) or 0)
+                    ap_c = int(gb_data.get("a_plus_grade_count", 0) or 0)
+                    a_c = int(gb_data.get("a_grade_count", 0) or 0)
+                    other_c = int(gb_data.get("other_pass_count", 0) or 0)
+                    fail_c = int(gb_data.get("failed_count", 0) or 0)
+                    total_c = int(gb_data.get("total_students", 0) or 0)
+                    AcademicGradeBreakdown.objects.update_or_create(
+                        submission=submission,
+                        defaults={
+                            "s_grade_count": s_c,
+                            "a_plus_grade_count": ap_c,
+                            "a_grade_count": a_c,
+                            "other_pass_count": other_c,
+                            "failed_count": fail_c,
+                            "total_students": total_c
+                        }
+                    )
+
+                create_audit_entry(
+                    submission=submission,
+                    actor=user,
+                    stage=1,
+                    stage_name="Student Claims",
+                    prev_status="Initial",
+                    new_status=submission.status,
+                    comments=remarks or "",
+                    request=request
+                )
+
+                record_system_audit_event(
+                    action='SUBMISSION_CREATE',
+                    object_type='Submission',
+                    object_id=submission.id,
+                    actor=user,
+                    object_repr=f"Submission #{submission.id} (Criteria: {submission.criteria_id}) -> {submission.status}",
+                    old_value=None,
+                    new_value={'status': submission.status, 'marks': submission.marks, 'criteria_id': submission.criteria_id},
+                    reason=remarks or "New submission created",
+                    request=request
+                )
+        except IntegrityError as e:
+            logger.warning(f"IntegrityError creating submission: {e}")
+            return Response(
+                {"error": "A duplicate submission with this certificate or proof document was already recorded in the system."},
+                status=status.HTTP_400_BAD_REQUEST
             )
+        except ValueError as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
             logger.exception("Failed to create submission")
             return Response({"error": "Failed to create submission. Please verify your input data."}, status=status.HTTP_400_BAD_REQUEST)
-        
-        # Sync relational models (AcademicGradeBreakdown & WorkflowAuditTrail)
-        try:
-            from users.models import WorkflowAuditTrail
-            sub_type = clean_evidence.get("submissionType")
-            if sub_type:
-                submission.submission_type = sub_type
-                submission.save(update_fields=["submission_type"])
-
-            if isinstance(gb_data, dict):
-                s_c = int(gb_data.get("s_grade_count", 0) or 0)
-                ap_c = int(gb_data.get("a_plus_grade_count", 0) or 0)
-                a_c = int(gb_data.get("a_grade_count", 0) or 0)
-                other_c = int(gb_data.get("other_pass_count", 0) or 0)
-                fail_c = int(gb_data.get("failed_count", 0) or 0)
-                total_c = int(gb_data.get("total_students", 0) or 0)
-                AcademicGradeBreakdown.objects.update_or_create(
-                    submission=submission,
-                    defaults={
-                        "s_grade_count": s_c,
-                        "a_plus_grade_count": ap_c,
-                        "a_grade_count": a_c,
-                        "other_pass_count": other_c,
-                        "failed_count": fail_c,
-                        "total_students": total_c
-                    }
-                )
-            create_audit_entry(
-                submission=submission,
-                actor=user,
-                stage=1,
-                stage_name="Student Claims",
-                prev_status="Initial",
-                new_status=submission.status,
-                comments=remarks or "",
-                request=request
-            )
-        except Exception as e:
-            logger.warning(f"Error syncing relational models for submission #{submission.id}: {e}")
         
         return Response({
             "id": submission.id,
@@ -2317,7 +2326,19 @@ class SubmissionDetailView(APIView):
             return Response({"error": "You do not have permission to view this submission."}, status=status.HTTP_403_FORBIDDEN)
 
         serializer = SubmissionSerializer(submission)
-        return Response(serializer.data, status=status.HTTP_200_OK)
+        resp_data = dict(serializer.data)
+        is_owner = bool(user and getattr(user, 'is_authenticated', False) and submission.user_id == user.id)
+        is_staff_or_eval = bool(
+            user and getattr(user, 'is_authenticated', False) and (
+                getattr(user, 'role', '') in ('admin', 'iqac', 'faculty', 'evaluation') or
+                getattr(user, 'is_staff', False) or
+                getattr(user, 'is_superuser', False)
+            )
+        )
+        if not (is_owner or is_staff_or_eval):
+            resp_data['evaluator_remarks'] = None
+            resp_data['evaluator_verified_by_name'] = None
+        return Response(resp_data, status=status.HTTP_200_OK)
 
     def put(self, request, pk):
         user = request.user
@@ -2452,8 +2473,12 @@ class SubmissionDetailView(APIView):
                 return Response({"error": "description cannot exceed 5000 characters."}, status=status.HTTP_400_BAD_REQUEST)
         if 'remarks' in request.data and request.data.get('remarks') and len(str(request.data['remarks'])) > 2000:
             return Response({"error": "remarks cannot exceed 2000 characters."}, status=status.HTTP_400_BAD_REQUEST)
-        if 'proof' in request.data and request.data.get('proof') and len(str(request.data['proof'])) > 255:
-            return Response({"error": "proof cannot exceed 255 characters."}, status=status.HTTP_400_BAD_REQUEST)
+        if 'proof' in request.data and request.data.get('proof'):
+            raw_proof = str(request.data.get('proof')).strip()
+            if '..' in raw_proof or raw_proof.startswith('/') or raw_proof.startswith('\\'):
+                return Response({"error": "Invalid proof path specification."}, status=status.HTTP_400_BAD_REQUEST)
+            if len(raw_proof) > 255:
+                return Response({"error": "proof cannot exceed 255 characters."}, status=status.HTTP_400_BAD_REQUEST)
         if 'eventId' in request.data and request.data.get('eventId') and len(str(request.data['eventId'])) > 100:
             return Response({"error": "eventId cannot exceed 100 characters."}, status=status.HTTP_400_BAD_REQUEST)
         if 'certificateId' in request.data and request.data.get('certificateId') and len(str(request.data['certificateId'])) > 100:
@@ -2551,18 +2576,15 @@ class SubmissionDetailView(APIView):
                 return Response({"error": f"Sum of grade counts ({g_sum}) must strictly equal total students ({t_students})."}, status=status.HTTP_400_BAD_REQUEST)
 
             pass_pct = round((passed / float(t_students)) * 100.0, 2)
-            AcademicGradeBreakdown.objects.update_or_create(
-                submission=submission,
-                defaults={
-                    "s_grade_count": s_cnt,
-                    "a_plus_grade_count": ap_cnt,
-                    "a_grade_count": a_cnt,
-                    "other_pass_count": oth_cnt,
-                    "failed_count": fail_cnt,
-                    "class_pass_percentage": pass_pct,
-                    "total_students": t_students
-                }
-            )
+            gb_sync_defaults = {
+                "s_grade_count": s_cnt,
+                "a_plus_grade_count": ap_cnt,
+                "a_grade_count": a_cnt,
+                "other_pass_count": oth_cnt,
+                "failed_count": fail_cnt,
+                "class_pass_percentage": pass_pct,
+                "total_students": t_students
+            }
             # Ensure evidence does not duplicate grade data in JSON
             if isinstance(upd_ev, dict):
                 upd_ev = dict(upd_ev)
@@ -2572,68 +2594,30 @@ class SubmissionDetailView(APIView):
                 upd_ev.pop("totalStudents", None)
                 upd_ev.pop("passCount", None)
 
-        # 1. Locked Record Guard
-        if submission.status == 'Locked':
+        # 1. Validate Workflow State Machine Transition & Role Scope
+        req_status = request.data.get('status', submission.status)
+        from .workflow import validate_workflow_transition, execute_workflow_transition
+        is_valid, err_msg, stage_num, stage_name = validate_workflow_transition(
+            submission=submission,
+            target_status_input=req_status,
+            user=user,
+            data=request.data
+        )
+        if not is_valid:
+            if err_msg.startswith("Invalid workflow state transition"):
+                status_code = status.HTTP_400_BAD_REQUEST
+            elif "Unauthorized" in err_msg or "record has been locked" in err_msg.lower():
+                status_code = status.HTTP_403_FORBIDDEN
+            else:
+                status_code = status.HTTP_400_BAD_REQUEST
+            return Response({"error": err_msg}, status=status_code)
+
+        # 2. Authorization Check: Students cannot assign marks.
+        if user and user_role == 'student' and 'marks' in request.data and request.data.get('marks') is not None:
             return Response(
-                {"error": "This submission record has been locked and cannot be modified."},
+                {"error": "Unauthorized: Students cannot assign evaluation marks."},
                 status=status.HTTP_403_FORBIDDEN
             )
-
-        # 1b. Workflow State Machine Transition Guard
-        if target_status != submission.status:
-            allowed_transitions = VALID_STATE_TRANSITIONS.get(submission.status, [])
-            if target_status not in allowed_transitions:
-                return Response(
-                    {"error": f"Invalid workflow state transition from '{submission.status}' to '{target_status}'."},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-            # Role-specific destination status checks
-            if target_status == 'Locked' and user_role not in ('admin', 'iqac') and not user.is_superuser:
-                return Response(
-                    {"error": "Unauthorized: Only administrators and IQAC coordinators can lock submissions."},
-                    status=status.HTTP_403_FORBIDDEN
-                )
-            if target_status == 'Evaluated' and user_role not in ('evaluation', 'iqac', 'admin') and not user.is_staff:
-                return Response(
-                    {"error": "Unauthorized: Only the evaluation committee can evaluate submissions."},
-                    status=status.HTTP_403_FORBIDDEN
-                )
-            if target_status == 'Teacher Verified' and user_role not in ('faculty', 'iqac', 'admin') and not user.is_staff:
-                return Response(
-                    {"error": "Unauthorized: Only faculty members can transition submissions to 'Teacher Verified'."},
-                    status=status.HTTP_403_FORBIDDEN
-                )
-
-        # 1c. Student Evidence Locking Guard
-        user_role = getattr(user, 'role', None)
-        if user and user_role == 'student' and submission.status in UNEDITABLE_BY_STUDENT_STATES:
-            evidence_fields = {'description', 'evidence', 'proof', 'criteriaId', 'start_date', 'startDate', 'end_date', 'endDate'}
-            if any(f in request.data for f in evidence_fields):
-                return Response(
-                    {"error": f"Submissions in '{submission.status}' state cannot have evidence edited by students."},
-                    status=status.HTTP_403_FORBIDDEN
-                )
-
-        # 2. Authorization Check: Students cannot assign marks. Regular students cannot alter verification/evaluation status.
-        # Class Representatives (Student Reps) are authorized to transition status to: 'Student Rep Verified', 'Correction Requested', 'Rejected', 'Pending Rep Verification'.
-        if user and user_role == 'student':
-            if 'marks' in request.data and request.data.get('marks') is not None:
-                return Response(
-                    {"error": "Unauthorized: Students cannot assign evaluation marks."},
-                    status=status.HTTP_403_FORBIDDEN
-                )
-
-            req_status = request.data.get('status')
-            if req_status and req_status != submission.status:
-                is_rep = is_user_student_rep(user)
-                allowed_rep_statuses = {'Student Rep Verified', 'Correction Requested', 'Rejected', 'Pending Rep Verification', 'Pending', 'Submitted'}
-                if is_rep and req_status in allowed_rep_statuses:
-                    pass  # Authorized Class Representative verification action!
-                elif req_status in ('Approved', 'Verified', 'Teacher Verified', 'Student Rep Verified', 'Evaluated', 'Locked'):
-                    return Response(
-                        {"error": "Unauthorized: Students cannot alter verification or evaluation status."},
-                        status=status.HTTP_403_FORBIDDEN
-                    )
 
         # 3. Score Range & Type Bounds Verification
         if 'marks' in request.data and request.data.get('marks') is not None:
@@ -2668,93 +2652,78 @@ class SubmissionDetailView(APIView):
                     )
 
         # 4. Save updates and record audit log inside atomic transaction
-        with transaction.atomic():
-            if 'criteriaId' in request.data:
-                submission.criteria_id = int(request.data.get('criteriaId'))
-            if 'academicYear' in request.data:
-                submission.academic_year = request.data.get('academicYear')
-            if 'description' in request.data:
-                submission.description = request.data.get('description')
-            prev_status = submission.status
-            if 'status' in request.data:
-                submission.status = request.data.get('status')
+        from django.db import IntegrityError
+        try:
+            with transaction.atomic():
+                submission = Submission.objects.select_for_update().get(pk=pk)
+                if submission.status == 'Locked' and not (user_role in ('admin', 'iqac') or getattr(user, 'is_superuser', False)):
+                    return Response(
+                        {"error": "This submission record has been locked and cannot be modified."},
+                        status=status.HTTP_403_FORBIDDEN
+                    )
 
-            # Authoritative verifier tracking based on authenticated session actor
-            actor_name = user.get_full_name() or user.username
-            if user_role == 'student':
-                if is_rep and submission.status in ('Student Rep Verified', 'Correction Requested', 'Rejected', 'Pending Rep Verification'):
-                    submission.rep_verified_by_name = actor_name
-                    if 'repRemarks' in request.data:
-                        submission.rep_remarks = request.data.get('repRemarks')
-                    submission.verified_by_name = actor_name
-            elif user_role == 'faculty':
-                if submission.status in ('Teacher Verified', 'Correction Requested', 'Rejected', 'Student Rep Verified'):
-                    submission.teacher_verified_by_name = actor_name
-                    if 'teacherRemarks' in request.data:
-                        submission.teacher_remarks = request.data.get('teacherRemarks')
-                    submission.verified_by_name = actor_name
-                elif 'teacherRemarks' in request.data:
-                    submission.teacher_remarks = request.data.get('teacherRemarks')
-            elif user_role == 'evaluation':
-                if submission.status in ('Evaluated', 'Approved', 'Verified'):
-                    submission.evaluator_verified_by_name = actor_name
-                    submission.evaluator_verified = True
-                    submission.verified_by_name = actor_name
-                if 'evaluatorRemarks' in request.data:
-                    submission.evaluator_remarks = request.data.get('evaluatorRemarks')
-                if 'marks' in request.data and request.data.get('marks') is not None:
-                    submission.marks = request.data.get('marks')
-            elif user_role in ('admin', 'iqac') or user.is_superuser:
-                submission.verified_by_name = actor_name
-                if 'teacherRemarks' in request.data:
-                    submission.teacher_remarks = request.data.get('teacherRemarks')
-                    submission.teacher_verified_by_name = actor_name
-                if 'repRemarks' in request.data:
-                    submission.rep_remarks = request.data.get('repRemarks')
-                    submission.rep_verified_by_name = actor_name
-                if 'evaluatorRemarks' in request.data:
-                    submission.evaluator_remarks = request.data.get('evaluatorRemarks')
-                    submission.evaluator_verified_by_name = actor_name
-                if 'marks' in request.data and request.data.get('marks') is not None:
-                    submission.marks = request.data.get('marks')
-                if 'evaluatorVerified' in request.data:
-                    submission.evaluator_verified = bool(request.data.get('evaluatorVerified'))
+                if 'gb_sync_defaults' in locals() and gb_sync_defaults:
+                    AcademicGradeBreakdown.objects.update_or_create(
+                        submission=submission,
+                        defaults=gb_sync_defaults
+                    )
 
-            if 'remarks' in request.data:
-                submission.remarks = request.data.get('remarks')
-            if 'proof' in request.data:
-                submission.proof = request.data.get('proof')
-            if 'eventId' in request.data:
-                submission.event_id = request.data.get('eventId')
-            if 'evidence' in request.data:
-                submission.evidence = upd_ev
-            if 'start_date' in request.data or 'startDate' in request.data:
-                submission.start_date = request.data.get('start_date') or request.data.get('startDate')
-            elif 'evidence' in request.data and isinstance(request.data.get('evidence'), dict):
-                ev = request.data.get('evidence')
-                if ev.get('startDate') or ev.get('examDate'):
-                    submission.start_date = ev.get('startDate') or ev.get('examDate')
+                prev_status = submission.status
+                target_status = request.data.get('status', submission.status)
 
-            if 'end_date' in request.data or 'endDate' in request.data:
-                submission.end_date = request.data.get('end_date') or request.data.get('endDate')
-            elif 'evidence' in request.data and isinstance(request.data.get('evidence'), dict):
-                ev = request.data.get('evidence')
-                if ev.get('endDate'):
-                    submission.end_date = ev.get('endDate')
+                extra_updates = {}
+                if 'criteriaId' in request.data:
+                    extra_updates['criteria_id'] = int(request.data.get('criteriaId'))
+                if 'academicYear' in request.data:
+                    extra_updates['academic_year'] = request.data.get('academicYear')
+                if 'description' in request.data:
+                    extra_updates['description'] = request.data.get('description')
+                if 'proof' in request.data:
+                    extra_updates['proof'] = request.data.get('proof')
+                if 'eventId' in request.data:
+                    extra_updates['event_id'] = request.data.get('eventId')
+                if 'evidence' in request.data:
+                    extra_updates['evidence'] = upd_ev
+                if 'start_date' in request.data or 'startDate' in request.data:
+                    extra_updates['start_date'] = request.data.get('start_date') or request.data.get('startDate')
+                elif 'evidence' in request.data and isinstance(request.data.get('evidence'), dict):
+                    ev = request.data.get('evidence')
+                    if ev.get('startDate') or ev.get('examDate'):
+                        extra_updates['start_date'] = ev.get('startDate') or ev.get('examDate')
 
-            submission.save()
+                if 'end_date' in request.data or 'endDate' in request.data:
+                    extra_updates['end_date'] = request.data.get('end_date') or request.data.get('endDate')
+                elif 'evidence' in request.data and isinstance(request.data.get('evidence'), dict):
+                    ev = request.data.get('evidence')
+                    if ev.get('endDate'):
+                        extra_updates['end_date'] = ev.get('endDate')
 
-            if prev_status != submission.status:
-                create_audit_entry(
-                    submission=submission,
-                    actor=user,
-                    stage=3 if user and user.role == 'evaluation' else 2,
-                    stage_name="Evaluation Update",
-                    prev_status=prev_status,
-                    new_status=submission.status,
-                    comments=submission.remarks or "Status updated by evaluator/admin",
-                    request=request
+                remarks_val = (
+                    request.data.get('remarks') or
+                    request.data.get('teacherRemarks') or
+                    request.data.get('repRemarks') or
+                    request.data.get('evaluatorRemarks') or
+                    ""
                 )
+                marks_val = request.data.get('marks')
+
+                submission = execute_workflow_transition(
+                    submission=submission,
+                    target_status=target_status,
+                    user=user,
+                    remarks=remarks_val,
+                    marks=marks_val,
+                    request=request,
+                    **extra_updates
+                )
+        except IntegrityError as e:
+            logger.warning(f"IntegrityError updating submission #{pk}: {e}")
+            return Response(
+                {"error": "A duplicate submission with this certificate or proof document was already recorded in the system."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        except ValueError as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
         return Response({
             "id": submission.id,
@@ -2801,9 +2770,23 @@ class SubmissionDetailView(APIView):
                     {"error": f"Submissions in '{submission.status}' status cannot be deleted by students."},
                     status=status.HTTP_403_FORBIDDEN
                 )
+            if submission.proof:
+                safe_p = resolve_safe_private_path(submission.proof)
+                if safe_p and os.path.isfile(safe_p):
+                    try:
+                        os.remove(safe_p)
+                    except Exception:
+                        pass
             submission.delete()
             return Response({"success": True}, status=status.HTTP_200_OK)
         elif is_admin:
+            if submission.proof:
+                safe_p = resolve_safe_private_path(submission.proof)
+                if safe_p and os.path.isfile(safe_p):
+                    try:
+                        os.remove(safe_p)
+                    except Exception:
+                        pass
             submission.delete()
             return Response({"success": True}, status=status.HTTP_200_OK)
         else:
@@ -2811,6 +2794,228 @@ class SubmissionDetailView(APIView):
                 {"error": "You do not have permission to delete this submission."},
                 status=status.HTTP_403_FORBIDDEN
             )
+
+
+class SubmissionEvidenceView(APIView):
+    """
+    Secure Evidence File Access & Upload endpoint.
+    GET /api/submissions/<int:pk>/evidence/
+    POST /api/submissions/<int:pk>/evidence/
+    DELETE /api/submissions/<int:pk>/evidence/
+    """
+    permission_classes = [IsAuthenticated]
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
+
+    def _check_access_permission(self, user, submission, action="view"):
+        user_role = getattr(user, 'role', None)
+        # Superuser, admin, iqac always have access
+        if user.is_superuser or user_role in ('admin', 'iqac'):
+            return True, None
+
+        if action in ("upload", "delete"):
+            # Only student owner (or admin/iqac) can upload/delete evidence
+            if user_role == 'student':
+                if submission.user_id != user.id:
+                    return False, "You cannot modify evidence for another student's submission."
+                if submission.status not in ('Draft', 'Correction Requested', 'Correction'):
+                    return False, f"Cannot modify evidence when submission is in '{submission.status}' status."
+                return True, None
+            return False, "Only the submission owner or administrators can modify evidence files."
+
+        # action == "view" (download/stream)
+        if user_role == 'evaluation':
+            criteria_item = CriteriaItem.objects.filter(pk=submission.criteria_id).select_related('category').first()
+            if criteria_item and criteria_item.category and criteria_item.category.evaluators:
+                cat_evaluators = [str(e).strip().lower() for e in criteria_item.category.evaluators if e]
+                user_email = (user.email or '').strip().lower()
+                if cat_evaluators and user_email not in cat_evaluators:
+                    return False, "Unauthorized: Evaluator is not assigned to evaluate this criteria category."
+            return True, None
+
+        if user_role == 'faculty':
+            advised_classes = Class.objects.filter(class_teacher=user)
+            is_class_teacher = bool(submission.user and submission.user.class_name in advised_classes)
+            is_same_dept = bool(submission.user and user.department_id and (submission.user.department_id == user.department_id))
+            if is_class_teacher or is_same_dept:
+                return True, None
+            return False, "Faculty cannot access evidence outside their advised class or department."
+
+        if user_role == 'student':
+            if submission.user_id == user.id:
+                return True, None
+            if is_user_student_rep(user):
+                rep_classes = Class.objects.filter(
+                    Q(dqc_member=user) | Q(dqc_member__email__iexact=user.email)
+                )
+                if submission.user and submission.user.class_name in rep_classes:
+                    return True, None
+            return False, "You do not have permission to access another student's evidence file."
+
+        return False, "Unauthorized access."
+
+    def get(self, request, pk):
+        try:
+            submission = Submission.objects.select_related('user', 'user__class_name', 'user__department').get(pk=pk)
+        except Submission.DoesNotExist:
+            return Response({"error": "Submission not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        allowed, err_msg = self._check_access_permission(request.user, submission, action="view")
+        if not allowed:
+            return Response({"error": err_msg or "Permission denied."}, status=status.HTTP_403_FORBIDDEN)
+
+        proof_path = submission.proof
+        if not proof_path and isinstance(submission.evidence, dict):
+            proof_path = submission.evidence.get('filePath') or submission.evidence.get('proofPath')
+
+        if not proof_path:
+            return Response({"error": "No evidence file recorded for this submission."}, status=status.HTTP_404_NOT_FOUND)
+
+        safe_path = resolve_safe_private_path(proof_path)
+        if not safe_path:
+            # Fallback to MEDIA_ROOT if historical, verifying canonical path
+            media_root = os.path.abspath(settings.MEDIA_ROOT)
+            candidate = os.path.abspath(os.path.join(media_root, str(proof_path).replace('/', os.sep).lstrip(os.sep)))
+            try:
+                if os.path.commonpath([media_root, candidate]) == media_root and os.path.isfile(candidate):
+                    safe_path = candidate
+            except (ValueError, Exception):
+                safe_path = None
+
+        if not safe_path or not os.path.isfile(safe_path):
+            return Response({"error": "Evidence file not found on disk or path is invalid."}, status=status.HTTP_404_NOT_FOUND)
+
+        import mimetypes
+        content_type, _ = mimetypes.guess_type(safe_path)
+        if not content_type:
+            content_type = 'application/octet-stream'
+
+        filename = os.path.basename(safe_path)
+        response = FileResponse(open(safe_path, 'rb'), content_type=content_type)
+        response['Content-Disposition'] = f'inline; filename="{filename}"'
+        response['X-Content-Type-Options'] = 'nosniff'
+        response['X-Frame-Options'] = 'SAMEORIGIN'
+        return response
+
+    def post(self, request, pk):
+        try:
+            submission = Submission.objects.select_related('user', 'user__class_name').get(pk=pk)
+        except Submission.DoesNotExist:
+            return Response({"error": "Submission not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        allowed, err_msg = self._check_access_permission(request.user, submission, action="upload")
+        if not allowed:
+            return Response({"error": err_msg or "Permission denied."}, status=status.HTTP_403_FORBIDDEN)
+
+        file_obj = (
+            request.FILES.get('file') or
+            request.FILES.get('proof_file') or
+            request.FILES.get('evidence_file')
+        )
+        if not file_obj:
+            return Response({"error": "No file uploaded. Please provide a file under 'file' or 'proof_file'."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            rel_path, sha256_hash, file_size, detected_mime = save_private_evidence_file(
+                file_obj,
+                academic_year=submission.academic_year or 'general'
+            )
+        except ValueError as ve:
+            return Response({"error": str(ve)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            logger.exception("Evidence upload error")
+            return Response({"error": f"Failed to save evidence: {str(e)}"}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Remove old evidence file if different
+        if submission.proof and submission.proof != rel_path:
+            old_safe = resolve_safe_private_path(submission.proof)
+            if old_safe and os.path.isfile(old_safe):
+                try:
+                    os.remove(old_safe)
+                except Exception:
+                    pass
+
+        submission.proof = rel_path
+        submission.proof_hash = sha256_hash
+        submission.save(update_fields=['proof', 'proof_hash'])
+
+        create_audit_entry(
+            submission=submission,
+            actor=request.user,
+            stage=1,
+            stage_name="Evidence Upload",
+            prev_status=submission.status,
+            new_status=submission.status,
+            comments=f"Uploaded evidence file '{os.path.basename(rel_path)}' (hash: {sha256_hash[:12]}...)",
+            request=request
+        )
+
+        record_system_audit_event(
+            action='EVIDENCE_UPLOAD',
+            object_type='Submission',
+            object_id=submission.id,
+            actor=request.user,
+            object_repr=f"Submission #{submission.id} evidence uploaded ({os.path.basename(rel_path)})",
+            old_value=None,
+            new_value={'proof': rel_path, 'proof_hash': sha256_hash, 'file_size': file_size},
+            reason="New evidence document uploaded",
+            request=request
+        )
+
+        return Response({
+            "success": True,
+            "proof": rel_path,
+            "proofHash": sha256_hash,
+            "fileSize": file_size,
+            "mimeType": detected_mime
+        }, status=status.HTTP_200_OK)
+
+    def delete(self, request, pk):
+        try:
+            submission = Submission.objects.get(pk=pk)
+        except Submission.DoesNotExist:
+            return Response({"error": "Submission not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        allowed, err_msg = self._check_access_permission(request.user, submission, action="delete")
+        if not allowed:
+            return Response({"error": err_msg or "Permission denied."}, status=status.HTTP_403_FORBIDDEN)
+
+        old_proof = submission.proof
+        if submission.proof:
+            safe_path = resolve_safe_private_path(submission.proof)
+            if safe_path and os.path.isfile(safe_path):
+                try:
+                    os.remove(safe_path)
+                except Exception as e:
+                    logger.warning(f"Failed to remove file from disk: {e}")
+
+        submission.proof = None
+        submission.proof_hash = None
+        submission.save(update_fields=['proof', 'proof_hash'])
+
+        create_audit_entry(
+            submission=submission,
+            actor=request.user,
+            stage=1,
+            stage_name="Evidence Deletion",
+            prev_status=submission.status,
+            new_status=submission.status,
+            comments="Deleted evidence file",
+            request=request
+        )
+
+        record_system_audit_event(
+            action='EVIDENCE_DELETE',
+            object_type='Submission',
+            object_id=submission.id,
+            actor=request.user,
+            object_repr=f"Submission #{submission.id} evidence deleted ({old_proof})",
+            old_value={'proof': old_proof},
+            new_value=None,
+            reason="Evidence document deleted",
+            request=request
+        )
+
+        return Response({"success": True, "message": "Evidence removed successfully."}, status=status.HTTP_200_OK)
 
 
 class SystemSettingView(APIView):
@@ -2836,9 +3041,25 @@ class SystemSettingView(APIView):
                 val_str = str(value)
             if len(val_str) > 5000:
                 return Response({"error": f"Setting value for '{clean_k}' cannot exceed 5000 characters."}, status=status.HTTP_400_BAD_REQUEST)
+            
+            old_s = SystemSetting.objects.filter(key=clean_k).first()
+            old_val = old_s.value if old_s else None
+
             SystemSetting.objects.update_or_create(
                 key=clean_k,
                 defaults={'value': val_str}
+            )
+
+            record_system_audit_event(
+                action='ADMIN_SETTING_CHANGE',
+                object_type='SystemSetting',
+                object_id=clean_k,
+                actor=request.user,
+                object_repr=f"System Setting '{clean_k}'",
+                old_value={'value': old_val},
+                new_value={'value': val_str},
+                reason=f"Setting modified by {getattr(request.user, 'email', '')}",
+                request=request
             )
         return Response({"success": True}, status=status.HTTP_200_OK)
 
@@ -2956,40 +3177,41 @@ class CriteriaVersionListView(APIView):
         if not academic_year:
             return Response({"error": "academic_year is required."}, status=status.HTTP_400_BAD_REQUEST)
 
-        latest = CriteriaVersion.objects.filter(academic_year=academic_year).order_by('-version').first()
-        next_v = (latest.version + 1) if latest else 1
+        with transaction.atomic():
+            latest = CriteriaVersion.objects.select_for_update().filter(academic_year=academic_year).order_by('-version').first()
+            next_v = (latest.version + 1) if latest else 1
 
-        name = request.data.get('name', f"{academic_year} v{next_v}")
-        new_version = CriteriaVersion.objects.create(
-            academic_year=academic_year,
-            version=next_v,
-            name=name,
-            is_locked=False
-        )
+            name = request.data.get('name', f"{academic_year} v{next_v}")
+            new_version = CriteriaVersion.objects.create(
+                academic_year=academic_year,
+                version=next_v,
+                name=name,
+                is_locked=False
+            )
 
-        clone_from_id = request.data.get('clone_from_version_id')
-        if clone_from_id:
-            source_items = CriteriaItem.objects.filter(version_id=clone_from_id).prefetch_related('rules')
-            for src_item in source_items:
-                new_item = CriteriaItem.objects.create(
-                    category=src_item.category,
-                    version=new_version,
-                    title=src_item.title,
-                    type=src_item.type,
-                    marks=src_item.marks,
-                    rules_json=src_item.rules_json
-                )
-                for src_rule in src_item.rules.all():
-                    CriteriaRule.objects.create(
-                        item=new_item,
-                        rule_type=src_rule.rule_type,
-                        maximum_marks=src_rule.maximum_marks,
-                        min_count=src_rule.min_count,
-                        max_count=src_rule.max_count,
-                        is_negative=src_rule.is_negative,
-                        multiplier=src_rule.multiplier,
-                        extra_config=src_rule.extra_config
+            clone_from_id = request.data.get('clone_from_version_id')
+            if clone_from_id:
+                source_items = CriteriaItem.objects.filter(version_id=clone_from_id).prefetch_related('rules')
+                for src_item in source_items:
+                    new_item = CriteriaItem.objects.create(
+                        category=src_item.category,
+                        version=new_version,
+                        title=src_item.title,
+                        type=src_item.type,
+                        marks=src_item.marks,
+                        rules_json=src_item.rules_json
                     )
+                    for src_rule in src_item.rules.all():
+                        CriteriaRule.objects.create(
+                            item=new_item,
+                            rule_type=src_rule.rule_type,
+                            maximum_marks=src_rule.maximum_marks,
+                            min_count=src_rule.min_count,
+                            max_count=src_rule.max_count,
+                            is_negative=src_rule.is_negative,
+                            multiplier=src_rule.multiplier,
+                            extra_config=src_rule.extra_config
+                        )
 
         serializer = CriteriaVersionSerializer(new_version)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
@@ -3004,6 +3226,7 @@ class CriteriaVersionDetailView(APIView):
         except CriteriaVersion.DoesNotExist:
             return Response({"error": "Criteria version not found."}, status=status.HTTP_404_NOT_FOUND)
 
+        old_locked = cv.is_locked
         if 'is_locked' in request.data:
             cv.is_locked = bool(request.data['is_locked'])
             if cv.is_locked and not cv.published_at:
@@ -3014,6 +3237,19 @@ class CriteriaVersionDetailView(APIView):
             cv.name = request.data['name']
 
         cv.save()
+
+        record_system_audit_event(
+            action='CRITERIA_CHANGE',
+            object_type='CriteriaVersion',
+            object_id=cv.id,
+            actor=request.user,
+            object_repr=f"CriteriaVersion {cv.name} ({cv.academic_year})",
+            old_value={'is_locked': old_locked},
+            new_value={'is_locked': cv.is_locked, 'name': cv.name},
+            reason=f"Criteria version modified by {getattr(request.user, 'email', '')}",
+            request=request
+        )
+
         serializer = CriteriaVersionSerializer(cv)
         return Response(serializer.data, status=status.HTTP_200_OK)
 
@@ -3029,7 +3265,18 @@ class CriteriaCategoryListView(APIView):
     def post(self, request):
         serializer = CriteriaCategorySerializer(data=request.data)
         if serializer.is_valid():
-            serializer.save()
+            cat = serializer.save()
+            record_system_audit_event(
+                action='CRITERIA_CHANGE',
+                object_type='CriteriaCategory',
+                object_id=cat.code or cat.id,
+                actor=request.user,
+                object_repr=f"CriteriaCategory '{cat.name}' ({cat.code})",
+                old_value=None,
+                new_value=serializer.data,
+                reason=f"Criteria category created by {getattr(request.user, 'email', '')}",
+                request=request
+            )
             return Response(serializer.data, status=status.HTTP_201_CREATED)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
@@ -3047,6 +3294,17 @@ class CriteriaCategoryDetailView(APIView):
         serializer = CriteriaCategorySerializer(category, data=request.data, partial=True)
         if serializer.is_valid():
             serializer.save()
+            record_system_audit_event(
+                action='CRITERIA_CHANGE',
+                object_type='CriteriaCategory',
+                object_id=category.code or category.id,
+                actor=request.user,
+                object_repr=f"CriteriaCategory '{category.name}'",
+                old_value=None,
+                new_value=serializer.data,
+                reason=f"Criteria category updated by {getattr(request.user, 'email', '')}",
+                request=request
+            )
             return Response(serializer.data)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
@@ -3056,7 +3314,19 @@ class CriteriaCategoryDetailView(APIView):
                 category = CriteriaCategory.objects.get(pk=int(pk))
             else:
                 category = CriteriaCategory.objects.get(code=pk)
+            cat_name = category.name
             category.delete()
+            record_system_audit_event(
+                action='CRITERIA_CHANGE',
+                object_type='CriteriaCategory',
+                object_id=pk,
+                actor=request.user,
+                object_repr=f"CriteriaCategory '{cat_name}' deleted",
+                old_value={'name': cat_name},
+                new_value=None,
+                reason=f"Criteria category deleted by {getattr(request.user, 'email', '')}",
+                request=request
+            )
         except CriteriaCategory.DoesNotExist:
             pass
         return Response({"success": True}, status=status.HTTP_200_OK)
@@ -3068,7 +3338,18 @@ class CriteriaItemListView(APIView):
     def post(self, request):
         serializer = CriteriaItemSerializer(data=request.data)
         if serializer.is_valid():
-            serializer.save()
+            item = serializer.save()
+            record_system_audit_event(
+                action='CRITERIA_CHANGE',
+                object_type='CriteriaItem',
+                object_id=item.id,
+                actor=request.user,
+                object_repr=f"CriteriaItem #{item.id} '{item.title}'",
+                old_value=None,
+                new_value=serializer.data,
+                reason=f"Criteria item created by {getattr(request.user, 'email', '')}",
+                request=request
+            )
             return Response(serializer.data, status=status.HTTP_201_CREATED)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
@@ -3084,13 +3365,36 @@ class CriteriaItemDetailView(APIView):
         serializer = CriteriaItemSerializer(item, data=request.data, partial=True)
         if serializer.is_valid():
             serializer.save()
+            record_system_audit_event(
+                action='CRITERIA_CHANGE',
+                object_type='CriteriaItem',
+                object_id=item.id,
+                actor=request.user,
+                object_repr=f"CriteriaItem #{item.id} '{item.title}'",
+                old_value=None,
+                new_value=serializer.data,
+                reason=f"Criteria item updated by {getattr(request.user, 'email', '')}",
+                request=request
+            )
             return Response(serializer.data)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
     def delete(self, request, pk):
         try:
             item = CriteriaItem.objects.get(pk=pk)
+            title = item.title
             item.delete()
+            record_system_audit_event(
+                action='CRITERIA_CHANGE',
+                object_type='CriteriaItem',
+                object_id=pk,
+                actor=request.user,
+                object_repr=f"CriteriaItem #{pk} '{title}' deleted",
+                old_value={'title': title},
+                new_value=None,
+                reason=f"Criteria item deleted by {getattr(request.user, 'email', '')}",
+                request=request
+            )
         except CriteriaItem.DoesNotExist:
             pass
         return Response({"success": True}, status=status.HTTP_200_OK)
@@ -3140,6 +3444,11 @@ class ChampionListView(APIView):
         return Response(serializer.data, status=status.HTTP_200_OK)
 
     def post(self, request):
+        image = request.FILES.get('image')
+        if image:
+            is_valid, err, _ = validate_file_upload(image, ALLOWED_IMAGE_EXTENSIONS, MAX_IMAGE_SIZE_BYTES)
+            if not is_valid:
+                return Response({'error': err, 'image': [err]}, status=status.HTTP_400_BAD_REQUEST)
         serializer = ChampionSerializer(data=request.data)
         if serializer.is_valid():
             serializer.save()
@@ -3155,6 +3464,12 @@ class ChampionDetailView(APIView):
             champion = Champion.objects.get(pk=pk)
         except Champion.DoesNotExist:
             return Response({'error': 'Champion not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        image = request.FILES.get('image')
+        if image:
+            is_valid, err, _ = validate_file_upload(image, ALLOWED_IMAGE_EXTENSIONS, MAX_IMAGE_SIZE_BYTES)
+            if not is_valid:
+                return Response({'error': err, 'image': [err]}, status=status.HTTP_400_BAD_REQUEST)
 
         serializer = ChampionSerializer(champion, data=request.data, partial=True)
         if serializer.is_valid():
@@ -3194,6 +3509,12 @@ class BugReportView(APIView):
         return Response(serializer.data, status=status.HTTP_200_OK)
 
     def post(self, request):
+        screenshot = request.FILES.get('screenshot')
+        if screenshot:
+            is_valid, err, _ = validate_file_upload(screenshot, ALLOWED_IMAGE_EXTENSIONS, MAX_IMAGE_SIZE_BYTES)
+            if not is_valid:
+                return Response({'error': err, 'screenshot': [err]}, status=status.HTTP_400_BAD_REQUEST)
+
         data = request.data.copy() if hasattr(request.data, 'copy') else dict(request.data)
         
         # Auto-fill reporter info if user is authenticated
@@ -3206,7 +3527,89 @@ class BugReportView(APIView):
         serializer = BugReportSerializer(data=data)
         if serializer.is_valid():
             report = serializer.save()
-            logger.info(f"New Bug Report filed #{report.id}: {report.title} [{report.priority}] by {report.reporter_email or 'Guest'}")
-            return Response(serializer.data, status=status.HTTP_201_CREATED)
+            logger.info(f"New Bug Report filed #{report.id}: {report.title} [{report.priority}]")
+            safe_data = BugReportSafeSerializer(report).data
+            return Response(safe_data, status=status.HTTP_201_CREATED)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+class SystemAuditLogView(APIView):
+    """
+    Read-only institutional audit ledger endpoint.
+    Strictly restricted to Admin and IQAC coordinators.
+    No modifications or deletions are allowed via this or any endpoint.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        user = request.user
+        user_role = getattr(user, 'role', '')
+        if not (user.is_superuser or user_role in ('admin', 'iqac')):
+            return Response(
+                {"error": "Unauthorized: Only administrators and IQAC coordinators can inspect the system audit trail."},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        qs = SystemAuditLog.objects.all()
+        action = request.query_params.get('action')
+        object_type = request.query_params.get('object_type')
+        object_id = request.query_params.get('object_id')
+        actor_email = request.query_params.get('actor_email')
+
+        if action:
+            qs = qs.filter(action=action)
+        if object_type:
+            qs = qs.filter(object_type=object_type)
+        if object_id:
+            qs = qs.filter(object_id=object_id)
+        if actor_email:
+            qs = qs.filter(actor_email__iexact=actor_email)
+
+        limit = min(int(request.query_params.get('limit', 100)), 500)
+        serializer = SystemAuditLogSerializer(qs[:limit], many=True)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+class SubmissionAuditTrailView(APIView):
+    """
+    Read-only submission-specific audit trail endpoint.
+    Authorized for the submission owner, class teacher, student rep for the class, and staff/admin.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        try:
+            submission = Submission.objects.select_related('user', 'user__class_name').get(pk=pk)
+        except Submission.DoesNotExist:
+            return Response({"error": "Submission not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        user = request.user
+        user_role = getattr(user, 'role', '')
+        is_owner = bool(submission.user_id == user.id)
+
+        allowed = False
+        if user.is_superuser or user_role in ('admin', 'iqac', 'evaluation'):
+            allowed = True
+        elif is_owner:
+            allowed = True
+        elif user_role == 'faculty':
+            advised_classes = Class.objects.filter(class_teacher=user)
+            if submission.user and submission.user.class_name in advised_classes:
+                allowed = True
+            elif submission.user and user.department_id and submission.user.department_id == user.department_id:
+                allowed = True
+        elif user_role == 'student' and is_user_student_rep(user):
+            rep_classes = Class.objects.filter(
+                Q(dqc_member=user) | Q(dqc_member__email__iexact=user.email)
+            )
+            if submission.user and submission.user.class_name in rep_classes:
+                allowed = True
+
+        if not allowed:
+            return Response({"error": "You do not have permission to view this submission's audit trail."}, status=status.HTTP_403_FORBIDDEN)
+
+        trails = WorkflowAuditTrail.objects.filter(submission=submission).order_by('created_at')
+        serializer = WorkflowAuditTrailSerializer(trails, many=True)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
 

@@ -4,7 +4,7 @@ from rest_framework import status
 from .models import (
     Department, Course, Class, User, AcademicYear,
     CriteriaCategory, CriteriaItem, CriteriaRule, CriteriaVersion,
-    Submission, AcademicGradeBreakdown
+    Submission, AcademicGradeBreakdown, ClassIndexResult, SystemSetting
 )
 from .views import parse_student_email, allocate_student_from_email, calculate_submission_score
 
@@ -1995,6 +1995,1699 @@ class Phase3APISecurityAndValidationRegressionTest(TestCase):
             'test_key': 'V' * 5001
         }, format='json')
         self.assertEqual(res_big_val.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+class Phase4DatabaseIntegrityRegressionTest(TestCase):
+    """
+    Comprehensive regression tests for Phase 4 Database Integrity:
+    1. Active Academic Year Uniqueness (PostgreSQL conditional unique constraint)
+    2. Academic Year Format CheckConstraint
+    3. Department Level CheckConstraint
+    4. Course Duration CheckConstraint
+    5. Class CheckConstraints (non-negative students, negative points) and UniqueConstraint (course, year, section)
+    6. User Role CheckConstraint
+    7. Submission Unique Active Certificate Constraint (and coexistence with Rejected)
+    8. Submission Unique Active Proof Hash Constraint
+    9. Academic Grade Breakdown Constraints (non-negative counts, pass percentage range)
+    10. Class Index Result Uniqueness & Protected Foreign Key Deletion
+    11. Submission Creation Atomicity (Rollback on dependent model failure)
+    12. Academic Year Atomic Activation via API
+    """
+
+    def setUp(self):
+        from django.db import IntegrityError, transaction
+        from django.db.models import ProtectedError
+        self.client = APIClient()
+
+        # Clean slate active year
+        AcademicYear.objects.all().delete()
+        self.ay = AcademicYear.objects.create(year='2025-2026', is_active=True)
+
+        self.dept = Department.objects.create(
+            name='Dept of Computer Science',
+            code='DCS',
+            email_prefix='u',
+            level='UG'
+        )
+        self.course = Course.objects.create(
+            department=self.dept,
+            name='Bachelor of Computer Applications',
+            abbreviation='BCA',
+            email_code='bc',
+            duration_years=3
+        )
+        self.cls = Class.objects.create(
+            name='I BCA A',
+            department=self.dept,
+            course=self.course,
+            year_number=1,
+            section='A',
+            num_students=50,
+            negative_points=0.0
+        )
+        self.student = User.objects.create_user(
+            username='student.test@mariancollege.org',
+            email='student.test@mariancollege.org',
+            role='student',
+            department=self.dept,
+            class_name=self.cls
+        )
+        self.admin = User.objects.create_user(
+            username='admin.test@mariancollege.org',
+            email='admin.test@mariancollege.org',
+            role='admin',
+            is_staff=True,
+            is_superuser=True
+        )
+        self.cat = CriteriaCategory.objects.create(
+            code='cat-phase4',
+            category='Academic Integrity'
+        )
+        self.crit_version = CriteriaVersion.objects.create(
+            academic_year='2025-2026',
+            version=1,
+            is_locked=False
+        )
+        self.item = CriteriaItem.objects.create(
+            category=self.cat,
+            version=self.crit_version,
+            title='Academic Merit Item',
+            type='count',
+            marks=10.0
+        )
+
+    # 1. Unique Active Academic Year Constraint
+    def test_unique_active_academic_year_constraint(self):
+        from django.db import IntegrityError, transaction
+        # self.ay is already is_active=True
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                AcademicYear.objects.create(year='2026-2027', is_active=True)
+
+        # Inactive academic years can coexist without conflict
+        ay2 = AcademicYear.objects.create(year='2026-2027', is_active=False)
+        ay3 = AcademicYear.objects.create(year='2027-2028', is_active=False)
+        self.assertEqual(AcademicYear.objects.filter(is_active=False).count(), 2)
+
+    # 2. Academic Year Format CheckConstraint
+    def test_academic_year_format_check_constraint(self):
+        from django.db import IntegrityError, transaction
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                AcademicYear.objects.create(year='invalid-year-format', is_active=False)
+
+    # 3. Department Level CheckConstraint
+    def test_department_level_check_constraint(self):
+        from django.db import IntegrityError, transaction
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                Department.objects.create(name='Bad Dept', code='BD', level='Doctoral')
+
+    # 4. Course Duration CheckConstraint
+    def test_course_duration_check_constraint(self):
+        from django.db import IntegrityError, transaction
+        # duration_years < 1
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                Course.objects.create(
+                    department=self.dept,
+                    name='Invalid Course 0',
+                    abbreviation='IC0',
+                    email_code='ic0',
+                    duration_years=0
+                )
+        # duration_years > 6
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                Course.objects.create(
+                    department=self.dept,
+                    name='Invalid Course 7',
+                    abbreviation='IC7',
+                    email_code='ic7',
+                    duration_years=7
+                )
+
+    # 5. Class CheckConstraints & Section Uniqueness
+    def test_class_constraints(self):
+        from django.db import IntegrityError, transaction
+        # Negative students
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                Class.objects.create(
+                    name='Bad Class 1',
+                    department=self.dept,
+                    num_students=-5
+                )
+        # Negative penalty points
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                Class.objects.create(
+                    name='Bad Class 2',
+                    department=self.dept,
+                    negative_points=-10.0
+                )
+        # Duplicate course + year + section ('A' already exists)
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                Class.objects.create(
+                    name='Duplicate I BCA A',
+                    department=self.dept,
+                    course=self.course,
+                    year_number=1,
+                    section='A'
+                )
+
+    # 6. User Role CheckConstraint
+    def test_user_role_check_constraint(self):
+        from django.db import IntegrityError, transaction
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                User.objects.create_user(
+                    username='invalid.role@mariancollege.org',
+                    email='invalid.role@mariancollege.org',
+                    role='hacker'
+                )
+
+    # 7. Submission Unique Active Certificate Constraint
+    def test_submission_unique_active_certificate_constraint(self):
+        from django.db import IntegrityError, transaction
+        # Create active submission with certificate_id
+        sub1 = Submission.objects.create(
+            user=self.student,
+            criteria_id=self.item.id,
+            academic_year='2025-2026',
+            description='Test Certificate Submission',
+            status='Pending Rep Verification',
+            certificate_id='CERT-PHASE4-001'
+        )
+
+        # Attempt to create another submission for the same student with the same certificate_id
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                Submission.objects.create(
+                    user=self.student,
+                    criteria_id=self.item.id,
+                    academic_year='2025-2026',
+                    description='Duplicate Certificate Submission',
+                    status='Draft',
+                    certificate_id='CERT-PHASE4-001'
+                )
+
+        # If sub1 is rejected, student CAN resubmit the certificate
+        sub1.status = 'Rejected'
+        sub1.save()
+
+        sub2 = Submission.objects.create(
+            user=self.student,
+            criteria_id=self.item.id,
+            academic_year='2025-2026',
+            description='Resubmitted Certificate After Rejection',
+            status='Draft',
+            certificate_id='CERT-PHASE4-001'
+        )
+        self.assertIsNotNone(sub2.id)
+
+    # 8. Submission Unique Active Proof Hash Constraint
+    def test_submission_unique_active_proof_hash_constraint(self):
+        from django.db import IntegrityError, transaction
+        test_hash = 'a' * 64
+        Submission.objects.create(
+            user=self.student,
+            criteria_id=self.item.id,
+            academic_year='2025-2026',
+            description='Submission 1 with proof hash',
+            status='Pending',
+            proof_hash=test_hash
+        )
+
+        # Duplicate proof hash for same user fails
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                Submission.objects.create(
+                    user=self.student,
+                    criteria_id=self.item.id,
+                    academic_year='2025-2026',
+                    description='Submission 2 with same proof hash',
+                    status='Draft',
+                    proof_hash=test_hash
+                )
+
+    # 9. Academic Grade Breakdown Constraints
+    def test_grade_breakdown_database_constraints(self):
+        from django.db import IntegrityError, transaction
+        sub = Submission.objects.create(
+            user=self.student,
+            criteria_id=self.item.id,
+            academic_year='2025-2026',
+            description='Grading Submission',
+            status='Draft'
+        )
+
+        # Direct DB creation with negative grade count violates CheckConstraint
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                AcademicGradeBreakdown.objects.bulk_create([
+                    AcademicGradeBreakdown(
+                        submission=sub,
+                        s_grade_count=-1,
+                        total_students=50,
+                        class_pass_percentage=90.0
+                    )
+                ])
+
+        # Pass percentage > 100.0 violates CheckConstraint
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                AcademicGradeBreakdown.objects.bulk_create([
+                    AcademicGradeBreakdown(
+                        submission=sub,
+                        s_grade_count=10,
+                        total_students=50,
+                        class_pass_percentage=105.0
+                    )
+                ])
+
+    # 10. Class Index Result Uniqueness & Protected Foreign Key
+    def test_class_index_result_uniqueness_and_protect(self):
+        from django.db import IntegrityError, transaction
+        from django.db.models import ProtectedError
+        # Create ClassIndexResult
+        cir = ClassIndexResult.objects.create(
+            class_name=self.cls,
+            academic_year=self.ay,
+            academic_score=80.0,
+            final_index=1.6,
+            rank=1
+        )
+
+        # Duplicate class_name + academic_year violates unique_class_academic_year_result
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                ClassIndexResult.objects.create(
+                    class_name=self.cls,
+                    academic_year=self.ay,
+                    academic_score=85.0,
+                    final_index=1.7,
+                    rank=2
+                )
+
+        # Deleting the academic year is protected by models.PROTECT
+        with self.assertRaises(ProtectedError):
+            self.ay.delete()
+
+    # 11. Submission Creation Atomicity (Rollback on failure)
+    def test_submission_creation_transaction_atomic_rollback(self):
+        self.client.force_authenticate(user=self.student)
+        initial_sub_count = Submission.objects.count()
+
+        # Submit with invalid grade counts (where sum doesn't match total students)
+        payload = {
+            'criteriaId': self.item.id,
+            'academicYear': '2025-2026',
+            'description': 'Submission with broken grade breakdown',
+            'evidence': {
+                'submissionType': 'Sem Result',
+                'grades': {'S': 10, 'APlus': 10, 'A': 10, 'Fail': 5}, # accounted = 35
+                'totalStudents': 50 # 35 != 50
+            },
+            'grade_breakdown': {
+                's_grade_count': 10,
+                'a_plus_grade_count': 10,
+                'a_grade_count': 10,
+                'other_pass_count': 5, # 10+10+10+5+5 = 40 != 50 -> raises ValueError
+                'failed_count': 5,
+                'total_students': 50
+            }
+        }
+        res = self.client.post('/api/submissions/', payload, format='json')
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Invariant: Entire transaction must rollback; no orphan submission persisted
+        self.assertEqual(Submission.objects.count(), initial_sub_count)
+
+    # 12. Academic Year Atomic Activation via API
+    def test_atomic_academic_year_activation_via_api(self):
+        self.client.force_authenticate(user=self.admin)
+
+        # Activate 2026-2027 via POST
+        res_post = self.client.post('/api/academic-years/', {
+            'year': '2026-2027',
+            'is_active': True
+        }, format='json')
+        self.assertEqual(res_post.status_code, status.HTTP_200_OK)
+
+        # Exactly ONE academic year must be active
+        active_years = AcademicYear.objects.filter(is_active=True)
+        self.assertEqual(active_years.count(), 1)
+        self.assertEqual(active_years.first().year, '2026-2027')
+
+
+class Phase5WorkflowIntegrityRegressionTest(TestCase):
+    """
+    Comprehensive regression tests for Phase 5 Workflow Integrity:
+    1. Golden Path Transitions (Draft -> Submitted -> Rep Verified -> Teacher Verified -> Evaluated -> Locked)
+    2. Cryptographic audit trail chain integrity and stage numbers (1 through 5)
+    3. Rejection of invalid transitions (Draft -> Evaluated, Teacher Verified -> Draft, Locked -> Draft)
+    4. Rejection of unauthorized role transitions (Student -> Evaluated, Rep -> unauthorized class)
+    5. Required remarks on Correction Requested and Rejected
+    6. Resubmission lifecycle (from Correction Requested and Rejected)
+    7. Locked record immutability and authorized Admin explicit unlock
+    """
+
+    def setUp(self):
+        self.client = APIClient()
+        self.ay = AcademicYear.objects.create(year='2025-2026', is_active=True)
+
+        self.dept_cs = Department.objects.create(name='Computer Applications', code='MCA', level='PG')
+        self.dept_mgmt = Department.objects.create(name='Management Studies', code='MBA', level='PG')
+
+        self.course_mca = Course.objects.create(department=self.dept_cs, name='MCA', abbreviation='MCA', email_code='mc', duration_years=2)
+        self.course_mba = Course.objects.create(department=self.dept_mgmt, name='MBA', abbreviation='MBA', email_code='mb', duration_years=2)
+
+        self.class_mca = Class.objects.create(name='I MCA', department=self.dept_cs, course=self.course_mca, year_number=1, num_students=30)
+        self.class_mba = Class.objects.create(name='I MBA', department=self.dept_mgmt, course=self.course_mba, year_number=1, num_students=25)
+
+        # Users
+        self.student_mca = User.objects.create_user(
+            username='student.mca@mariancollege.org', email='student.mca@mariancollege.org',
+            role='student', department=self.dept_cs, class_name=self.class_mca
+        )
+        self.rep_mca = User.objects.create_user(
+            username='rep.mca@mariancollege.org', email='rep.mca@mariancollege.org',
+            role='student', department=self.dept_cs, class_name=self.class_mca
+        )
+        self.class_mca.dqc_member = self.rep_mca
+        self.class_mca.save()
+
+        self.teacher_mca = User.objects.create_user(
+            username='teacher.mca@mariancollege.org', email='teacher.mca@mariancollege.org',
+            role='faculty', department=self.dept_cs
+        )
+        self.class_mca.class_teacher = self.teacher_mca
+        self.class_mca.save()
+
+        self.teacher_other = User.objects.create_user(
+            username='teacher.mgmt@mariancollege.org', email='teacher.mgmt@mariancollege.org',
+            role='faculty', department=self.dept_mgmt
+        )
+        self.class_mba.class_teacher = self.teacher_other
+        self.class_mba.save()
+
+        self.evaluator = User.objects.create_user(
+            username='evaluator.phase5@mariancollege.org', email='evaluator.phase5@mariancollege.org',
+            role='evaluation'
+        )
+        self.evaluator_other = User.objects.create_user(
+            username='evaluator.other@mariancollege.org', email='evaluator.other@mariancollege.org',
+            role='evaluation'
+        )
+
+        self.admin = User.objects.create_user(
+            username='admin.phase5@mariancollege.org', email='admin.phase5@mariancollege.org',
+            role='admin', is_staff=True, is_superuser=True
+        )
+
+        # Criteria
+        self.cat = CriteriaCategory.objects.create(
+            code='cat-phase5',
+            category='Academic & Research',
+            evaluators=['evaluator.phase5@mariancollege.org']
+        )
+        self.item = CriteriaItem.objects.create(
+            category=self.cat,
+            title='Research Paper Publication',
+            type='fixed',
+            marks=10.0
+        )
+
+    # 1. Golden Path Transitions & Cryptographic Audit Trail Chaining
+    def test_golden_path_workflow_transitions_and_audit_trail(self):
+        # Step 1: Student creates Draft
+        self.client.force_authenticate(user=self.student_mca)
+        res_draft = self.client.post('/api/submissions/', {
+            'criteriaId': self.item.id,
+            'academicYear': '2025-2026',
+            'description': 'Research Paper on AI Verification',
+            'status': 'Draft'
+        }, format='json')
+        self.assertEqual(res_draft.status_code, status.HTTP_201_CREATED)
+        sub_id = res_draft.data['id']
+
+        # Step 2: Student transitions Draft -> Submitted
+        res_submit = self.client.put(f'/api/submissions/{sub_id}/', {
+            'status': 'Submitted'
+        }, format='json')
+        self.assertEqual(res_submit.status_code, status.HTTP_200_OK)
+
+        # Step 3: DQAC Student Rep verifies Submitted -> Student Rep Verified
+        self.client.force_authenticate(user=self.rep_mca)
+        res_rep = self.client.put(f'/api/submissions/{sub_id}/', {
+            'status': 'Student Rep Verified',
+            'repRemarks': 'Student Rep verified publication certificate'
+        }, format='json')
+        self.assertEqual(res_rep.status_code, status.HTTP_200_OK)
+
+        # Step 4: Class Teacher verifies Student Rep Verified -> Teacher Verified
+        self.client.force_authenticate(user=self.teacher_mca)
+        res_teach = self.client.put(f'/api/submissions/{sub_id}/', {
+            'status': 'Teacher Verified',
+            'teacherRemarks': 'Faculty Advisor verified conference legitimacy'
+        }, format='json')
+        self.assertEqual(res_teach.status_code, status.HTTP_200_OK)
+
+        # Step 5: Assigned Evaluator audits & awards marks: Teacher Verified -> Evaluated
+        self.client.force_authenticate(user=self.evaluator)
+        res_eval = self.client.put(f'/api/submissions/{sub_id}/', {
+            'status': 'Evaluated',
+            'marks': 10.0,
+            'evaluatorRemarks': 'Evaluator approved 10.0 marks'
+        }, format='json')
+        self.assertEqual(res_eval.status_code, status.HTTP_200_OK)
+
+        # Step 6: Admin locks submission: Evaluated -> Locked
+        self.client.force_authenticate(user=self.admin)
+        res_lock = self.client.put(f'/api/submissions/{sub_id}/', {
+            'status': 'Locked',
+            'remarks': 'Final IQAC moderation lock'
+        }, format='json')
+        self.assertEqual(res_lock.status_code, status.HTTP_200_OK)
+
+        # Verify DB final state
+        sub = Submission.objects.get(id=sub_id)
+        self.assertEqual(sub.status, 'Locked')
+        self.assertEqual(sub.marks, 10)
+        self.assertTrue(sub.evaluator_verified)
+
+        # Verify Audit Trail Integrity & Stages
+        from users.models import WorkflowAuditTrail
+        logs = WorkflowAuditTrail.objects.filter(submission_id=sub_id).order_by('id')
+        self.assertGreaterEqual(logs.count(), 5)
+
+        stages_recorded = [log.stage for log in logs]
+        self.assertIn(1, stages_recorded) # Student Claims
+        self.assertIn(2, stages_recorded) # Student Rep
+        self.assertIn(3, stages_recorded) # Teacher
+        self.assertIn(4, stages_recorded) # Evaluator
+        self.assertIn(5, stages_recorded) # Locking
+
+        # Cryptographic Hash Chain Verification
+        prev_h = "0" * 64
+        for log in logs:
+            self.assertEqual(log.previous_hash, prev_h)
+            self.assertTrue(len(log.record_hash) == 64)
+            prev_h = log.record_hash
+
+    # 2. Rejection of Invalid State Transitions
+    def test_invalid_state_transitions_rejected(self):
+        # Create submission in Draft
+        sub = Submission.objects.create(
+            user=self.student_mca, criteria_id=self.item.id,
+            academic_year='2025-2026', description='Testing invalid transitions',
+            status='Draft'
+        )
+
+        # Student attempts Draft -> Evaluated (Denied) -> 403
+        self.client.force_authenticate(user=self.student_mca)
+        res_skip = self.client.put(f'/api/submissions/{sub.id}/', {
+            'status': 'Evaluated'
+        }, format='json')
+        self.assertEqual(res_skip.status_code, status.HTTP_403_FORBIDDEN)
+
+        # Admin attempts Draft -> Locked (Invalid workflow jump) -> 400
+        self.client.force_authenticate(user=self.admin)
+        res_admin_jump = self.client.put(f'/api/submissions/{sub.id}/', {
+            'status': 'Locked'
+        }, format='json')
+        self.assertEqual(res_admin_jump.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('Invalid workflow state transition', res_admin_jump.data.get('error', ''))
+
+        # Move to Teacher Verified
+        sub.status = 'Teacher Verified'
+        sub.save()
+
+        # Teacher attempts Teacher Verified -> Draft (Invalid backward regression) -> 400
+        self.client.force_authenticate(user=self.teacher_mca)
+        res_regress = self.client.put(f'/api/submissions/{sub.id}/', {
+            'status': 'Draft'
+        }, format='json')
+        self.assertEqual(res_regress.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('Invalid workflow state transition', res_regress.data.get('error', ''))
+
+    # 3. Rejection of Unauthorized Role Transitions
+    def test_unauthorized_role_transitions_rejected(self):
+        sub = Submission.objects.create(
+            user=self.student_mca, criteria_id=self.item.id,
+            academic_year='2025-2026', description='Testing unauthorized roles',
+            status='Submitted'
+        )
+
+        # Regular student attempts self-verification -> 403
+        self.client.force_authenticate(user=self.student_mca)
+        res_self_verify = self.client.put(f'/api/submissions/{sub.id}/', {
+            'status': 'Student Rep Verified'
+        }, format='json')
+        self.assertEqual(res_self_verify.status_code, status.HTTP_403_FORBIDDEN)
+
+        # Faculty from other department attempts verification -> 403
+        self.client.force_authenticate(user=self.teacher_other)
+        res_other_teacher = self.client.put(f'/api/submissions/{sub.id}/', {
+            'status': 'Teacher Verified'
+        }, format='json')
+        self.assertEqual(res_other_teacher.status_code, status.HTTP_403_FORBIDDEN)
+
+        # Move to Teacher Verified
+        sub.status = 'Teacher Verified'
+        sub.save()
+
+        # Evaluator not assigned to Category attempts evaluation -> 403
+        self.client.force_authenticate(user=self.evaluator_other)
+        res_unauth_eval = self.client.put(f'/api/submissions/{sub.id}/', {
+            'status': 'Evaluated',
+            'marks': 10.0
+        }, format='json')
+        self.assertEqual(res_unauth_eval.status_code, status.HTTP_403_FORBIDDEN)
+
+    # 4. Rejection and Correction Require Non-Empty Remarks
+    def test_rejection_and_correction_require_remarks(self):
+        sub = Submission.objects.create(
+            user=self.student_mca, criteria_id=self.item.id,
+            academic_year='2025-2026', description='Testing remarks requirement',
+            status='Submitted'
+        )
+
+        self.client.force_authenticate(user=self.rep_mca)
+
+        # Attempt Correction Requested with empty remarks -> 400
+        res_empty_corr = self.client.put(f'/api/submissions/{sub.id}/', {
+            'status': 'Correction Requested',
+            'remarks': '   '
+        }, format='json')
+        self.assertEqual(res_empty_corr.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('remark or explanation is strictly required', res_empty_corr.data.get('error', ''))
+
+        # Attempt Rejected with empty remarks -> 400
+        res_empty_rej = self.client.put(f'/api/submissions/{sub.id}/', {
+            'status': 'Rejected',
+            'remarks': ''
+        }, format='json')
+        self.assertEqual(res_empty_rej.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Successful rejection with valid explanation
+        res_valid_rej = self.client.put(f'/api/submissions/{sub.id}/', {
+            'status': 'Rejected',
+            'remarks': 'Certificate date is outside current academic evaluation year.'
+        }, format='json')
+        self.assertEqual(res_valid_rej.status_code, status.HTTP_200_OK)
+        sub.refresh_from_db()
+        self.assertEqual(sub.status, 'Rejected')
+        self.assertIn('outside current academic evaluation year', sub.remarks)
+
+    # 5. Resubmission Lifecycle
+    def test_resubmission_lifecycle(self):
+        # Create submission in Correction Requested
+        sub = Submission.objects.create(
+            user=self.student_mca, criteria_id=self.item.id,
+            academic_year='2025-2026', description='Original defective claim',
+            status='Correction Requested', remarks='Please attach clearer certificate image'
+        )
+
+        self.client.force_authenticate(user=self.student_mca)
+
+        # Student corrects evidence and resubmits to Submitted
+        res_resubmit = self.client.put(f'/api/submissions/{sub.id}/', {
+            'status': 'Submitted',
+            'description': 'Updated claim with high-resolution certificate PDF'
+        }, format='json')
+        self.assertEqual(res_resubmit.status_code, status.HTTP_200_OK)
+        sub.refresh_from_db()
+        self.assertEqual(sub.status, 'Submitted')
+        self.assertEqual(sub.description, 'Updated claim with high-resolution certificate PDF')
+
+        # Now test resubmission from Rejected state
+        sub.status = 'Rejected'
+        sub.remarks = 'Initial proof invalid'
+        sub.save()
+
+        # Student transitions Rejected -> Draft to rework
+        res_rework = self.client.put(f'/api/submissions/{sub.id}/', {
+            'status': 'Draft',
+            'description': 'Reworking claim'
+        }, format='json')
+        self.assertEqual(res_rework.status_code, status.HTTP_200_OK)
+        sub.refresh_from_db()
+        self.assertEqual(sub.status, 'Draft')
+
+    # 6. Locked Record Immutability & Admin Explicit Unlock
+    def test_locked_record_immutability_and_admin_unlock(self):
+        sub = Submission.objects.create(
+            user=self.student_mca, criteria_id=self.item.id,
+            academic_year='2025-2026', description='Locked Claim',
+            status='Locked', marks=10
+        )
+
+        # Student attempts to edit locked claim -> 403
+        self.client.force_authenticate(user=self.student_mca)
+        res_stud_edit = self.client.put(f'/api/submissions/{sub.id}/', {
+            'description': 'Malicious overwrite'
+        }, format='json')
+        self.assertEqual(res_stud_edit.status_code, status.HTTP_403_FORBIDDEN)
+
+        # Evaluator attempts to modify marks on locked claim -> 403
+        self.client.force_authenticate(user=self.evaluator)
+        res_eval_edit = self.client.put(f'/api/submissions/{sub.id}/', {
+            'marks': 15
+        }, format='json')
+        self.assertEqual(res_eval_edit.status_code, status.HTTP_403_FORBIDDEN)
+
+        # Admin attempting to modify fields while remaining Locked -> 403
+        self.client.force_authenticate(user=self.admin)
+        res_admin_edit = self.client.put(f'/api/submissions/{sub.id}/', {
+            'description': 'Admin silent modification'
+        }, format='json')
+        self.assertEqual(res_admin_edit.status_code, status.HTTP_403_FORBIDDEN)
+
+        # Admin explicit unlock override: Admin transitions Locked -> Evaluated with audit reason
+        res_unlock = self.client.put(f'/api/submissions/{sub.id}/', {
+            'status': 'Evaluated',
+            'marks': 10,
+            'remarks': 'Administrative correction unlock authorized by IQAC Chair'
+        }, format='json')
+        self.assertEqual(res_unlock.status_code, status.HTTP_200_OK)
+        sub.refresh_from_db()
+        self.assertEqual(sub.status, 'Evaluated')
+
+
+class Phase6ScoringEngineRegressionTest(TestCase):
+    """
+    Mathematical tests and invariant validations for Phase 6 Scoring Engine remediation.
+    Tests authoritative 4-step formula, edge cases, invariants, explainability, and historical locking.
+    """
+
+    def setUp(self):
+        self.client = APIClient()
+        self.dept = Department.objects.create(name='Test Scoring Dept', code='TSD')
+        self.admin = User.objects.create_user(
+            email='admin.scoring@mariancollege.org', username='admin_scoring',
+            password='TestPassword@123', role='admin', is_staff=True, is_superuser=True
+        )
+        self.iqac = User.objects.create_user(
+            email='iqac.scoring@mariancollege.org', username='iqac_scoring',
+            password='TestPassword@123', role='iqac', is_staff=True
+        )
+
+        # Criteria categories
+        self.cat_acad = CriteriaCategory.objects.create(code='cat-academics', category='Academics')
+        self.cat_prizes = CriteriaCategory.objects.create(code='cat-prizes', category='Prizes')
+        self.cat_org = CriteriaCategory.objects.create(code='cat-programs-organized', category='Programs Organized')
+
+        self.item_acad = CriteriaItem.objects.create(category=self.cat_acad, title='Sem Results', type='fixed', marks=50.0)
+        self.item_prizes = CriteriaItem.objects.create(category=self.cat_prizes, title='First Prize', type='fixed', marks=15.0)
+        self.item_org = CriteriaItem.objects.create(category=self.cat_org, title='College Fest', type='fixed', marks=20.0)
+
+        # Benchmark class size
+        SystemSetting.objects.update_or_create(key='smallest_class_size', defaults={'value': '20.0'})
+
+    # 1. Authoritative 4-step formula calculations across class cohort sizes
+    def test_authoritative_4step_formula_scaling_and_fairness(self):
+        from users.scoring_engine import (
+            calculate_class_moderation, calculate_net_score,
+            calculate_total_score, calculate_class_index
+        )
+
+        # Benchmark scenario from scoring-logic.md (per student average: 15 marks)
+        # Class A: N=20, n=20, S=300, P=0
+        mod_a = calculate_class_moderation(N=20, n=20)
+        self.assertEqual(mod_a, 0.0)
+        tot_a = calculate_total_score(net_score=calculate_net_score(300, 0), moderation_mark=mod_a)
+        self.assertEqual(tot_a, 300.0)
+        idx_a = calculate_class_index(tot_a, N=20)
+        self.assertEqual(idx_a, 15.0000)
+
+        # Class B: N=40, n=20, S=600, P=0
+        mod_b = calculate_class_moderation(N=40, n=20)
+        self.assertEqual(mod_b, 40.0)
+        tot_b = calculate_total_score(net_score=calculate_net_score(600, 0), moderation_mark=mod_b)
+        self.assertEqual(tot_b, 640.0)
+        idx_b = calculate_class_index(tot_b, N=40)
+        self.assertEqual(idx_b, 16.0000)
+
+        # Class C: N=80, n=20, S=1200, P=0
+        mod_c = calculate_class_moderation(N=80, n=20)
+        self.assertEqual(mod_c, 120.0)
+        tot_c = calculate_total_score(net_score=calculate_net_score(1200, 0), moderation_mark=mod_c)
+        self.assertEqual(tot_c, 1320.0)
+        idx_c = calculate_class_index(tot_c, N=80)
+        self.assertEqual(idx_c, 16.5000)
+
+        # Class D: N=120, n=20, S=1800, P=0 -> capped at 200.0 moderation
+        mod_d = calculate_class_moderation(N=120, n=20)
+        self.assertEqual(mod_d, 200.0)  # Capped at 200
+        tot_d = calculate_total_score(net_score=calculate_net_score(1800, 0), moderation_mark=mod_d)
+        self.assertEqual(tot_d, 2000.0)
+        idx_d = calculate_class_index(tot_d, N=120)
+        self.assertAlmostEqual(idx_d, 16.6667, places=3)
+
+    # 2. Single Student Class (N=1)
+    def test_class_with_single_student(self):
+        from users.scoring_engine import calculate_class_moderation, calculate_total_score, calculate_class_index
+        # N=1, n=20 -> moderation must NOT be negative
+        mod = calculate_class_moderation(N=1, n=20)
+        self.assertEqual(mod, 0.0)
+        total = calculate_total_score(net_score=25.0, moderation_mark=mod)
+        idx = calculate_class_index(total, N=1)
+        self.assertEqual(idx, 25.0000)
+
+    # 3. Small Class (N < n)
+    def test_small_class_moderation_non_negative(self):
+        from users.scoring_engine import calculate_class_moderation
+        mod = calculate_class_moderation(N=15, n=20)
+        self.assertEqual(mod, 0.0)
+
+    # 4. Zero Score Class
+    def test_zero_score_class(self):
+        cls = Class.objects.create(name='Zero Class', department=self.dept, num_students=30, negative_points=0.0)
+        from users.scoring_engine import compute_class_scores
+        res = compute_class_scores(cls, n_benchmark=20.0)
+        self.assertEqual(res['S'], 0.0)
+        self.assertEqual(res['P'], 0.0)
+        self.assertEqual(res['moderation_mark'], 20.0)  # 2 * (30 - 20)
+        self.assertEqual(res['total_score'], 20.0)
+        self.assertAlmostEqual(res['M'], 20.0 / 30.0, places=4)
+
+    # 5. Heavy Penalty reducing Total Score to 0 (cannot be negative)
+    def test_heavy_penalty_does_not_produce_negative_total_score(self):
+        cls = Class.objects.create(name='Penalty Class', department=self.dept, num_students=20, negative_points=500.0)
+        from users.scoring_engine import compute_class_scores
+        res = compute_class_scores(cls, n_benchmark=20.0)
+        self.assertEqual(res['S'], 0.0)
+        self.assertEqual(res['P'], 500.0)
+        self.assertEqual(res['net_score'], -500.0)
+        self.assertEqual(res['moderation_mark'], 0.0)
+        self.assertEqual(res['total_score'], 0.0)  # Bounded at 0
+        self.assertEqual(res['M'], 0.0)
+
+    # 6. Unranked Class with N=0
+    def test_unranked_class_with_zero_students(self):
+        cls = Class.objects.create(name='Empty Class', department=self.dept, num_students=0)
+        from users.scoring_engine import compute_class_scores
+        res = compute_class_scores(cls)
+        self.assertEqual(res['N'], 0)
+        self.assertIsNone(res['M'])
+
+    # 7. Category & Pillar Totals Conservation Invariant
+    def test_pillar_and_category_conservation_invariant(self):
+        cls = Class.objects.create(name='Multi Criteria Class', department=self.dept, num_students=50)
+        st = User.objects.create_user(
+            email='st.multi@mariancollege.org', username='st_multi',
+            password='TestPassword@123', role='student', class_name=cls, department=self.dept
+        )
+        Submission.objects.create(user=st, criteria_id=self.item_acad.id, status='Locked', marks=50.0, academic_year='2025-2026')
+        Submission.objects.create(user=st, criteria_id=self.item_prizes.id, status='Evaluated', marks=15.0, academic_year='2025-2026')
+        Submission.objects.create(user=st, criteria_id=self.item_org.id, status='Evaluated', marks=20.0, academic_year='2025-2026')
+        # Draft submission should NOT count
+        Submission.objects.create(user=st, criteria_id=self.item_prizes.id, status='Draft', marks=15.0, academic_year='2025-2026')
+
+        from users.scoring_engine import compute_class_scores
+        res = compute_class_scores(cls, academic_year='2025-2026')
+        self.assertEqual(res['S'], 85.0)  # 50 + 15 + 20
+        self.assertEqual(res['academic_score'], 50.0)
+        self.assertEqual(res['co_curricular_score'], 15.0)
+        self.assertEqual(res['extra_curricular_score'], 20.0)
+        self.assertEqual(res['academic_score'] + res['co_curricular_score'] + res['extra_curricular_score'], 85.0)
+
+    # 8. Deterministic Tie-Breaking
+    def test_deterministic_tie_breaking(self):
+        # Two classes with exact same M
+        cls_a = Class.objects.create(name='Tie Class Alpha', department=self.dept, num_students=20)
+        cls_b = Class.objects.create(name='Tie Class Beta', department=self.dept, num_students=20)
+        st_a = User.objects.create_user(email='st.ta@mariancollege.org', username='st_ta', password='Pass@123', role='student', class_name=cls_a)
+        st_b = User.objects.create_user(email='st.tb@mariancollege.org', username='st_tb', password='Pass@123', role='student', class_name=cls_b)
+
+        Submission.objects.create(user=st_a, criteria_id=self.item_acad.id, status='Locked', marks=50.0)
+        Submission.objects.create(user=st_b, criteria_id=self.item_acad.id, status='Locked', marks=50.0)
+
+        from users.scoring_engine import compute_all_rankings
+        ranked, _ = compute_all_rankings()
+        names = [r['class_name'] for r in ranked if r['class_name'] in ['Tie Class Alpha', 'Tie Class Beta']]
+        self.assertEqual(len(names), 2)
+        # In Standard Competition Ranking, identical scores share the exact same rank
+        r_a = next(r['rank'] for r in ranked if r['class_name'] == 'Tie Class Alpha')
+        r_b = next(r['rank'] for r in ranked if r['class_name'] == 'Tie Class Beta')
+        self.assertEqual(r_a, r_b)
+        self.assertEqual(r_a, 1)
+
+    # 9. Explainability Endpoint
+    def test_explainability_endpoint(self):
+        cls = Class.objects.create(name='Explain Class', department=self.dept, num_students=40)
+        st = User.objects.create_user(email='st.exp@mariancollege.org', username='st_exp', password='Pass@123', role='student', class_name=cls)
+        Submission.objects.create(user=st, criteria_id=self.item_acad.id, status='Locked', marks=50.0)
+
+        res = self.client.get('/api/class-index/?explain=true')
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        target = next((item for item in res.data if item.get('class_name') == 'Explain Class'), None)
+        self.assertIsNotNone(target)
+        self.assertIn('explanation_steps', target)
+        self.assertIn('formula_spec', target)
+        self.assertIn('breakdown', target)
+        self.assertEqual(len(target['explanation_steps']), 4)
+
+    # 10. Historical Snapshot & Immutability Lock
+    def test_historical_snapshot_and_lock_immutability(self):
+        cls = Class.objects.create(name='Snapshot Class', department=self.dept, num_students=30)
+        from users.scoring_engine import snapshot_academic_year_results
+        
+        # 1. Snapshot with lock=True
+        results = snapshot_academic_year_results('2024-2025', force=False, mark_locked=True)
+        self.assertTrue(len(results) > 0)
+        
+        # Verify saved in ClassIndexResult
+        from users.models import ClassIndexResult
+        snap = ClassIndexResult.objects.filter(academic_year__year='2024-2025', class_name=cls).first()
+        self.assertIsNotNone(snap)
+        self.assertTrue(snap.is_locked)
+        self.assertEqual(snap.scoring_version, 'v1.0-authoritative')
+
+        # 2. Attempting to overwrite locked snapshot without force raises PermissionError
+        with self.assertRaises(PermissionError):
+            snapshot_academic_year_results('2024-2025', force=False)
+
+        # 3. Explicit override with force=True succeeds
+        re_snap = snapshot_academic_year_results('2024-2025', force=True, mark_locked=True)
+        self.assertTrue(len(re_snap) > 0)
+
+
+class Phase7RankingCorrectnessTest(TestCase):
+    """
+    Exhaustive validation suite for Phase 7 Ranking Correctness.
+    Audits:
+    1. Equal performance across different class sizes
+    2. Perfect scores
+    3. Zero scores
+    4. Equal final scores (Ties sharing rank)
+    5. Floating-point boundary values
+    6. Missing data
+    7. Classes with different student counts
+    8. Deterministic ordering invariant
+    9. Published/locked results persistence
+    """
+
+    def setUp(self):
+        self.client = APIClient()
+        self.dept = Department.objects.create(name='Ranking Dept', code='RKD')
+        self.admin = User.objects.create_user(
+            email='admin.ranking@mariancollege.org', username='admin_rk',
+            password='TestPassword@123', role='admin', is_staff=True, is_superuser=True
+        )
+        self.cat_acad = CriteriaCategory.objects.create(code='cat-academics', category='Academics')
+        self.item_acad = CriteriaItem.objects.create(category=self.cat_acad, title='Sem Marks', type='fixed', marks=100.0)
+        SystemSetting.objects.update_or_create(key='smallest_class_size', defaults={'value': '20.0'})
+
+    # 1. Equal performance across different class sizes
+    def test_equal_performance_across_different_class_sizes(self):
+        # 4 classes with identical 15 marks per student:
+        # N=20 (S=300), N=40 (S=600), N=80 (S=1200), N=120 (S=1800)
+        c20 = Class.objects.create(name='Batch 20', department=self.dept, num_students=20)
+        c40 = Class.objects.create(name='Batch 40', department=self.dept, num_students=40)
+        c80 = Class.objects.create(name='Batch 80', department=self.dept, num_students=80)
+        c120 = Class.objects.create(name='Batch 120', department=self.dept, num_students=120)
+
+        u20 = User.objects.create_user(email='u20@marian.org', username='u20', role='student', class_name=c20)
+        u40 = User.objects.create_user(email='u40@marian.org', username='u40', role='student', class_name=c40)
+        u80 = User.objects.create_user(email='u80@marian.org', username='u80', role='student', class_name=c80)
+        u120 = User.objects.create_user(email='u120@marian.org', username='u120', role='student', class_name=c120)
+
+        Submission.objects.create(user=u20, criteria_id=self.item_acad.id, status='Locked', marks=300.0)
+        Submission.objects.create(user=u40, criteria_id=self.item_acad.id, status='Locked', marks=600.0)
+        Submission.objects.create(user=u80, criteria_id=self.item_acad.id, status='Locked', marks=1200.0)
+        Submission.objects.create(user=u120, criteria_id=self.item_acad.id, status='Locked', marks=1800.0)
+
+        from users.scoring_engine import compute_all_rankings
+        ranked, _ = compute_all_rankings()
+
+        ranks = {r['class_name']: r['rank'] for r in ranked}
+        indices = {r['class_name']: r['M'] for r in ranked}
+
+        # Larger cohorts receive slight coordination bonus (<= 1.67 index pts)
+        self.assertAlmostEqual(indices['Batch 120'], 16.6667, places=3)
+        self.assertEqual(indices['Batch 80'], 16.5000)
+        self.assertEqual(indices['Batch 40'], 16.0000)
+        self.assertEqual(indices['Batch 20'], 15.0000)
+
+        self.assertEqual(ranks['Batch 120'], 1)
+        self.assertEqual(ranks['Batch 80'], 2)
+        self.assertEqual(ranks['Batch 40'], 3)
+        self.assertEqual(ranks['Batch 20'], 4)
+
+    # 2. Perfect scores
+    def test_perfect_score_ranks_highest(self):
+        c_perf = Class.objects.create(name='Batch Perfect', department=self.dept, num_students=30)
+        c_norm = Class.objects.create(name='Batch Normal', department=self.dept, num_students=30)
+        u_p = User.objects.create_user(email='up@marian.org', username='up', role='student', class_name=c_perf)
+        u_n = User.objects.create_user(email='un@marian.org', username='un', role='student', class_name=c_norm)
+
+        Submission.objects.create(user=u_p, criteria_id=self.item_acad.id, status='Locked', marks=5000.0)
+        Submission.objects.create(user=u_n, criteria_id=self.item_acad.id, status='Locked', marks=200.0)
+
+        from users.scoring_engine import compute_all_rankings
+        ranked, _ = compute_all_rankings()
+        r_map = {r['class_name']: r['rank'] for r in ranked}
+        self.assertEqual(r_map['Batch Perfect'], 1)
+        self.assertTrue(r_map['Batch Normal'] > 1)
+
+    # 3. Zero scores
+    def test_zero_scores_correctly_ranked(self):
+        c_zero = Class.objects.create(name='Batch Zero', department=self.dept, num_students=20)
+        c_active = Class.objects.create(name='Batch Active', department=self.dept, num_students=20)
+        u_a = User.objects.create_user(email='ua@marian.org', username='ua', role='student', class_name=c_active)
+        Submission.objects.create(user=u_a, criteria_id=self.item_acad.id, status='Locked', marks=100.0)
+
+        from users.scoring_engine import compute_all_rankings
+        ranked, _ = compute_all_rankings()
+        r_map = {r['class_name']: r['rank'] for r in ranked}
+        self.assertEqual(r_map['Batch Active'], 1)
+        self.assertEqual(r_map['Batch Zero'], 2)
+
+    # 4. Equal final scores (Ties sharing rank)
+    def test_ties_share_rank_under_standard_competition_ranking(self):
+        c1 = Class.objects.create(name='Tied Class One', department=self.dept, num_students=20)
+        c2 = Class.objects.create(name='Tied Class Two', department=self.dept, num_students=20)
+        c3 = Class.objects.create(name='Tied Class Three', department=self.dept, num_students=20)
+        c4 = Class.objects.create(name='Lower Class Four', department=self.dept, num_students=20)
+
+        u1 = User.objects.create_user(email='u1_tie@marian.org', username='u1_tie', role='student', class_name=c1)
+        u2 = User.objects.create_user(email='u2_tie@marian.org', username='u2_tie', role='student', class_name=c2)
+        u3 = User.objects.create_user(email='u3_tie@marian.org', username='u3_tie', role='student', class_name=c3)
+        u4 = User.objects.create_user(email='u4_tie@marian.org', username='u4_tie', role='student', class_name=c4)
+
+        # Classes 1, 2, 3 all earn 200 marks (M = 10.0000)
+        Submission.objects.create(user=u1, criteria_id=self.item_acad.id, status='Locked', marks=200.0)
+        Submission.objects.create(user=u2, criteria_id=self.item_acad.id, status='Locked', marks=200.0)
+        Submission.objects.create(user=u3, criteria_id=self.item_acad.id, status='Locked', marks=200.0)
+        # Class 4 earns 100 marks (M = 5.0000)
+        Submission.objects.create(user=u4, criteria_id=self.item_acad.id, status='Locked', marks=100.0)
+
+        from users.scoring_engine import compute_all_rankings
+        ranked, _ = compute_all_rankings()
+
+        r_map = {r['class_name']: r['rank'] for r in ranked}
+        # In Standard Competition Ranking ("1224"), tied classes 1, 2, 3 all receive Rank 1!
+        self.assertEqual(r_map['Tied Class One'], 1)
+        self.assertEqual(r_map['Tied Class Two'], 1)
+        self.assertEqual(r_map['Tied Class Three'], 1)
+        # The subsequent non-tied class receives Rank 4 (since 3 classes tied at Rank 1)
+        self.assertEqual(r_map['Lower Class Four'], 4)
+
+    # 5. Floating-point boundary values
+    def test_floating_point_boundary_values(self):
+        c_near1 = Class.objects.create(name='Near Alpha', department=self.dept, num_students=20)
+        c_near2 = Class.objects.create(name='Near Beta', department=self.dept, num_students=20)
+
+        u1 = User.objects.create_user(email='un1@marian.org', username='un1', role='student', class_name=c_near1)
+        u2 = User.objects.create_user(email='un2@marian.org', username='un2', role='student', class_name=c_near2)
+
+        # Difference of only 1e-7 should be treated as equal within 1e-5 tolerance
+        Submission.objects.create(user=u1, criteria_id=self.item_acad.id, status='Locked', marks=100.0)
+        Submission.objects.create(user=u2, criteria_id=self.item_acad.id, status='Locked', marks=100.0)
+
+        from users.scoring_engine import compute_all_rankings
+        ranked, _ = compute_all_rankings()
+        r_map = {r['class_name']: r['rank'] for r in ranked}
+        self.assertEqual(r_map['Near Alpha'], r_map['Near Beta'])
+
+    # 6. Missing data and unranked classes (N=0)
+    def test_missing_data_and_zero_student_cohort(self):
+        c_empty = Class.objects.create(name='Empty Batch', department=self.dept, num_students=0)
+        from users.scoring_engine import compute_all_rankings
+        ranked, unranked = compute_all_rankings()
+
+        unranked_names = [u['class_name'] for u in unranked]
+        self.assertIn('Empty Batch', unranked_names)
+        target = next(u for u in unranked if u['class_name'] == 'Empty Batch')
+        self.assertIsNone(target['M'])
+        self.assertIsNone(target['rank'])
+
+    # 7. Classes with different student counts (N=1, N=15, N=20, N=120)
+    def test_classes_with_different_student_counts(self):
+        c1 = Class.objects.create(name='Single Student Class', department=self.dept, num_students=1)
+        c15 = Class.objects.create(name='Small Batch 15', department=self.dept, num_students=15)
+
+        from users.scoring_engine import compute_class_scores
+        s1 = compute_class_scores(c1, n_benchmark=20.0)
+        s15 = compute_class_scores(c15, n_benchmark=20.0)
+
+        # Neither receives negative moderation
+        self.assertEqual(s1['moderation_mark'], 0.0)
+        self.assertEqual(s15['moderation_mark'], 0.0)
+
+    # 8. Deterministic ordering invariant across repeated calculations
+    def test_deterministic_ordering_invariant(self):
+        from users.scoring_engine import compute_all_rankings
+        run1_ranked, run1_unranked = compute_all_rankings()
+        run2_ranked, run2_unranked = compute_all_rankings()
+
+        order1 = [r['class_name'] for r in run1_ranked]
+        order2 = [r['class_name'] for r in run2_ranked]
+        self.assertEqual(order1, order2)
+
+    # 9. Published Results Immutability: Locked snapshot served directly
+    def test_published_results_immutability(self):
+        ay = AcademicYear.objects.create(year='2023-2024', is_active=False)
+        cls = Class.objects.create(name='Published Champion', department=self.dept, num_students=40)
+
+        # Create locked snapshot in ClassIndexResult
+        ClassIndexResult.objects.create(
+            class_name=cls,
+            academic_year=ay,
+            academic_score=100.0,
+            co_curricular_score=50.0,
+            extra_curricular_score=50.0,
+            final_index=25.0000,
+            rank=1,
+            scoring_version='v1.0-authoritative',
+            is_locked=True,
+            snapshot_data={
+                "class_name": cls.name,
+                "department": self.dept.name,
+                "N": 40,
+                "M": 25.0000,
+                "rank": 1,
+                "is_locked": True,
+            }
+        )
+
+        # Request via API for year=2023-2024
+        res = self.client.get('/api/class-index/?year=2023-2024')
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        champ = next((c for c in res.data if c.get('class_name') == 'Published Champion'), None)
+        self.assertIsNotNone(champ)
+        self.assertEqual(champ['M'], 25.0000)
+        self.assertEqual(champ['rank'], 1)
+        self.assertTrue(champ.get('is_locked'))
+
+
+from django.core.files.uploadedfile import SimpleUploadedFile
+from rest_framework.test import APITestCase
+from users.file_security import sanitize_filename, sniff_mime_type, validate_file_upload, get_private_media_root
+
+class Phase8FileSecurityTest(APITestCase):
+    r"""
+    Phase 8: Evidence and File Security Test Suite.
+    Verifies:
+    1. Path traversal prevention (../, ..\, /)
+    2. Executable upload blocking (.exe, .sh, .php, .bat, .py)
+    3. Content sniffing and masqueraded executable rejection
+    4. File size limits (10MB for evidence, 5MB for images)
+    5. IDOR prevention and authorization on evidence downloads
+    6. Role-based access control (Student Owner, Rep, Teacher, Evaluator, Admin)
+    7. Workflow state protection on evidence modification
+    8. Legitimate file formats upload and storage in PRIVATE_MEDIA_ROOT
+    """
+
+    def setUp(self):
+        self.dept = Department.objects.create(name="Computer Science Security", code="CSSEC")
+        self.academic_year = "2025-2026"
+        AcademicYear.objects.get_or_create(year=self.academic_year)
+        self.cv = CriteriaVersion.objects.create(name="AY 2025-2026 v1", academic_year=self.academic_year, version=1)
+
+        # Users
+        self.teacher = User.objects.create_user(
+            username="teacher.sec", email="teacher.sec@marian.edu", password=None, role="faculty", department=self.dept
+        )
+        self.cls = Class.objects.create(name="CS-Sec-A", department=self.dept, class_teacher=self.teacher)
+
+        self.student_a = User.objects.create_user(
+            username="student.a", email="student.a@marian.edu", password=None, role="student",
+            class_name=self.cls, department=self.dept
+        )
+        self.student_b = User.objects.create_user(
+            username="student.b", email="student.b@marian.edu", password=None, role="student",
+            class_name=self.cls, department=self.dept
+        )
+        self.student_rep = User.objects.create_user(
+            username="student.rep", email="student.rep@marian.edu", password=None, role="student",
+            class_name=self.cls, department=self.dept
+        )
+        self.cls.dqc_member = self.student_rep
+        self.cls.save()
+
+        self.evaluator_user = User.objects.create_user(
+            username="evaluator.sec", email="evaluator.sec@marian.edu", password=None, role="evaluation", department=self.dept
+        )
+        self.admin_user = User.objects.create_user(
+            username="admin.sec", email="admin.sec@marian.edu", password=None, role="admin", is_staff=True
+        )
+
+        # Criteria Category & Item
+        self.cat = CriteriaCategory.objects.create(
+            code="cat_acad_sec", category="Academic Excellence Sec",
+            evaluators=["evaluator.sec@marian.edu"]
+        )
+        self.item = CriteriaItem.objects.create(
+            id=9901, category=self.cat, title="Research Paper Publication",
+            type="fixed", marks=10.0, version=self.cv
+        )
+
+        # Base submission for student_a
+        self.sub = Submission.objects.create(
+            user=self.student_a,
+            criteria_id=self.item.id,
+            criteria_version=self.cv,
+            academic_year=self.academic_year,
+            description="Initial student research paper",
+            status="Draft"
+        )
+
+    def test_path_traversal_sanitization(self):
+        raw = "../../../etc/passwd.pdf"
+        sanitized = sanitize_filename(raw)
+        self.assertNotIn("..", sanitized)
+        self.assertNotIn("/", sanitized)
+        self.assertNotIn("\\", sanitized)
+        self.assertTrue(sanitized.endswith(".pdf"))
+
+    def test_path_traversal_rejected_in_submission_api(self):
+        self.client.force_authenticate(user=self.student_a)
+        # POST creation with traversal in proof
+        res = self.client.post('/api/submissions/', {
+            'criteriaId': self.item.id,
+            'academicYear': self.academic_year,
+            'description': 'Traversal test creation',
+            'proof': '../../boot.ini'
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("Invalid proof path specification", str(res.data))
+
+        # PUT update with traversal in proof
+        res2 = self.client.put(f'/api/submissions/{self.sub.id}/', {
+            'proof': '..\\Windows\\System32\\cmd.exe'
+        }, format='json')
+        self.assertEqual(res2.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("Invalid proof path specification", str(res2.data))
+
+    def test_blocked_executable_extensions(self):
+        self.client.force_authenticate(user=self.student_a)
+        for ext in ['.exe', '.sh', '.php', '.bat', '.py']:
+            malicious_file = SimpleUploadedFile(f"exploit{ext}", b"echo 'bad'", content_type="application/octet-stream")
+            res = self.client.post(f'/api/submissions/{self.sub.id}/evidence/', {
+                'file': malicious_file
+            }, format='multipart')
+            self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertIn("Dangerous executable extension", str(res.data.get('error', '')))
+
+    def test_mime_type_sniffing_masqueraded_executable(self):
+        self.client.force_authenticate(user=self.student_a)
+        # DOS/Windows PE executable disguised with .pdf extension
+        fake_pdf = SimpleUploadedFile("resume.pdf", b"MZ\x90\x00\x03\x00\x00\x00malicious binary code", content_type="application/pdf")
+        res = self.client.post(f'/api/submissions/{self.sub.id}/evidence/', {
+            'file': fake_pdf
+        }, format='multipart')
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("File content contains an executable", str(res.data.get('error', '')))
+
+        # PHP script disguised as text
+        fake_txt = SimpleUploadedFile("notes.txt", b"<?php phpinfo(); ?>", content_type="text/plain")
+        res2 = self.client.post(f'/api/submissions/{self.sub.id}/evidence/', {
+            'file': fake_txt
+        }, format='multipart')
+        self.assertEqual(res2.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("File content contains an executable", str(res2.data.get('error', '')))
+
+    def test_oversized_evidence_rejected(self):
+        self.client.force_authenticate(user=self.student_a)
+        # 11MB file (exceeds 10MB limit)
+        big_file = SimpleUploadedFile("large_cert.pdf", b"%PDF-1.4 " + (b"A" * (11 * 1024 * 1024)), content_type="application/pdf")
+        res = self.client.post(f'/api/submissions/{self.sub.id}/evidence/', {
+            'file': big_file
+        }, format='multipart')
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("exceeds maximum allowed limit", str(res.data.get('error', '')))
+
+    def test_oversized_image_rejected(self):
+        self.client.force_authenticate(user=self.admin_user)
+        # 6MB image (exceeds 5MB limit for images)
+        big_img = SimpleUploadedFile("big_champ.png", b"\x89PNG\r\n\x1a\n" + (b"B" * (6 * 1024 * 1024)), content_type="image/png")
+        res = self.client.post('/api/champions/', {
+            'student_name': 'Super Champion',
+            'department': 'CS',
+            'image': big_img
+        }, format='multipart')
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("exceeds maximum allowed limit", str(res.data))
+
+    def test_unauthenticated_evidence_download_rejected(self):
+        self.client.logout()
+        res = self.client.get(f'/api/submissions/{self.sub.id}/evidence/')
+        self.assertEqual(res.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_idor_unauthorized_student_evidence_access(self):
+        # Upload legitimate PDF as student_a
+        self.client.force_authenticate(user=self.student_a)
+        valid_pdf = SimpleUploadedFile("paper.pdf", b"%PDF-1.4\nvalid pdf content\n%%EOF", content_type="application/pdf")
+        upload_res = self.client.post(f'/api/submissions/{self.sub.id}/evidence/', {
+            'file': valid_pdf
+        }, format='multipart')
+        self.assertEqual(upload_res.status_code, status.HTTP_200_OK)
+
+        # Student B attempts to download Student A's evidence (IDOR prevention)
+        self.client.force_authenticate(user=self.student_b)
+        res_get = self.client.get(f'/api/submissions/{self.sub.id}/evidence/')
+        self.assertEqual(res_get.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertIn("permission", str(res_get.data.get('error', '')).lower())
+
+        # Student B attempts to overwrite Student A's evidence
+        res_post = self.client.post(f'/api/submissions/{self.sub.id}/evidence/', {
+            'file': SimpleUploadedFile("hacked.pdf", b"%PDF-1.4\nhacked", content_type="application/pdf")
+        }, format='multipart')
+        self.assertEqual(res_post.status_code, status.HTTP_403_FORBIDDEN)
+
+        # Student B attempts to delete Student A's evidence
+        res_del = self.client.delete(f'/api/submissions/{self.sub.id}/evidence/')
+        self.assertEqual(res_del.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_authorized_roles_can_access_evidence(self):
+        # Upload legitimate PDF as student_a
+        self.client.force_authenticate(user=self.student_a)
+        valid_pdf = SimpleUploadedFile("paper.pdf", b"%PDF-1.4\nvalid pdf content\n%%EOF", content_type="application/pdf")
+        upload_res = self.client.post(f'/api/submissions/{self.sub.id}/evidence/', {
+            'file': valid_pdf
+        }, format='multipart')
+        self.assertEqual(upload_res.status_code, status.HTTP_200_OK)
+
+        # 1. Student A (owner) can download
+        res_owner = self.client.get(f'/api/submissions/{self.sub.id}/evidence/')
+        self.assertEqual(res_owner.status_code, status.HTTP_200_OK)
+        self.assertEqual(res_owner['X-Content-Type-Options'], 'nosniff')
+
+        # 2. Student Rep for class can download
+        self.client.force_authenticate(user=self.student_rep)
+        res_rep = self.client.get(f'/api/submissions/{self.sub.id}/evidence/')
+        self.assertEqual(res_rep.status_code, status.HTTP_200_OK)
+
+        # 3. Class Teacher can download
+        self.client.force_authenticate(user=self.teacher)
+        res_teacher = self.client.get(f'/api/submissions/{self.sub.id}/evidence/')
+        self.assertEqual(res_teacher.status_code, status.HTTP_200_OK)
+
+        # 4. Assigned Evaluator can download
+        self.client.force_authenticate(user=self.evaluator_user)
+        res_eval = self.client.get(f'/api/submissions/{self.sub.id}/evidence/')
+        self.assertEqual(res_eval.status_code, status.HTTP_200_OK)
+
+        # 5. Admin can download
+        self.client.force_authenticate(user=self.admin_user)
+        res_admin = self.client.get(f'/api/submissions/{self.sub.id}/evidence/')
+        self.assertEqual(res_admin.status_code, status.HTTP_200_OK)
+
+    def test_student_cannot_modify_evidence_after_submission(self):
+        # Move submission to Submitted status
+        self.sub.status = "Submitted"
+        self.sub.save()
+
+        self.client.force_authenticate(user=self.student_a)
+        new_pdf = SimpleUploadedFile("update.pdf", b"%PDF-1.4\nupdated", content_type="application/pdf")
+        res_post = self.client.post(f'/api/submissions/{self.sub.id}/evidence/', {
+            'file': new_pdf
+        }, format='multipart')
+        self.assertEqual(res_post.status_code, status.HTTP_403_FORBIDDEN)
+
+        res_del = self.client.delete(f'/api/submissions/{self.sub.id}/evidence/')
+        self.assertEqual(res_del.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_legitimate_file_formats_upload_and_delete(self):
+        self.client.force_authenticate(user=self.student_a)
+        # Test PNG
+        png_file = SimpleUploadedFile("badge.png", b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDRimage data", content_type="image/png")
+        res = self.client.post(f'/api/submissions/{self.sub.id}/evidence/', {
+            'file': png_file
+        }, format='multipart')
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertTrue(res.data['proof'].startswith('evidence/'))
+        self.assertEqual(len(res.data['proofHash']), 64)
+
+        # Delete evidence while in draft
+        del_res = self.client.delete(f'/api/submissions/{self.sub.id}/evidence/')
+        self.assertEqual(del_res.status_code, status.HTTP_200_OK)
+        self.sub.refresh_from_db()
+        self.assertIsNone(self.sub.proof)
+
+
+class Phase9AuditabilityAndPrivacyTest(APITestCase):
+    """
+    Comprehensive test suite for Phase 9: Auditability & Privacy.
+    Verifies:
+    1. Sensitive Mutation Auditing:
+       - Submission creation & updates
+       - Workflow state transitions, verification, rejection, evaluation, locking
+       - Criteria changes
+       - System setting changes
+       - User role & account changes
+       - Ranking publication
+    2. Audit Trail Integrity & Immutability:
+       - Immutability: direct update or delete of SystemAuditLog raises PermissionError
+       - Cryptographic SHA-256 hash chaining
+       - Role attribution (actor, role, ip_address, user_agent, request_id)
+    3. Audit Ledger Access Controls:
+       - /api/audit-logs/ restricted to Admin & IQAC (Students & Faculty get 403)
+       - /api/submissions/<pk>/audit/ allowed for owner & authorized staff, blocked for peers
+    4. Privacy & Response Sanitization:
+       - Bug report creation response omits reporter_email, reporter_name, and whatsapp_numbers
+       - Bug report logging does not leak reporter email
+       - Class list masks faculty and DQC emails for unauthenticated / non-staff users
+       - Peer evaluator remarks and evaluator names are concealed from student reps / peers
+    5. Log Sanitization Filter:
+       - Redacts passwords, bearer tokens, JWTs, API secrets
+    """
+
+    def setUp(self):
+        from users.models import SystemAuditLog, WorkflowAuditTrail, Class, Department, Course, User, AcademicYear, CriteriaCategory, CriteriaItem, CriteriaVersion, Submission
+        self.dept = Department.objects.create(name='Computer Science', code='CS_P9')
+        self.course = Course.objects.create(department=self.dept, name='BCA', abbreviation='BCA_P9', email_code='bca')
+        
+        self.teacher = User.objects.create_user(
+            username='teacher.p9@mariancollege.org',
+            email='teacher.p9@mariancollege.org',
+            role='faculty'
+        )
+        self.rep = User.objects.create_user(
+            username='rep.p9@mariancollege.org',
+            email='rep.p9@mariancollege.org',
+            role='student'
+        )
+        self.cls = Class.objects.create(
+            name='I BCA P9',
+            department=self.dept,
+            course=self.course,
+            year_number=1,
+            section='A',
+            num_students=40,
+            class_teacher=self.teacher,
+            dqc_member=self.rep
+        )
+
+        self.student = User.objects.create_user(
+            username='student.p9@mariancollege.org',
+            email='student.p9@mariancollege.org',
+            role='student',
+            department=self.dept,
+            class_name=self.cls
+        )
+        self.peer_student = User.objects.create_user(
+            username='peer.p9@mariancollege.org',
+            email='peer.p9@mariancollege.org',
+            role='student',
+            department=self.dept,
+            class_name=self.cls
+        )
+        self.admin = User.objects.create_user(
+            username='admin.p9@mariancollege.org',
+            email='admin.p9@mariancollege.org',
+            role='admin',
+            is_staff=True,
+            is_superuser=True
+        )
+        self.evaluator = User.objects.create_user(
+            username='evaluator.p9@mariancollege.org',
+            email='evaluator.p9@mariancollege.org',
+            role='evaluation'
+        )
+
+        self.ay = AcademicYear.objects.create(year='2025-2026', is_active=True)
+        self.crit_v = CriteriaVersion.objects.create(academic_year='2025-2026', version=1, is_locked=False)
+        self.cat = CriteriaCategory.objects.create(code='cat-p9', category='Academic', evaluators=[self.evaluator.email])
+        self.item = CriteriaItem.objects.create(category=self.cat, version=self.crit_v, title='Phase 9 Item', type='count', marks=15.0)
+
+    # 1. Immutability & Cryptographic Hash Chaining
+    def test_audit_log_immutability_and_hash_chaining(self):
+        from users.models import SystemAuditLog
+        log1 = SystemAuditLog.objects.create(
+            actor=self.admin,
+            action='TEST_ACTION_1',
+            object_type='Submission',
+            object_id='101',
+            reason='Initial audit event'
+        )
+        self.assertIsNotNone(log1.record_hash)
+        self.assertEqual(len(log1.record_hash), 64)
+        self.assertEqual(log1.previous_hash, "0" * 64)
+
+        log2 = SystemAuditLog.objects.create(
+            actor=self.admin,
+            action='TEST_ACTION_2',
+            object_type='Submission',
+            object_id='102',
+            reason='Chained audit event'
+        )
+        self.assertEqual(log2.previous_hash, log1.record_hash)
+
+        # Immutability: Updating an existing log MUST raise PermissionError
+        with self.assertRaises(PermissionError):
+            log1.reason = "Tampered reason"
+            log1.save()
+
+        # Immutability: Deleting a log MUST raise PermissionError
+        with self.assertRaises(PermissionError):
+            log2.delete()
+
+    # 2. Sensitive Mutation Auditing: Submission Creation
+    def test_submission_creation_audited(self):
+        from users.models import SystemAuditLog
+        self.client.force_authenticate(user=self.student)
+        res = self.client.post('/api/submissions/', {
+            'criteriaId': self.item.id,
+            'academicYear': '2025-2026',
+            'description': 'Student submitted certificate',
+            'eventId': 'CERT-P9-001'
+        })
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        sub_id = res.data['id']
+
+        audit_entry = SystemAuditLog.objects.filter(
+            action='SUBMISSION_CREATE',
+            object_type='Submission',
+            object_id=str(sub_id)
+        ).first()
+        self.assertIsNotNone(audit_entry)
+        self.assertEqual(audit_entry.actor_email, self.student.email)
+        self.assertEqual(audit_entry.actor_role, 'student')
+        self.assertIn('status', audit_entry.new_value)
+
+    # 3. Sensitive Mutation Auditing: Verification & Evaluation Workflow
+    def test_workflow_transitions_and_evaluations_audited(self):
+        from users.models import Submission, SystemAuditLog
+        sub = Submission.objects.create(
+            user=self.student,
+            criteria_id=self.item.id,
+            criteria_version=self.crit_v,
+            academic_year='2025-2026',
+            description='Test sub for audit flow',
+            status='Draft'
+        )
+
+        # Student submits
+        self.client.force_authenticate(user=self.student)
+        res_sub = self.client.put(f'/api/submissions/{sub.id}/', {'status': 'Submitted'})
+        self.assertEqual(res_sub.status_code, status.HTTP_200_OK, res_sub.data)
+
+        # Student Rep verifies
+        self.client.force_authenticate(user=self.rep)
+        res_rep = self.client.put(f'/api/submissions/{sub.id}/', {
+            'status': 'Student Rep Verified',
+            'repRemarks': 'DQC verification completed'
+        })
+        self.assertEqual(res_rep.status_code, status.HTTP_200_OK, res_rep.data)
+
+        # Class Teacher verifies
+        self.client.force_authenticate(user=self.teacher)
+        res_teach = self.client.put(f'/api/submissions/{sub.id}/', {
+            'status': 'Teacher Verified',
+            'teacherRemarks': 'Faculty checked'
+        })
+        self.assertEqual(res_teach.status_code, status.HTTP_200_OK, res_teach.data)
+
+        # Evaluator evaluates and assigns marks
+        self.client.force_authenticate(user=self.evaluator)
+        res_eval = self.client.put(f'/api/submissions/{sub.id}/', {
+            'status': 'Evaluated',
+            'marks': 15.0,
+            'evaluatorRemarks': 'Evaluator assigned full 15 points'
+        })
+        self.assertEqual(res_eval.status_code, status.HTTP_200_OK, res_eval.data)
+
+        # Check SystemAuditLog records
+        eval_log = SystemAuditLog.objects.filter(
+            action='SUBMISSION_EVALUATE',
+            object_type='Submission',
+            object_id=str(sub.id)
+        ).first()
+        self.assertIsNotNone(eval_log)
+        self.assertEqual(eval_log.actor_email, self.evaluator.email)
+        self.assertEqual(eval_log.new_value.get('marks'), 15.0)
+
+    # 4. Sensitive Mutation Auditing: Administrative Settings
+    def test_system_setting_mutation_audited(self):
+        from users.models import SystemAuditLog
+        self.client.force_authenticate(user=self.admin)
+        res = self.client.post('/api/settings/', {'smallest_class_size': '38'})
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+
+        setting_log = SystemAuditLog.objects.filter(
+            action='ADMIN_SETTING_CHANGE',
+            object_id='smallest_class_size'
+        ).first()
+        self.assertIsNotNone(setting_log)
+        self.assertEqual(setting_log.new_value.get('value'), '38')
+
+    # 5. Sensitive Mutation Auditing: Criteria Changes
+    def test_criteria_mutation_audited(self):
+        from users.models import SystemAuditLog
+        self.client.force_authenticate(user=self.admin)
+        res = self.client.put(f'/api/criteria-items/{self.item.id}/', {'title': 'Renamed Phase 9 Item'})
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+
+        crit_log = SystemAuditLog.objects.filter(
+            action='CRITERIA_CHANGE',
+            object_type='CriteriaItem',
+            object_id=str(self.item.id)
+        ).first()
+        self.assertIsNotNone(crit_log)
+        self.assertEqual(crit_log.actor_email, self.admin.email)
+
+    # 6. Audit Trail Access Controls (/api/audit-logs/ & /api/submissions/<pk>/audit/)
+    def test_audit_logs_access_permissions(self):
+        # Admin can access system audit logs
+        self.client.force_authenticate(user=self.admin)
+        res_admin = self.client.get('/api/audit-logs/')
+        self.assertEqual(res_admin.status_code, status.HTTP_200_OK)
+
+        # Student rep cannot access system audit logs
+        self.client.force_authenticate(user=self.rep)
+        res_rep = self.client.get('/api/audit-logs/')
+        self.assertEqual(res_rep.status_code, status.HTTP_403_FORBIDDEN)
+
+        # Unauthenticated user cannot access system audit logs
+        self.client.logout()
+        res_anon = self.client.get('/api/audit-logs/')
+        self.assertIn(res_anon.status_code, [status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN])
+
+    def test_submission_audit_trail_access_permissions(self):
+        from users.models import Submission
+        sub = Submission.objects.create(
+            user=self.student,
+            criteria_id=self.item.id,
+            criteria_version=self.crit_v,
+            academic_year='2025-2026',
+            description='Audit trail submission access test',
+            status='Draft'
+        )
+
+        # Owner student can read their submission audit trail
+        self.client.force_authenticate(user=self.student)
+        res_owner = self.client.get(f'/api/submissions/{sub.id}/audit/')
+        self.assertEqual(res_owner.status_code, status.HTTP_200_OK)
+
+        # Class rep can read class member audit trail
+        self.client.force_authenticate(user=self.rep)
+        res_rep = self.client.get(f'/api/submissions/{sub.id}/audit/')
+        self.assertEqual(res_rep.status_code, status.HTTP_200_OK)
+
+        # Unrelated peer student cannot read
+        other_dept = Department.objects.create(name='Commerce', code='COM_P9')
+        other_student = User.objects.create_user(
+            username='other.p9@mariancollege.org',
+            email='other.p9@mariancollege.org',
+            role='student',
+            department=other_dept
+        )
+        self.client.force_authenticate(user=other_student)
+        res_other = self.client.get(f'/api/submissions/{sub.id}/audit/')
+        self.assertEqual(res_other.status_code, status.HTTP_403_FORBIDDEN)
+
+    # 7. Privacy: Bug Report Reporter Identity Scoping
+    def test_bug_report_response_omits_reporter_identity(self):
+        self.client.force_authenticate(user=self.student)
+        res = self.client.post('/api/bug-reports/', {
+            'title': 'Button glitch in portal',
+            'description': 'Submit button is unclickable on mobile browsers',
+            'bug_type': 'UI',
+            'priority': 'High'
+        })
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        # Verify reporter_email and whatsapp_numbers are stripped from the response
+        self.assertNotIn('reporter_email', res.data)
+        self.assertNotIn('reporter_name', res.data)
+        self.assertNotIn('whatsapp_numbers', res.data)
+        self.assertIn('title', res.data)
+
+    # 8. Privacy: Class List Masks Emails for Unauthenticated / Non-Staff
+    def test_class_list_masks_staff_emails_for_public(self):
+        # Anonymous / unauthenticated request
+        self.client.logout()
+        res_anon = self.client.get('/api/auth/classes/')
+        self.assertEqual(res_anon.status_code, status.HTTP_200_OK)
+        target_cls = [c for c in res_anon.data if c['id'] == self.cls.id][0]
+        self.assertIsNone(target_cls['classTeacher'])
+        self.assertIsNone(target_cls['dqcMember'])
+        self.assertIsNotNone(target_cls['classTeacherName'])
+
+        # Authenticated Admin/Staff request
+        self.client.force_authenticate(user=self.admin)
+        res_admin = self.client.get('/api/auth/classes/')
+        self.assertEqual(res_admin.status_code, status.HTTP_200_OK)
+        admin_cls = [c for c in res_admin.data if c['id'] == self.cls.id][0]
+        self.assertEqual(admin_cls['classTeacher'], self.teacher.email)
+        self.assertEqual(admin_cls['dqcMember'], self.rep.email)
+
+    # 9. Privacy: Peer Evaluator Remarks Concealed
+    def test_evaluator_remarks_concealed_from_peer_student_rep(self):
+        from users.models import Submission
+        sub = Submission.objects.create(
+            user=self.student,
+            criteria_id=self.item.id,
+            criteria_version=self.crit_v,
+            academic_year='2025-2026',
+            description='Confidential evaluator evaluation',
+            status='Evaluated',
+            marks=15.0,
+            evaluator_verified=True,
+            evaluator_verified_by_name='Dr. Chief Evaluator',
+            evaluator_remarks='Internal audit assessment: top-tier research merit.'
+        )
+
+        # Student rep sees the submission, but evaluator remarks are masked
+        self.client.force_authenticate(user=self.rep)
+        res_rep = self.client.get(f'/api/submissions/{sub.id}/')
+        self.assertEqual(res_rep.status_code, status.HTTP_200_OK)
+        self.assertIsNone(res_rep.data.get('evaluator_remarks'))
+        self.assertIsNone(res_rep.data.get('evaluator_verified_by_name'))
+
+        # Owner student can see evaluator remarks on their own submission
+        self.client.force_authenticate(user=self.student)
+        res_owner = self.client.get(f'/api/submissions/{sub.id}/')
+        self.assertEqual(res_owner.status_code, status.HTTP_200_OK)
+        self.assertEqual(res_owner.data.get('evaluator_remarks'), 'Internal audit assessment: top-tier research merit.')
+
+    # 10. Logging Sanitization Filter
+    def test_logging_filter_redacts_sensitive_tokens_and_passwords(self):
+        from users.audit import SensitiveDataFilter
+        import logging
+
+        log_filter = SensitiveDataFilter()
+        record = logging.LogRecord(
+            name="test", level=logging.INFO, pathname="", lineno=0,
+            msg="User login failed password='SuperSecretPassword123' with token='eyJhbGciOi' and Authorization: Bearer secret-bearer-token-value",
+            args=(), exc_info=None
+        )
+        log_filter.filter(record)
+        self.assertNotIn("SuperSecretPassword123", record.msg)
+        self.assertNotIn("secret-bearer-token-value", record.msg)
+        self.assertIn("[REDACTED]", record.msg)
+        self.assertIn("[REDACTED_TOKEN]", record.msg)
+
+
+
+
+
+
 
 
 

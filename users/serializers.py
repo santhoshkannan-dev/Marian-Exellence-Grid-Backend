@@ -3,7 +3,7 @@ from .models import (
     Department, Course, AcademicYear, Class, User,
     CriteriaCategory, CriteriaItem, CriteriaRule, CriteriaVersion, Submission,
     AcademicGradeBreakdown, WorkflowAuditTrail, ClassIndexResult,
-    Champion, BugReport
+    Champion, BugReport, SystemAuditLog
 )
 
 
@@ -234,6 +234,39 @@ class BugReportSerializer(serializers.ModelSerializer):
         if len(clean_val) > 5000:
             raise serializers.ValidationError("Description cannot exceed 5000 characters.")
         return clean_val
+
+
+class BugReportSafeSerializer(serializers.ModelSerializer):
+    """Safe public serializer omitting reporter personal contact details."""
+    class Meta:
+        model = BugReport
+        fields = [
+            'id', 'title', 'description', 'bug_type', 'priority',
+            'browser_device', 'page_url', 'role_category', 'status',
+            'created_at'
+        ]
+        read_only_fields = [
+            'id', 'title', 'description', 'bug_type', 'priority',
+            'browser_device', 'page_url', 'role_category', 'status',
+            'created_at'
+        ]
+
+
+class SystemAuditLogSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SystemAuditLog
+        fields = [
+            'id', 'actor', 'actor_email', 'actor_role', 'action',
+            'object_type', 'object_id', 'object_repr', 'old_value',
+            'new_value', 'reason', 'ip_address', 'user_agent',
+            'request_id', 'previous_hash', 'record_hash', 'created_at'
+        ]
+        read_only_fields = [
+            'id', 'actor', 'actor_email', 'actor_role', 'action',
+            'object_type', 'object_id', 'object_repr', 'old_value',
+            'new_value', 'reason', 'ip_address', 'user_agent',
+            'request_id', 'previous_hash', 'record_hash', 'created_at'
+        ]
 
 
 

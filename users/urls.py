@@ -11,6 +11,7 @@ from .views import (
     ClassIndexView,
     SubmissionListView,
     SubmissionDetailView,
+    SubmissionEvidenceView,
     AcademicYearListView,
     DepartmentListView,
     DepartmentDetailView,
@@ -28,7 +29,9 @@ from .views import (
     CriteriaItemDetailView,
     ChampionListView,
     ChampionDetailView,
-    BugReportView
+    BugReportView,
+    SystemAuditLogView,
+    SubmissionAuditTrailView
 )
 
 urlpatterns = [
@@ -47,6 +50,9 @@ urlpatterns = [
     path('users/', UserManagementView.as_view(), name='user-management'),
     path('submissions/', SubmissionListView.as_view(), name='submission-list'),
     path('submissions/<int:pk>/', SubmissionDetailView.as_view(), name='submission-detail'),
+    path('submissions/<int:pk>/audit/', SubmissionAuditTrailView.as_view(), name='submission-audit'),
+    path('submissions/<int:pk>/evidence/', SubmissionEvidenceView.as_view(), name='submission-evidence'),
+    path('audit-logs/', SystemAuditLogView.as_view(), name='system-audit-logs'),
     path('settings/', SystemSettingView.as_view(), name='system-settings'),
     path('user-groups/', UserGroupListView.as_view(), name='user-groups'),
     path('user-groups/<str:pk>/', UserGroupDetailView.as_view(), name='user-group-detail'),
