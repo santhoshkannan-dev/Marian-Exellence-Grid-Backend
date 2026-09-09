@@ -107,3 +107,13 @@ class SensitiveDataFilter(logging.Filter):
             record.msg = msg
         return True
 
+
+class AuditService:
+    """
+    Focused service for institutional audit logging and tamper-evident event tracking.
+    """
+    record_event = staticmethod(record_system_audit_event)
+    get_client_ip = staticmethod(get_client_ip)
+    get_user_agent = staticmethod(get_user_agent)
+    get_request_id = staticmethod(get_request_id)
+

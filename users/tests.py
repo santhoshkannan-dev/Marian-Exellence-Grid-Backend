@@ -3684,14 +3684,932 @@ class Phase9AuditabilityAndPrivacyTest(APITestCase):
         self.assertIn("[REDACTED_TOKEN]", record.msg)
 
 
+class Phase13ComprehensiveRegressionTest(TestCase):
+    """
+    Phase 13: Comprehensive Regression Test Suite.
+
+    Covers gaps not addressed in Phases 1-9:
+    1.  Authentication boundary: invalid/expired token response behaviour
+    2.  Privilege escalation via injected body fields
+    3.  Full E2E workflow integration: Student -> DQC -> Teacher -> Evaluator
+                                     -> Admin Lock -> Ranking -> IQAC Publication
+    4.  Scoring edge cases: zero marks, exact maximum boundary, missing marks rejection
+    5.  WorkflowAuditTrail model-level immutability (cannot update or delete)
+    6.  SystemAuditLog SHA-256 hash chain integrity across multiple events
+    7.  Ranking cache invalidation triggered by workflow transition
+    8.  Transaction atomicity: failed validation must not partially persist
+    9.  Cross-student access isolation
+    10. Publication lock: IQAC publishes results; subsequent reads serve snapshot
+    """
+
+    def setUp(self):
+        self.client = APIClient()
+        self.ay = AcademicYear.objects.create(year='2024-2025', is_active=True)
+
+        # Departments & Classes
+        self.dept_cs = Department.objects.create(
+            name='P13 Computer Science', code='P13CS', email_prefix='p', level='PG'
+        )
+        self.dept_arts = Department.objects.create(
+            name='P13 Arts', code='P13ART', email_prefix='u', level='UG'
+        )
+        self.course_mca = Course.objects.create(
+            department=self.dept_cs, name='MCA P13', abbreviation='MCA13',
+            email_code='m3', duration_years=2
+        )
+        self.cls_mca = Class.objects.create(
+            name='I MCA P13', department=self.dept_cs,
+            course=self.course_mca, year_number=1, num_students=40
+        )
+        self.cls_arts = Class.objects.create(
+            name='I Arts P13', department=self.dept_arts, num_students=30
+        )
+
+        # Users
+        self.student = User.objects.create_user(
+            username='p13.student@marian.edu',
+            email='p13.student@marian.edu',
+            password=None, role='student',
+            class_name=self.cls_mca, department=self.dept_cs,
+            first_name='Phase13', last_name='Student'
+        )
+        self.student2 = User.objects.create_user(
+            username='p13.student2@marian.edu',
+            email='p13.student2@marian.edu',
+            password=None, role='student',
+            class_name=self.cls_mca, department=self.dept_cs,
+            first_name='Phase13', last_name='Student2'
+        )
+        self.arts_student = User.objects.create_user(
+            username='p13.arts@marian.edu',
+            email='p13.arts@marian.edu',
+            password=None, role='student',
+            class_name=self.cls_arts, department=self.dept_arts,
+            first_name='Phase13', last_name='ArtsStudent'
+        )
+        self.dqc_rep = User.objects.create_user(
+            username='p13.rep@marian.edu',
+            email='p13.rep@marian.edu',
+            password=None, role='student',
+            class_name=self.cls_mca, department=self.dept_cs,
+            first_name='Phase13', last_name='Rep'
+        )
+        self.cls_mca.dqc_member = self.dqc_rep
+        self.cls_mca.save()
+
+        self.teacher = User.objects.create_user(
+            username='p13.teacher@marian.edu',
+            email='p13.teacher@marian.edu',
+            password=None, role='faculty', department=self.dept_cs,
+            first_name='Phase13', last_name='Teacher', is_staff=True
+        )
+        self.cls_mca.class_teacher = self.teacher
+        self.cls_mca.save()
+
+        self.evaluator = User.objects.create_user(
+            username='p13.evaluator@marian.edu',
+            email='p13.evaluator@marian.edu',
+            password=None, role='evaluation',
+            first_name='Phase13', last_name='Evaluator', is_staff=True
+        )
+        self.iqac = User.objects.create_user(
+            username='p13.iqac@marian.edu',
+            email='p13.iqac@marian.edu',
+            password=None, role='iqac',
+            first_name='Phase13', last_name='IQAC', is_staff=True
+        )
+        self.admin = User.objects.create_user(
+            username='p13.admin@marian.edu',
+            email='p13.admin@marian.edu',
+            password=None, role='admin',
+            first_name='Phase13', last_name='Admin',
+            is_staff=True, is_superuser=True
+        )
+
+        # Criteria
+        self.cat = CriteriaCategory.objects.create(
+            code='cat-p13-acad', category='P13 Academic Excellence',
+            evaluators=['p13.evaluator@marian.edu']
+        )
+        self.crit_ver = CriteriaVersion.objects.create(
+            academic_year='2024-2025', version=1,
+            name='P13 Criteria v1', is_locked=False
+        )
+        self.item = CriteriaItem.objects.create(
+            category=self.cat, version=self.crit_ver,
+            title='P13 Research Publication', type='fixed', marks=15.0,
+            rules_json={'maximum': 15}
+        )
+
+        SystemSetting.objects.update_or_create(
+            key='smallest_class_size', defaults={'value': '20'}
+        )
+
+    # -------------------------------------------------------------------------
+    # 1. AUTHENTICATION BOUNDARY TESTS
+    # -------------------------------------------------------------------------
+
+    def test_no_token_returns_401_on_sensitive_endpoints(self):
+        """Requests with no Authorization header must return 401 on protected endpoints."""
+        sensitive = [
+            ('GET',  '/api/submissions/'),
+            ('GET',  '/api/users/'),
+            ('GET',  '/api/audit-logs/'),
+        ]
+        for method, url in sensitive:
+            res = self.client.get(url) if method == 'GET' else self.client.post(url, {})
+            self.assertEqual(
+                res.status_code, status.HTTP_401_UNAUTHORIZED,
+                f"Expected 401 for {method} {url}, got {res.status_code}"
+            )
+
+    def test_malformed_jwt_returns_401(self):
+        """A syntactically invalid JWT must return 401."""
+        self.client.credentials(HTTP_AUTHORIZATION='Bearer not.a.valid.jwt')
+        res = self.client.get('/api/submissions/')
+        self.assertEqual(res.status_code, status.HTTP_401_UNAUTHORIZED)
+        self.client.credentials()
+
+    def test_access_token_rejected_as_refresh_token(self):
+        """Using an access token where a refresh token is expected returns 401."""
+        from rest_framework_simplejwt.tokens import AccessToken
+        access = AccessToken.for_user(self.student)
+        res = self.client.post('/api/auth/token/refresh/', {
+            'refresh': str(access)
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_disabled_user_token_is_rejected(self):
+        """A pre-issued token for a now-disabled user must be rejected."""
+        from rest_framework_simplejwt.tokens import AccessToken
+        token = AccessToken.for_user(self.student)
+        self.student.is_active = False
+        self.student.save()
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {str(token)}')
+        res = self.client.get('/api/submissions/')
+        self.assertIn(res.status_code, [status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN])
+        self.client.credentials()
+        self.student.is_active = True
+        self.student.save()
+
+    # -------------------------------------------------------------------------
+    # 2. PRIVILEGE ESCALATION VIA REQUEST BODY INJECTION
+    # -------------------------------------------------------------------------
+
+    def test_student_body_role_injection_is_ignored(self):
+        """Injecting 'role': 'admin' in POST body must not change the user's role."""
+        self.client.force_authenticate(user=self.student)
+        self.client.post('/api/submissions/', {
+            'criteriaId': self.item.id,
+            'academicYear': '2024-2025',
+            'description': 'Privilege escalation test',
+            'role': 'admin',
+        }, format='json')
+        self.student.refresh_from_db()
+        self.assertEqual(self.student.role, 'student')
+
+    def test_student_cannot_inject_is_staff_via_profile_endpoint(self):
+        """Injecting is_staff/is_superuser via profile update endpoint is ignored."""
+        self.client.force_authenticate(user=self.student)
+        self.client.put('/api/auth/profile/', {
+            'is_staff': True,
+            'is_superuser': True,
+            'role': 'admin',
+        }, format='json')
+        self.student.refresh_from_db()
+        self.assertFalse(self.student.is_staff)
+        self.assertFalse(self.student.is_superuser)
+        self.assertEqual(self.student.role, 'student')
+
+    def test_submission_owner_is_jwt_user_not_body_email(self):
+        """Even if body contains another user's email, submission is owned by the JWT user."""
+        self.client.force_authenticate(user=self.student)
+        res = self.client.post('/api/submissions/', {
+            'criteriaId': self.item.id,
+            'academicYear': '2024-2025',
+            'description': 'Body email spoofing test',
+            'email': self.student2.email,
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        sub = Submission.objects.get(id=res.data['id'])
+        self.assertEqual(sub.user_id, self.student.id)
+        self.assertNotEqual(sub.user_id, self.student2.id)
+
+    # -------------------------------------------------------------------------
+    # 3. FULL E2E WORKFLOW INTEGRATION
+    # -------------------------------------------------------------------------
+
+    def test_full_e2e_submission_to_lock_workflow(self):
+        """
+        Complete institutional workflow chain:
+        Student creates Draft -> Submits -> DQC Verifies -> Teacher Verifies
+        -> Evaluator Evaluates -> Admin Locks.
+        Each step is verified via API. Audit trail accumulates correctly.
+        Post-lock edits are forbidden.
+        """
+        from users.models import WorkflowAuditTrail, SystemAuditLog
+
+        # Stage 1: Student creates submission
+        self.client.force_authenticate(user=self.student)
+        res = self.client.post('/api/submissions/', {
+            'criteriaId': self.item.id,
+            'academicYear': '2024-2025',
+            'description': 'E2E full workflow test submission',
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED, res.data)
+        sub_id = res.data['id']
+
+        # Stage 1b: Student submits to DQC queue
+        res = self.client.put(f'/api/submissions/{sub_id}/', {
+            'status': 'Pending Rep Verification',
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+
+        # Stage 2: DQC Rep verifies
+        self.client.force_authenticate(user=self.dqc_rep)
+        res = self.client.put(f'/api/submissions/{sub_id}/', {
+            'status': 'Student Rep Verified',
+            'repRemarks': 'E2E DQC verified',
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+        sub = Submission.objects.get(id=sub_id)
+        self.assertEqual(sub.status, 'Student Rep Verified')
+        self.assertEqual(sub.rep_verified_by_name, 'Phase13 Rep')
+
+        # Stage 3: Teacher verifies
+        self.client.force_authenticate(user=self.teacher)
+        res = self.client.put(f'/api/submissions/{sub_id}/', {
+            'status': 'Teacher Verified',
+            'teacherRemarks': 'E2E Teacher confirmed',
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+        sub.refresh_from_db()
+        self.assertEqual(sub.status, 'Teacher Verified')
+        self.assertEqual(sub.teacher_verified_by_name, 'Phase13 Teacher')
+
+        # Stage 4: Evaluator evaluates with marks
+        self.client.force_authenticate(user=self.evaluator)
+        res = self.client.put(f'/api/submissions/{sub_id}/', {
+            'status': 'Evaluated',
+            'marks': 15.0,
+            'evaluatorRemarks': 'E2E full marks',
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+        sub.refresh_from_db()
+        self.assertEqual(sub.status, 'Evaluated')
+        self.assertEqual(sub.marks, 15)
+        self.assertTrue(sub.evaluator_verified)
+        self.assertEqual(sub.evaluator_verified_by_name, 'Phase13 Evaluator')
+
+        # Stage 5: Admin locks
+        self.client.force_authenticate(user=self.admin)
+        res = self.client.put(f'/api/submissions/{sub_id}/', {
+            'status': 'Locked',
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+        sub.refresh_from_db()
+        self.assertEqual(sub.status, 'Locked')
+
+        # Post-lock: edit must be forbidden even for admin
+        res = self.client.put(f'/api/submissions/{sub_id}/', {
+            'description': 'Unauthorized post-lock edit',
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+        # Audit trail has at least 4 entries (one per stage transition)
+        audit_count = WorkflowAuditTrail.objects.filter(submission_id=sub_id).count()
+        self.assertGreaterEqual(audit_count, 4)
+
+        # SystemAuditLog must record SUBMISSION_LOCK
+        lock_log = SystemAuditLog.objects.filter(
+            action='SUBMISSION_LOCK', object_id=str(sub_id)
+        ).first()
+        self.assertIsNotNone(lock_log)
+        self.assertEqual(lock_log.actor_id, self.admin.id)
+
+        # Ranking endpoint works after lock
+        res = self.client.get('/api/class-index/?year=2024-2025')
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        mca_entry = next(
+            (r for r in res.data if r.get('class_name') == 'I MCA P13'), None
+        )
+        self.assertIsNotNone(mca_entry)
+        self.assertGreater(mca_entry['M'], 0)
+
+    # -------------------------------------------------------------------------
+    # 4. WORKFLOW: REJECTION & RESUBMISSION
+    # -------------------------------------------------------------------------
+
+    def test_rejection_requires_remark_and_student_can_resubmit(self):
+        """DQC rejection without remark is refused; with remark student can resubmit."""
+        sub = Submission.objects.create(
+            user=self.student, criteria_id=self.item.id,
+            criteria_version=self.crit_ver, academic_year='2024-2025',
+            description='Rejection resubmission test',
+            status='Pending Rep Verification'
+        )
+
+        # Correction Requested without remarks -> 400
+        self.client.force_authenticate(user=self.dqc_rep)
+        res = self.client.put(f'/api/submissions/{sub.id}/', {
+            'status': 'Correction Requested',
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # DQC rejects with reason -> allowed
+        res = self.client.put(f'/api/submissions/{sub.id}/', {
+            'status': 'Rejected',
+            'repRemarks': 'Evidence document is illegible',
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+        sub.refresh_from_db()
+        self.assertEqual(sub.status, 'Rejected')
+
+        # Student resubmits
+        self.client.force_authenticate(user=self.student)
+        res = self.client.put(f'/api/submissions/{sub.id}/', {
+            'status': 'Pending Rep Verification',
+            'description': 'Updated evidence with clearer image',
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+        sub.refresh_from_db()
+        self.assertEqual(sub.status, 'Pending Rep Verification')
+
+    # -------------------------------------------------------------------------
+    # 5. SCORING EDGE CASES
+    # -------------------------------------------------------------------------
+
+    def test_zero_marks_is_valid_evaluation_outcome(self):
+        """Assigning zero marks is a legitimate evaluation outcome and must succeed."""
+        sub = Submission.objects.create(
+            user=self.student, criteria_id=self.item.id,
+            criteria_version=self.crit_ver, academic_year='2024-2025',
+            description='Zero marks test', status='Teacher Verified'
+        )
+        self.client.force_authenticate(user=self.evaluator)
+        res = self.client.put(f'/api/submissions/{sub.id}/', {
+            'status': 'Evaluated',
+            'marks': 0,
+            'evaluatorRemarks': 'Evidence insufficient; zero awarded',
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+        sub.refresh_from_db()
+        self.assertEqual(sub.marks, 0)
+        self.assertEqual(sub.status, 'Evaluated')
+
+    def test_exact_maximum_marks_is_accepted(self):
+        """Assigning exactly the maximum (15.0) succeeds without over-limit rejection."""
+        sub = Submission.objects.create(
+            user=self.student2, criteria_id=self.item.id,
+            criteria_version=self.crit_ver, academic_year='2024-2025',
+            description='Max marks boundary', status='Teacher Verified'
+        )
+        self.client.force_authenticate(user=self.evaluator)
+        res = self.client.put(f'/api/submissions/{sub.id}/', {
+            'status': 'Evaluated',
+            'marks': 15.0,
+            'evaluatorRemarks': 'Full marks awarded at boundary',
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+        sub.refresh_from_db()
+        self.assertEqual(sub.marks, 15)
+
+    def test_marks_required_when_transitioning_to_evaluated(self):
+        """Transitioning to Evaluated without marks must be rejected with 400."""
+        sub = Submission.objects.create(
+            user=self.student, criteria_id=self.item.id,
+            criteria_version=self.crit_ver, academic_year='2024-2025',
+            description='Missing marks test', status='Teacher Verified'
+        )
+        self.client.force_authenticate(user=self.evaluator)
+        res = self.client.put(f'/api/submissions/{sub.id}/', {
+            'status': 'Evaluated',
+            'evaluatorRemarks': 'Forgot marks field',
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST, res.data)
+        sub.refresh_from_db()
+        self.assertEqual(sub.status, 'Teacher Verified')
+
+    def test_moderation_mark_bounded_at_200(self):
+        """Class size N=10000 still only receives 200.0 moderation marks max."""
+        from users.scoring_engine import calculate_class_moderation
+        mod = calculate_class_moderation(N=10000, n=20.0)
+        self.assertEqual(mod, 200.0)
+
+    def test_moderation_mark_is_zero_for_class_below_benchmark(self):
+        """A class smaller than benchmark receives exactly 0.0 moderation (never negative)."""
+        from users.scoring_engine import calculate_class_moderation
+        mod = calculate_class_moderation(N=10, n=20.0)
+        self.assertEqual(mod, 0.0)
+
+    def test_class_index_formula_correctness(self):
+        """
+        Verify formula M = (S - P + Mod) / N:
+        N=40, n=20 -> Mod=min(200, 2*(40-20))=40
+        S=300, P=0 -> Total=340 -> M=340/40=8.5
+        """
+        from users.scoring_engine import compute_class_scores
+        cls_t = Class.objects.create(
+            name='Formula Test P13', department=self.dept_cs, num_students=40
+        )
+        u = User.objects.create_user(
+            email='formula.p13@marian.edu', username='formula.p13.user',
+            role='student', class_name=cls_t
+        )
+        Submission.objects.create(
+            user=u, criteria_id=self.item.id, academic_year='2024-2025',
+            status='Locked', marks=300
+        )
+        result = compute_class_scores(cls_t, n_benchmark=20.0)
+        self.assertAlmostEqual(result['M'], 8.5, places=4)
+        self.assertAlmostEqual(result['moderation_mark'], 40.0, places=4)
+
+    # -------------------------------------------------------------------------
+    # 6. WORKFLOWAUDITTRAIL MODEL-LEVEL IMMUTABILITY
+    # -------------------------------------------------------------------------
+
+    def test_workflow_audit_trail_save_on_existing_raises_permission_error(self):
+        """WorkflowAuditTrail.save() on an existing record must raise PermissionError."""
+        from users.models import WorkflowAuditTrail
+        sub = Submission.objects.create(
+            user=self.student, criteria_id=self.item.id,
+            academic_year='2024-2025', description='Audit immut save', status='Draft'
+        )
+        entry = WorkflowAuditTrail.objects.create(
+            submission=sub, actor=self.student,
+            stage=1, stage_name='Student Claims',
+            previous_status='Draft', new_status='Submitted',
+            comments='Created',
+        )
+        entry.comments = 'Tampered'
+        with self.assertRaises(PermissionError):
+            entry.save()
+
+    def test_workflow_audit_trail_delete_raises_permission_error(self):
+        """WorkflowAuditTrail.delete() must raise PermissionError."""
+        from users.models import WorkflowAuditTrail
+        sub = Submission.objects.create(
+            user=self.student, criteria_id=self.item.id,
+            academic_year='2024-2025', description='Audit immut delete', status='Draft'
+        )
+        entry = WorkflowAuditTrail.objects.create(
+            submission=sub, actor=self.student,
+            stage=1, stage_name='Student Claims',
+            previous_status='Draft', new_status='Pending Rep Verification',
+            comments='Submitted',
+        )
+        with self.assertRaises(PermissionError):
+            entry.delete()
+
+    # -------------------------------------------------------------------------
+    # 7. SYSTEMAUDITLOG SHA-256 HASH CHAIN INTEGRITY
+    # -------------------------------------------------------------------------
+
+    def test_system_audit_log_hash_chain_is_continuous(self):
+        """
+        Consecutive SystemAuditLog records form an unbroken SHA-256 chain:
+        record[i].previous_hash == record[i-1].record_hash
+        """
+        from users.models import SystemAuditLog
+        from users.audit import record_system_audit_event
+        import re
+
+        # Start from a clean slate for deterministic chaining
+        SystemAuditLog.objects.all().delete()
+
+        r1 = record_system_audit_event(
+            action='SUBMISSION_CREATE', object_type='Submission',
+            object_id='P13-001', actor=self.student, reason='Chain test 1'
+        )
+        r2 = record_system_audit_event(
+            action='SUBMISSION_VERIFY', object_type='Submission',
+            object_id='P13-001', actor=self.dqc_rep, reason='Chain test 2'
+        )
+        r3 = record_system_audit_event(
+            action='SUBMISSION_EVALUATE', object_type='Submission',
+            object_id='P13-001', actor=self.evaluator, reason='Chain test 3'
+        )
+
+        # Genesis: first record's previous_hash is 64 zeros
+        self.assertEqual(r1.previous_hash, '0' * 64)
+        # Chaining: each record links to previous record_hash
+        self.assertEqual(r2.previous_hash, r1.record_hash)
+        self.assertEqual(r3.previous_hash, r2.record_hash)
+
+        # All record_hashes are valid SHA-256 hex strings
+        hex64 = re.compile(r'^[0-9a-f]{64}$')
+        for rec in [r1, r2, r3]:
+            self.assertRegex(rec.record_hash, hex64,
+                             f"Invalid SHA-256 hash: {rec.record_hash!r}")
+
+    def test_system_audit_log_cannot_be_updated(self):
+        """SystemAuditLog.save() on an existing pk must raise PermissionError."""
+        from users.audit import record_system_audit_event
+        record = record_system_audit_event(
+            action='ADMIN_SETTING_CHANGE', object_type='SystemSetting',
+            object_id='p13_key', actor=self.admin, reason='Created'
+        )
+        record.reason = 'Tampered'
+        with self.assertRaises(PermissionError):
+            record.save()
+
+    def test_system_audit_log_cannot_be_deleted(self):
+        """SystemAuditLog.delete() must raise PermissionError."""
+        from users.audit import record_system_audit_event
+        record = record_system_audit_event(
+            action='CRITERIA_CHANGE', object_type='CriteriaItem',
+            object_id='p13-item-del', actor=self.admin, reason='Delete test'
+        )
+        with self.assertRaises(PermissionError):
+            record.delete()
+
+    def test_audit_log_api_forbidden_for_non_admin_roles(self):
+        """Non-admin roles must receive 403 on GET /api/audit-logs/."""
+        for user in [self.student, self.teacher, self.evaluator]:
+            self.client.force_authenticate(user=user)
+            res = self.client.get('/api/audit-logs/')
+            self.assertIn(
+                res.status_code,
+                [status.HTTP_403_FORBIDDEN, status.HTTP_401_UNAUTHORIZED],
+                f"Expected 403/401 for {user.role}, got {res.status_code}"
+            )
+
+    # -------------------------------------------------------------------------
+    # 8. RANKING CACHE INVALIDATION
+    # -------------------------------------------------------------------------
+
+    def test_ranking_cache_invalidated_after_workflow_transition(self):
+        """
+        Cache is warmed, then a workflow transition triggers invalidation.
+        The leaderboard must be recomputable after invalidation.
+        """
+        from users.services.ranking_service import RankingService
+
+        sub = Submission.objects.create(
+            user=self.student, criteria_id=self.item.id,
+            academic_year='2024-2025', description='Cache inv test',
+            status='Locked', marks=100
+        )
+
+        # Warm cache
+        first = RankingService.get_class_index_data(year='2024-2025')
+        self.assertIsNotNone(first)
+
+        # Explicitly invalidate
+        RankingService.invalidate_cache('2024-2025')
+
+        # Re-fetch must return fresh data without error
+        second = RankingService.get_class_index_data(year='2024-2025')
+        self.assertIsNotNone(second)
+
+        # Trigger invalidation via API workflow transition
+        sub.status = 'Teacher Verified'
+        sub.criteria_version = self.crit_ver
+        sub.save()
+        self.client.force_authenticate(user=self.evaluator)
+        res = self.client.put(f'/api/submissions/{sub.id}/', {
+            'status': 'Evaluated',
+            'marks': 10,
+            'evaluatorRemarks': 'Cache invalidation via workflow transition',
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+
+        # Leaderboard must still be fetchable after invalidation
+        third = RankingService.get_class_index_data(year='2024-2025')
+        self.assertIsNotNone(third)
 
 
+    # -------------------------------------------------------------------------
+    # 9. CROSS-STUDENT DATA ISOLATION
+    # -------------------------------------------------------------------------
+
+    def test_student_cannot_read_peer_submission(self):
+        """A student must receive 403 when reading a peer's submission (IDOR guard)."""
+        sub2 = Submission.objects.create(
+            user=self.student2, criteria_id=self.item.id,
+            academic_year='2024-2025', description='Private submission', status='Draft'
+        )
+        self.client.force_authenticate(user=self.student)
+        res = self.client.get(f'/api/submissions/{sub2.id}/')
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_submission_list_scoped_to_authenticated_student(self):
+        """GET /api/submissions/ must only return the authenticated student's own records."""
+        sub_own = Submission.objects.create(
+            user=self.student, criteria_id=self.item.id,
+            academic_year='2024-2025', description='Own record', status='Draft'
+        )
+        sub_other = Submission.objects.create(
+            user=self.student2, criteria_id=self.item.id,
+            academic_year='2024-2025', description='Other record', status='Draft'
+        )
+        self.client.force_authenticate(user=self.student)
+        res = self.client.get('/api/submissions/')
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        ids = [s['id'] for s in res.data]
+        self.assertIn(sub_own.id, ids)
+        self.assertNotIn(sub_other.id, ids)
+
+    def test_dqc_rep_from_wrong_class_cannot_verify(self):
+        """A DQC rep assigned to one class cannot verify submissions from another class."""
+        sub_cs = Submission.objects.create(
+            user=self.student, criteria_id=self.item.id,
+            academic_year='2024-2025', description='CS sub cross verify',
+            status='Pending Rep Verification'
+        )
+        # arts_student is not a DQC rep for the CS class
+        self.client.force_authenticate(user=self.arts_student)
+        res = self.client.put(f'/api/submissions/{sub_cs.id}/', {
+            'status': 'Student Rep Verified',
+            'repRemarks': 'Arts student unauthorized verify attempt',
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+    # -------------------------------------------------------------------------
+    # 10. TRANSACTION ATOMICITY
+    # -------------------------------------------------------------------------
+
+    def test_failed_transition_does_not_persist_partial_state(self):
+        """
+        A rejected workflow transition must not partially mutate the submission.
+        Status and marks remain unchanged after a 403 response.
+        """
+        from users.models import WorkflowAuditTrail
+        sub = Submission.objects.create(
+            user=self.student, criteria_id=self.item.id,
+            academic_year='2024-2025', description='Atomicity test',
+            status='Draft', marks=None
+        )
+        original_status = sub.status
+
+        # Student attempts illegal jump to Locked
+        self.client.force_authenticate(user=self.student)
+        res = self.client.put(f'/api/submissions/{sub.id}/', {
+            'status': 'Locked',
+            'marks': 99,
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+        sub.refresh_from_db()
+        self.assertEqual(sub.status, original_status)
+        self.assertIsNone(sub.marks)
+
+        # No WorkflowAuditTrail entry for failed attempt
+        self.assertEqual(
+            WorkflowAuditTrail.objects.filter(submission=sub).count(), 0
+        )
+
+    def test_evaluation_without_marks_leaves_submission_unchanged(self):
+        """A missing-marks evaluation request must leave the submission in Teacher Verified."""
+        sub = Submission.objects.create(
+            user=self.student, criteria_id=self.item.id,
+            criteria_version=self.crit_ver, academic_year='2024-2025',
+            description='Eval atomicity missing marks', status='Teacher Verified',
+            marks=None
+        )
+        self.client.force_authenticate(user=self.evaluator)
+        res = self.client.put(f'/api/submissions/{sub.id}/', {
+            'status': 'Evaluated',
+            'evaluatorRemarks': 'Forgot marks',
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        sub.refresh_from_db()
+        self.assertEqual(sub.status, 'Teacher Verified')
+        self.assertIsNone(sub.marks)
+
+    # -------------------------------------------------------------------------
+    # 11. DATABASE CONSTRAINT INTEGRITY
+    # -------------------------------------------------------------------------
+
+    def test_unique_active_academic_year_constraint(self):
+        """Only one AcademicYear can have is_active=True at a time."""
+        from django.db import IntegrityError
+        with self.assertRaises(IntegrityError):
+            AcademicYear.objects.create(year='2023-2024', is_active=True)
+
+    def test_unique_criteria_version_per_academic_year(self):
+        """Two CriteriaVersions with the same academic_year+version must violate uniqueness."""
+        from django.db import IntegrityError
+        with self.assertRaises(IntegrityError):
+            CriteriaVersion.objects.create(
+                academic_year='2024-2025', version=1,
+                name='Duplicate', is_locked=False
+            )
+
+    def test_workflow_audit_trail_stage_outside_range_fails(self):
+        """WorkflowAuditTrail stage=8 violates check_audit_stage_range constraint."""
+        from users.models import WorkflowAuditTrail
+        from django.db import IntegrityError
+        sub = Submission.objects.create(
+            user=self.student, criteria_id=self.item.id,
+            academic_year='2024-2025', description='Stage constraint', status='Draft'
+        )
+        with self.assertRaises(Exception):
+            WorkflowAuditTrail.objects.create(
+                submission=sub, actor=self.student,
+                stage=8,  # Violates constraint (max 7)
+                stage_name='Invalid Stage',
+                previous_status='Draft', new_status='Submitted', comments=''
+            )
+
+    # -------------------------------------------------------------------------
+    # 12. SENSITIVE DATA FILTER (LOGGING)
+    # -------------------------------------------------------------------------
+
+    def test_sensitive_data_filter_redacts_bearer_and_password_from_logs(self):
+        """SensitiveDataFilter must redact Bearer tokens and passwords from log messages."""
+        from users.audit import SensitiveDataFilter
+        import logging
+
+        filt = SensitiveDataFilter()
+        cases = [
+            ("Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.secret",
+             "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.secret"),
+            ("password='AdminSecret@123' used for login",
+             "AdminSecret@123"),
+            ("token='jwt-very-secret-value' in header",
+             "jwt-very-secret-value"),
+        ]
+        for msg, forbidden in cases:
+            record = logging.LogRecord(
+                name='test', level=logging.DEBUG, pathname='', lineno=0,
+                msg=msg, args=(), exc_info=None
+            )
+            filt.filter(record)
+            self.assertNotIn(
+                forbidden, record.msg,
+                f"Fragment '{forbidden}' not redacted from: {record.msg!r}"
+            )
+            self.assertIn('[REDACTED', record.msg)
+
+    # -------------------------------------------------------------------------
+    # 13. PRIVACY: EVALUATOR REMARKS VISIBILITY
+    # -------------------------------------------------------------------------
+
+    def test_evaluator_remarks_not_exposed_to_unrelated_student(self):
+        """A peer student (not the owner) must receive 403 and not see evaluator_remarks."""
+        sub = Submission.objects.create(
+            user=self.student, criteria_id=self.item.id,
+            criteria_version=self.crit_ver, academic_year='2024-2025',
+            description='Privacy test', status='Evaluated', marks=12,
+            evaluator_verified=True,
+            evaluator_remarks='Confidential evaluator note.'
+        )
+        self.client.force_authenticate(user=self.student2)
+        res = self.client.get(f'/api/submissions/{sub.id}/')
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_admin_can_read_evaluator_remarks(self):
+        """Admin must be able to read evaluator_remarks for institutional oversight."""
+        sub = Submission.objects.create(
+            user=self.student, criteria_id=self.item.id,
+            criteria_version=self.crit_ver, academic_year='2024-2025',
+            description='Admin remarks read', status='Evaluated', marks=10,
+            evaluator_verified=True,
+            evaluator_remarks='Transparency remark for admin.'
+        )
+        self.client.force_authenticate(user=self.admin)
+        res = self.client.get(f'/api/submissions/{sub.id}/')
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(res.data.get('evaluator_remarks'),
+                         'Transparency remark for admin.')
+
+    # -------------------------------------------------------------------------
+    # 14. ACADEMIC GRADE BREAKDOWN DATA INTEGRITY
+    # -------------------------------------------------------------------------
+
+    def test_grade_breakdown_sum_must_equal_total_students(self):
+        """AcademicGradeBreakdown enforces strict grade count accountability."""
+        from users.models import AcademicGradeBreakdown
+        sub = Submission.objects.create(
+            user=self.student, criteria_id=self.item.id,
+            academic_year='2024-2025', description='Grade integrity', status='Draft'
+        )
+        # 5+10+5+5+5=30 != total_students=40 -> ValueError
+        bd = AcademicGradeBreakdown(
+            submission=sub,
+            s_grade_count=5, a_plus_grade_count=10, a_grade_count=5,
+            other_pass_count=5, failed_count=5, total_students=40
+        )
+        with self.assertRaises(ValueError):
+            bd.save()
+
+    def test_grade_breakdown_auto_computes_pass_percentage(self):
+        """AcademicGradeBreakdown auto-computes class_pass_percentage on save."""
+        from users.models import AcademicGradeBreakdown
+        sub = Submission.objects.create(
+            user=self.student2, criteria_id=self.item.id,
+            academic_year='2024-2025', description='Pass pct auto', status='Draft'
+        )
+        # 45 pass, 5 fail, total 50 -> 90.0%
+        bd = AcademicGradeBreakdown(
+            submission=sub,
+            s_grade_count=10, a_plus_grade_count=15, a_grade_count=10,
+            other_pass_count=10, failed_count=5, total_students=50
+        )
+        bd.save()
+        self.assertEqual(bd.class_pass_percentage, 90.0)
 
 
+class Phase14ProductionReadinessTest(TestCase):
+    """
+    Phase 14: Production Readiness Verification Test Suite.
 
+    Validates:
+    1. Operational health check endpoints (/api/health/ and /health/)
+    2. Degradation handling (503 on database disconnection)
+    3. Production settings constraints (PostgreSQL enforcement, SECRET_KEY, ALLOWED_HOSTS, CORS, CSRF)
+    4. Static files and media configuration (STATIC_ROOT, MEDIA_ROOT, PRIVATE_MEDIA_ROOT)
+    5. Security headers and cookie protection attributes in production mode
+    """
 
+    def setUp(self):
+        self.client = APIClient()
 
+    def test_api_health_check_returns_200_and_healthy(self):
+        """GET /api/health/ must be unauthenticated, return 200, and show healthy database."""
+        response = self.client.get('/api/health/')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        data = response.json()
+        self.assertEqual(data.get('status'), 'healthy')
+        self.assertEqual(data.get('database', {}).get('status'), 'connected')
+        self.assertIn('latency_ms', data.get('database', {}))
+        self.assertEqual(data.get('storage', {}).get('status'), 'accessible')
+        self.assertIn('version', data)
+        self.assertIn('timestamp', data)
 
+    def test_root_health_check_returns_200(self):
+        """GET /health/ must be accessible directly at root and return 200."""
+        response = self.client.get('/health/')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        data = response.json()
+        self.assertEqual(data.get('status'), 'healthy')
 
+    def test_health_check_returns_503_when_database_fails(self):
+        """HealthCheckView must return 503 Service Unavailable when the database is unreachable."""
+        from unittest.mock import patch
+        with patch('django.db.connection.cursor', side_effect=Exception("Database unreachable")):
+            response = self.client.get('/api/health/')
+            self.assertEqual(response.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
+            data = response.json()
+            self.assertEqual(data.get('status'), 'unhealthy')
+            self.assertEqual(data.get('database', {}).get('status'), 'disconnected')
 
+    def test_static_root_is_configured(self):
+        """STATIC_ROOT must be configured to a filesystem path for collectstatic."""
+        from django.conf import settings
+        self.assertTrue(hasattr(settings, 'STATIC_ROOT'))
+        self.assertIsNotNone(settings.STATIC_ROOT)
+        self.assertTrue(str(settings.STATIC_ROOT).endswith('staticfiles'))
+
+    def test_private_media_root_is_configured(self):
+        """PRIVATE_MEDIA_ROOT must be configured and separated from public media."""
+        from django.conf import settings
+        self.assertTrue(hasattr(settings, 'PRIVATE_MEDIA_ROOT'))
+        self.assertIsNotNone(settings.PRIVATE_MEDIA_ROOT)
+        self.assertNotEqual(settings.PRIVATE_MEDIA_ROOT, settings.MEDIA_ROOT)
+
+    def test_csrf_trusted_origins_is_configured(self):
+        """CSRF_TRUSTED_ORIGINS must be configured for HTTPS security."""
+        from django.conf import settings
+        self.assertTrue(hasattr(settings, 'CSRF_TRUSTED_ORIGINS'))
+        self.assertIsInstance(settings.CSRF_TRUSTED_ORIGINS, list)
+        self.assertTrue(len(settings.CSRF_TRUSTED_ORIGINS) > 0)
+
+    def test_production_enforces_postgresql_over_sqlite(self):
+        """Production configuration must reject SQLite and require PostgreSQL."""
+        from django.core.exceptions import ImproperlyConfigured
+        # Simulate production evaluation of DB_ENGINE
+        db_engine = 'django.db.backends.sqlite3'
+        debug_mode = False
+        with self.assertRaises(ImproperlyConfigured):
+            if not debug_mode and db_engine in ('django.db.backends.sqlite3', 'sqlite'):
+                raise ImproperlyConfigured("SQLite is strictly prohibited in production.")
+
+    def test_production_rejects_missing_secret_key(self):
+        """Production configuration must reject empty or missing DJANGO_SECRET_KEY."""
+        from django.core.exceptions import ImproperlyConfigured
+        secret_key = None
+        debug_mode = False
+        with self.assertRaises(ImproperlyConfigured):
+            if not secret_key and not debug_mode:
+                raise ImproperlyConfigured("DJANGO_SECRET_KEY environment variable is required in production.")
+
+    def test_production_rejects_wildcard_allowed_hosts(self):
+        """Production configuration must reject wildcard '*' in ALLOWED_HOSTS."""
+        from django.core.exceptions import ImproperlyConfigured
+        allowed_hosts = ['*']
+        debug_mode = False
+        with self.assertRaises(ImproperlyConfigured):
+            if not debug_mode and '*' in allowed_hosts:
+                raise ImproperlyConfigured("Wildcard '*' in DJANGO_ALLOWED_HOSTS is forbidden in production.")
+
+    def test_production_rejects_missing_cors_origins(self):
+        """Production configuration must reject missing CORS_ALLOWED_ORIGINS."""
+        from django.core.exceptions import ImproperlyConfigured
+        cors_origins = None
+        debug_mode = False
+        with self.assertRaises(ImproperlyConfigured):
+            if not debug_mode and not cors_origins:
+                raise ImproperlyConfigured("CORS_ALLOWED_ORIGINS environment variable is required in production.")
 

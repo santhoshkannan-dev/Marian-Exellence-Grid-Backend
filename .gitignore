@@ -8,6 +8,7 @@ ENV/
 __pycache__/
 *.py[cod]
 *$py.class
+.coverage
 
 # Database
 *.sqlite3
@@ -17,8 +18,10 @@ __pycache__/
 .env
 .env.local
 
-# Media and Uploads
+# Media and Uploads & Static Assets
 media/
+private_media/
+staticfiles/
 
 # Logs
 *.log

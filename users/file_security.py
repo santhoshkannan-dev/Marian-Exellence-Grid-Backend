@@ -252,3 +252,14 @@ def resolve_safe_private_path(relative_path: str) -> Optional[str]:
         return None
 
     return abs_path
+
+
+class EvidenceSecurityManager:
+    """
+    Focused service for evidence and file validation, security, and storage.
+    """
+    validate_file_upload = staticmethod(validate_file_upload)
+    save_private_evidence_file = staticmethod(save_private_evidence_file)
+    resolve_safe_private_path = staticmethod(resolve_safe_private_path)
+    sniff_mime_type = staticmethod(sniff_mime_type)
+    get_private_media_root = staticmethod(get_private_media_root)

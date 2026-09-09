@@ -353,29 +353,119 @@ def compute_class_scores(cls, academic_year: Optional[str] = None, n_benchmark: 
 def compute_all_rankings(academic_year: Optional[str] = None, n_benchmark: Optional[float] = None) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
     Compute official rankings for all classes.
-    Returns:
-      (ranked_classes, unranked_classes)
-    Classes with N > 0 are ranked by M descending.
-    Ties in M are broken by total_score descending, then S descending, then class_name alphabetically.
+    Uses high-performance batch SQL aggregation:
+    - Fetches all classes with select_related('department') in 1 query.
+    - Pre-caches all CriteriaItems with select_related('category') in 1 query.
+    - Aggregates evaluated/locked marks grouped by (user__class_name_id, criteria_id) in 1 query.
+    - Computes class scores and ranks in memory without N+1 query loops.
     """
-    from .models import Class
+    from .models import Class, Submission, CriteriaItem
 
     if n_benchmark is None:
         n = get_benchmark_class_size()
     else:
         n = float(n_benchmark)
 
-    all_classes = Class.objects.select_related('department').all()
+    all_classes = list(Class.objects.select_related('department').all())
+    if not all_classes:
+        return [], []
+
+    # 1. Pre-fetch all criteria items once outside the loop
+    all_items = {it.id: it for it in CriteriaItem.objects.select_related('category').all()}
+
+    # 2. Batch aggregate in single SQL query
+    sub_qs = Submission.objects.filter(
+        status__in=['Locked', 'Evaluated'],
+        marks__isnull=False
+    )
+    if academic_year:
+        sub_qs = sub_qs.filter(academic_year=academic_year)
+
+    class_criteria_sums = (
+        sub_qs.values('user__class_name_id', 'criteria_id')
+        .annotate(total_marks=Sum('marks'))
+    )
+
+    class_scores_map: Dict[int, Dict[int, float]] = {}
+    for entry in class_criteria_sums:
+        c_id = entry['user__class_name_id']
+        crit_id = entry['criteria_id']
+        tot = float(entry['total_marks'] or 0.0)
+        if c_id not in class_scores_map:
+            class_scores_map[c_id] = {}
+        class_scores_map[c_id][crit_id] = tot
+
     ranked: List[Dict[str, Any]] = []
     unranked: List[Dict[str, Any]] = []
 
     for cls in all_classes:
-        scores = compute_class_scores(cls, academic_year=academic_year, n_benchmark=n)
-        if scores["N"] > 0:
-            ranked.append(scores)
+        N = cls.num_students or 0
+        P = round(float(cls.negative_points or 0.0), 2)
+        cls_sums = class_scores_map.get(cls.id, {})
+
+        S = round(sum(cls_sums.values()), 2)
+        category_scores: Dict[str, float] = {}
+        pillar_scores: Dict[str, float] = {
+            'Academic': 0.0,
+            'Co-Curricular': 0.0,
+            'Extra-Curricular': 0.0,
+        }
+
+        for crit_id, marks_val in cls_sums.items():
+            item = all_items.get(crit_id)
+            cat_code = item.category.code if item and item.category else 'unknown'
+            cat_name = item.category.category if item and item.category else 'Unknown Category'
+
+            category_scores[cat_name] = round(category_scores.get(cat_name, 0.0) + marks_val, 2)
+            pillar = get_pillar_for_category(cat_code)
+            if pillar not in pillar_scores:
+                pillar = get_pillar_for_category(cat_name)
+            if pillar in pillar_scores:
+                pillar_scores[pillar] = round(pillar_scores[pillar] + marks_val, 2)
+            else:
+                pillar_scores['Extra-Curricular'] = round(pillar_scores['Extra-Curricular'] + marks_val, 2)
+
+        if N > 0:
+            net_score = calculate_net_score(S, P)
+            moderation_mark = calculate_class_moderation(N, n)
+            total_score = calculate_total_score(net_score, moderation_mark)
+            M = calculate_class_index(total_score, N)
         else:
-            scores["rank"] = None
-            unranked.append(scores)
+            net_score = calculate_net_score(S, P)
+            moderation_mark = 0.0
+            total_score = 0.0
+            M = None
+
+        dept_name = cls.department.name if cls.department else 'General'
+        dept_code = cls.department.code if cls.department else 'GEN'
+
+        res = {
+            "class_id": cls.id,
+            "class_name": cls.name,
+            "department": dept_name,
+            "department_code": dept_code,
+            "N": N,
+            "n": n,
+            "S": S,
+            "P": P,
+            "net_score": net_score,
+            "moderation_mark": moderation_mark,
+            "total_score": total_score,
+            "M": M,
+            "academic_score": pillar_scores['Academic'],
+            "co_curricular_score": pillar_scores['Co-Curricular'],
+            "extra_curricular_score": pillar_scores['Extra-Curricular'],
+            "category_scores": category_scores,
+            "scoring_version": SCORING_ENGINE_VERSION,
+        }
+
+        verify_scoring_invariants(res)
+
+        if N > 0:
+            ranked.append(res)
+        else:
+            res["rank"] = None
+            unranked.append(res)
 
     # Deterministic sorting:
     # Primary: M (Class Index Mark) descending
@@ -528,3 +618,18 @@ def snapshot_academic_year_results(academic_year_str: str, force: bool = False, 
 
     logger.info(f"Successfully snapshotted {len(saved_instances)} class results for academic year '{academic_year_str}'.")
     return saved_instances
+
+
+class ScoringEngine:
+    """
+    Focused domain service for institutional score calculation and moderation.
+    """
+    calculate_score = staticmethod(calculate_submission_score)
+    compute_class_scores = staticmethod(compute_class_scores)
+    compute_all_rankings = staticmethod(compute_all_rankings)
+    explain_class_score = staticmethod(explain_class_score)
+    snapshot_results = staticmethod(snapshot_academic_year_results)
+
+
+ScoringService = ScoringEngine
+EvaluationService = ScoringEngine

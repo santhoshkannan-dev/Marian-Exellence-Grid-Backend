@@ -31,10 +31,12 @@ from .views import (
     ChampionDetailView,
     BugReportView,
     SystemAuditLogView,
-    SubmissionAuditTrailView
+    SubmissionAuditTrailView,
+    HealthCheckView,
 )
 
 urlpatterns = [
+    path('health/', HealthCheckView.as_view(), name='health-check'),
     path('auth/google/', GoogleLoginView.as_view(), name='google-login'),
     path('auth/token/refresh/', CustomTokenRefreshView.as_view(), name='token-refresh'),
     path('auth/logout/', LogoutView.as_view(), name='auth-logout'),

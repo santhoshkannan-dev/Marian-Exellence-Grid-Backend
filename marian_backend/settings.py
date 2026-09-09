@@ -9,7 +9,7 @@ from datetime import timedelta
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-# Auto-load .env configuration if present
+# Auto-load .env configuration if present (without overwriting real environment variables)
 env_path = BASE_DIR / '.env'
 if env_path.exists():
     with open(env_path, 'r', encoding='utf-8') as f:
@@ -17,7 +17,7 @@ if env_path.exists():
             line = line.strip()
             if line and not line.startswith('#') and '=' in line:
                 key, val = line.split('=', 1)
-                os.environ[key.strip()] = val.strip()
+                os.environ.setdefault(key.strip(), val.strip())
 
 from django.core.exceptions import ImproperlyConfigured
 
@@ -103,8 +103,14 @@ TEMPLATES = [
 
 WSGI_APPLICATION = 'marian_backend.wsgi.application'
 
-# Database Setup (SQLite by default for local dev)
+# Database Setup (PostgreSQL strictly enforced in production; SQLite allowed in dev)
 DB_ENGINE = os.environ.get('DATABASE_ENGINE', 'django.db.backends.sqlite3')
+
+if not DEBUG and DB_ENGINE in ('django.db.backends.sqlite3', 'sqlite'):
+    raise ImproperlyConfigured(
+        "SQLite is strictly prohibited in production. "
+        "Set DATABASE_ENGINE=django.db.backends.postgresql and provide DATABASE_NAME, DATABASE_USER, DATABASE_PASSWORD, and DATABASE_HOST."
+    )
 
 if DB_ENGINE in ('django.db.backends.sqlite3', 'sqlite'):
     DATABASES = {
@@ -119,6 +125,7 @@ else:
     db_password = os.environ.get('DATABASE_PASSWORD')
     db_host = os.environ.get('DATABASE_HOST', 'localhost')
     db_port = os.environ.get('DATABASE_PORT', '5432')
+    db_conn_max_age = int(os.environ.get('DATABASE_CONN_MAX_AGE', '300'))
 
     if not DEBUG and (not db_password or not db_name or not db_user):
         raise ImproperlyConfigured(
@@ -134,6 +141,7 @@ else:
             'PASSWORD': db_password,
             'HOST': db_host,
             'PORT': db_port,
+            'CONN_MAX_AGE': db_conn_max_age,
         }
     }
 
@@ -163,8 +171,9 @@ TIME_ZONE = 'UTC'
 USE_I18N = True
 USE_TZ = True
 
-# Static files
+# Static files (CSS, JavaScript, Images)
 STATIC_URL = 'static/'
+STATIC_ROOT = BASE_DIR / 'staticfiles'
 
 # Media files
 MEDIA_URL = '/media/'
@@ -182,6 +191,25 @@ CORS_ALLOWED_ORIGINS = [
     if origin.strip()
 ]
 CORS_ALLOW_CREDENTIALS = True
+
+# CSRF Trusted Origins (Required for HTTPS forms & admin in Django 4+)
+_csrf_origins = os.environ.get('CSRF_TRUSTED_ORIGINS')
+if _csrf_origins:
+    CSRF_TRUSTED_ORIGINS = [origin.strip() for origin in _csrf_origins.split(',') if origin.strip()]
+elif not DEBUG:
+    # Safe derivation: mirror valid origins from CORS_ALLOWED_ORIGINS
+    CSRF_TRUSTED_ORIGINS = [
+        origin for origin in CORS_ALLOWED_ORIGINS
+        if origin.startswith('http://') or origin.startswith('https://')
+    ]
+else:
+    CSRF_TRUSTED_ORIGINS = [
+        'http://localhost:3000',
+        'http://127.0.0.1:3000',
+        'http://localhost:5173',
+        'http://localhost:8000',
+        'http://127.0.0.1:8000',
+    ]
 
 # REST Framework settings
 REST_FRAMEWORK = {
@@ -241,6 +269,8 @@ if not DEBUG:
     SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 
 # Logging Configuration with Sensitive Data Sanitization
+DJANGO_LOG_LEVEL = os.environ.get('DJANGO_LOG_LEVEL', 'INFO').upper()
+
 LOGGING = {
     'version': 1,
     'disable_existing_loggers': False,
@@ -263,6 +293,21 @@ LOGGING = {
     },
     'root': {
         'handlers': ['console'],
-        'level': 'INFO',
+        'level': DJANGO_LOG_LEVEL,
     },
-}
+}
+
+# Optional Sentry Error Monitoring Integration
+SENTRY_DSN = os.environ.get('SENTRY_DSN')
+if SENTRY_DSN:
+    try:
+        import sentry_sdk
+        from sentry_sdk.integrations.django import DjangoIntegration
+        sentry_sdk.init(
+            dsn=SENTRY_DSN,
+            integrations=[DjangoIntegration()],
+            traces_sample_rate=float(os.environ.get('SENTRY_TRACES_SAMPLE_RATE', '0.1')),
+            send_default_pii=False,
+        )
+    except ImportError:
+        pass

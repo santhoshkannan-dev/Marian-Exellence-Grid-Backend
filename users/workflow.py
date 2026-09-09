@@ -440,4 +440,25 @@ def execute_workflow_transition(
             request=request
         )
 
+        # Invalidate in-process ranking cache if marks, evaluation, or locking state changed
+        if sub.status in ('Evaluated', 'Locked') or prev_status in ('Evaluated', 'Locked') or marks != old_marks:
+            try:
+                from users.services.ranking_service import RankingService
+                RankingService.invalidate_cache(sub.academic_year)
+            except Exception:
+                pass
+
         return sub
+
+
+class WorkflowService:
+    """
+    Domain service encapsulation for workflow state machine validation and transitions.
+    """
+    validate_transition = staticmethod(validate_workflow_transition)
+    execute_transition = staticmethod(execute_workflow_transition)
+    normalize_status = staticmethod(normalize_status)
+    determine_stage = staticmethod(determine_stage)
+    is_user_student_rep = staticmethod(is_user_student_rep_for_class)
+    is_user_class_advisor = staticmethod(is_user_class_advisor)
+    is_evaluator_assigned = staticmethod(is_evaluator_assigned_to_item)

@@ -269,6 +269,7 @@ class Submission(models.Model):
         indexes = [
             models.Index(fields=['user', 'status'], name='idx_sub_user_status'),
             models.Index(fields=['academic_year', 'status'], name='idx_sub_year_status'),
+            models.Index(fields=['status', 'academic_year'], name='idx_sub_status_year'),
             models.Index(fields=['criteria_id', 'status'], name='idx_sub_criteria_status'),
         ]
         constraints = [
@@ -599,6 +600,9 @@ class ClassIndexResult(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
+        indexes = [
+            models.Index(fields=['academic_year', 'is_locked'], name='idx_cir_year_locked'),
+        ]
         constraints = [
             models.UniqueConstraint(
                 fields=['class_name', 'academic_year'],
