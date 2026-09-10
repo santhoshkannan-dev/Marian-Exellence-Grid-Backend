@@ -74,6 +74,10 @@ parse_student_email = UserService.parse_student_email
 allocate_student_from_email = UserService.allocate_student_from_email
 get_tokens_for_user = UserService.get_tokens_for_user
 is_user_student_rep = UserService.is_user_student_rep
+is_staff_email = UserService.is_staff_email
+is_student_email = UserService.is_student_email
+is_user_dqc_rep = UserService.is_user_dqc_rep
+get_student_rep_classes = UserService.get_student_rep_classes
 
 check_duplicate_submission = SubmissionService.check_duplicate_submission
 get_online_courses_item_ids = SubmissionService.get_online_courses_item_ids

@@ -10,9 +10,59 @@ from users.models import SystemSetting, UserGroupModel, BugReport, SystemAuditLo
 from users.serializers import BugReportSerializer, BugReportSafeSerializer, SystemAuditLogSerializer, WorkflowAuditTrailSerializer
 from users.permissions import IsAdminOrReadOnly
 from users.file_security import validate_file_upload, ALLOWED_IMAGE_EXTENSIONS, MAX_IMAGE_SIZE_BYTES
-from .base import record_system_audit_event, is_user_student_rep
+from .base import record_system_audit_event, is_user_student_rep, is_staff_email, is_student_email
 
 logger = logging.getLogger(__name__)
+
+
+def _cleanup_removed_group_members(group_id: str, group_name: str, old_members: list, new_members: list):
+    """
+    When members are removed from a group, clean up any DB assignments they held.
+    - Class Teachers Council: clear class_teacher FK on any class the user is assigned to.
+    - DQC Student Rep Group: clear dqc_member FK on any class the user is assigned to.
+    """
+    from users.models import Class, User as UserModel
+    old_set = set(e.strip().lower() for e in old_members if isinstance(e, str))
+    new_set = set(e.strip().lower() for e in new_members if isinstance(e, str))
+    removed_emails = old_set - new_set
+    if not removed_emails:
+        return
+
+    is_class_teachers = (group_id == 'grp-class-teachers' or 'class teacher' in group_name.lower())
+    is_dqc = (
+        group_id in ('grp-dqc-student-rep',) or
+        'dqc' in group_id.lower() or 'dqc' in group_name.lower() or
+        'dac' in group_name.lower()
+    )
+    is_student_rep = (
+        group_id == 'grp-student-reps' or 'student rep' in group_name.lower()
+    ) and not is_dqc
+
+    for email in removed_emails:
+        try:
+            member_user = UserModel.objects.filter(email__iexact=email).first()
+            if not member_user:
+                continue
+            if is_class_teachers:
+                # Clear any class where this user is the class teacher
+                affected_classes = Class.objects.filter(class_teacher=member_user)
+                for cls in affected_classes:
+                    cls.class_teacher = None
+                    cls.save(update_fields=['class_teacher'])
+                    logger.info(f"Cleared class_teacher for class '{cls.name}' because '{email}' was removed from Class Teachers Council.")
+                # Also clear class_name on the user if it was set by teacher allocation
+                if member_user.class_name and Class.objects.filter(class_teacher=member_user).count() == 0:
+                    member_user.class_name = None
+                    member_user.save(update_fields=['class_name'])
+            if is_dqc or is_student_rep:
+                # Clear any class where this user is the dqc_member
+                affected_classes = Class.objects.filter(dqc_member=member_user)
+                for cls in affected_classes:
+                    cls.dqc_member = None
+                    cls.save(update_fields=['dqc_member'])
+                    logger.info(f"Cleared dqc_member for class '{cls.name}' because '{email}' was removed from DQC/Rep group.")
+        except Exception as cleanup_err:
+            logger.warning(f"Cleanup error for removed member '{email}': {cleanup_err}")
 
 
 class SystemSettingView(APIView):
@@ -104,6 +154,48 @@ class UserGroupListView(APIView):
 
         clean_id = str(group_id).strip()
         clean_name = str(name).strip()
+
+        if clean_id in ['grp-evaluators', 'grp-evaluation-committee'] or 'evaluat' in clean_name.lower() or 'evaluat' in clean_id.lower():
+            return Response(
+                {"error": "Evaluators cannot be managed through User Groups. Please use Evaluator Management."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        is_class_teachers_group = (clean_id == 'grp-class-teachers' or 'class teacher' in clean_name.lower())
+        if is_class_teachers_group and members and isinstance(members, list):
+            invalid_staff_emails = [m for m in members if isinstance(m, str) and not is_staff_email(m)]
+            if invalid_staff_emails:
+                return Response(
+                    {"error": f"Class Teachers Council only permits staff emails (name.name@mariancollege.org, e.g. kochumol.abraham@mariancollege.org). Student emails are not permitted. Invalid emails: {', '.join(invalid_staff_emails)}"},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+        is_dqc_group = (
+            clean_id == 'grp-dqc-student-rep' or
+            'dqc' in clean_name.lower() or 'dac' in clean_name.lower() or
+            'dqc' in clean_id.lower() or 'dac' in clean_id.lower()
+        )
+        if is_dqc_group and members and isinstance(members, list):
+            invalid_student_emails = [m for m in members if isinstance(m, str) and not is_student_email(m)]
+            if invalid_student_emails:
+                return Response(
+                    {"error": f"DQC Student Rep Group only permits student emails (name.startingwithnumber@mariancollege.org, e.g. amal.25pmc114@mariancollege.org). Staff emails are not permitted. Invalid emails: {', '.join(invalid_student_emails)}"},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+        is_student_rep_group = (
+            clean_id == 'grp-student-reps' or
+            'student rep' in clean_name.lower() or
+            'student rep' in clean_id.lower()
+        ) and not is_dqc_group
+        if is_student_rep_group and members and isinstance(members, list):
+            invalid_student_emails = [m for m in members if isinstance(m, str) and not is_student_email(m)]
+            if invalid_student_emails:
+                return Response(
+                    {"error": f"Student Rep Group only permits student emails (name.startingwithnumber@mariancollege.org, e.g. amal.25pmc114@mariancollege.org). Staff emails are not permitted. Invalid emails: {', '.join(invalid_student_emails)}"},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
         if len(clean_id) > 100:
             return Response({"error": "id cannot exceed 100 characters."}, status=status.HTTP_400_BAD_REQUEST)
         if len(clean_name) > 150:
@@ -112,6 +204,10 @@ class UserGroupListView(APIView):
             return Response({"error": "description cannot exceed 2000 characters."}, status=status.HTTP_400_BAD_REQUEST)
         if not isinstance(members, list):
             return Response({"error": "members must be a list of email strings."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Load old members before update for cleanup comparison
+        old_group = UserGroupModel.objects.filter(group_id=clean_id).first()
+        old_members = list(old_group.members or []) if old_group else []
 
         group, _ = UserGroupModel.objects.update_or_create(
             group_id=clean_id,
@@ -122,6 +218,9 @@ class UserGroupListView(APIView):
             }
         )
         sync_student_rep_group_members(group)
+
+        # Cleanup DB assignments for removed members
+        _cleanup_removed_group_members(clean_id, clean_name, old_members, members)
 
         return Response({
             "id": group.group_id,
@@ -149,18 +248,64 @@ class UserGroupDetailView(APIView):
     def put(self, request, pk):
         try:
             g = UserGroupModel.objects.get(group_id=pk)
-            g.name = request.data.get('name', g.name)
-            g.description = request.data.get('description', g.description)
+            name = request.data.get('name', g.name)
+            description = request.data.get('description', g.description)
+            members = request.data.get('members', g.members)
+
+            is_class_teachers_group = (pk == 'grp-class-teachers' or 'class teacher' in str(name).lower() or 'class teacher' in str(g.name).lower())
+            if is_class_teachers_group and members and isinstance(members, list):
+                invalid_staff_emails = [m for m in members if isinstance(m, str) and not is_staff_email(m)]
+                if invalid_staff_emails:
+                    return Response(
+                        {"error": f"Class Teachers Council only permits staff emails (name.name@mariancollege.org, e.g. kochumol.abraham@mariancollege.org). Student emails are not permitted. Invalid emails: {', '.join(invalid_staff_emails)}"},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+
+            is_dqc_group = (
+                pk == 'grp-dqc-student-rep' or
+                'dqc' in str(name).lower() or 'dqc' in str(g.name).lower() or
+                'dac' in str(name).lower() or 'dac' in str(g.name).lower() or
+                'dqc' in str(pk).lower() or 'dac' in str(pk).lower()
+            )
+            if is_dqc_group and members and isinstance(members, list):
+                invalid_student_emails = [m for m in members if isinstance(m, str) and not is_student_email(m)]
+                if invalid_student_emails:
+                    return Response(
+                        {"error": f"DQC Student Rep Group only permits student emails (name.startingwithnumber@mariancollege.org, e.g. amal.25pmc114@mariancollege.org). Staff emails are not permitted. Invalid emails: {', '.join(invalid_student_emails)}"},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+
+            is_student_rep_group = (
+                pk == 'grp-student-reps' or
+                'student rep' in str(name).lower() or 'student rep' in str(g.name).lower() or
+                'student rep' in str(pk).lower()
+            ) and not is_dqc_group
+            if is_student_rep_group and members and isinstance(members, list):
+                invalid_student_emails = [m for m in members if isinstance(m, str) and not is_student_email(m)]
+                if invalid_student_emails:
+                    return Response(
+                        {"error": f"Student Rep Group only permits student emails (name.startingwithnumber@mariancollege.org, e.g. amal.25pmc114@mariancollege.org). Staff emails are not permitted. Invalid emails: {', '.join(invalid_student_emails)}"},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+
+            old_members = list(g.members or [])
+            g.name = name
+            g.description = description
             if 'members' in request.data:
-                g.members = request.data.get('members')
+                g.members = members
             g.save()
             sync_student_rep_group_members(g)
+
+            # Cleanup DB assignments for removed members
+            if 'members' in request.data:
+                _cleanup_removed_group_members(pk, g.name, old_members, members)
             return Response({
                 "id": g.group_id,
                 "name": g.name,
                 "description": g.description,
                 "members": g.members
             }, status=status.HTTP_200_OK)
+
         except UserGroupModel.DoesNotExist:
             return Response({"error": "Group not found"}, status=status.HTTP_404_NOT_FOUND)
 

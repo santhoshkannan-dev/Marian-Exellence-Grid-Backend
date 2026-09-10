@@ -4,7 +4,8 @@ from rest_framework import status
 from .models import (
     Department, Course, Class, User, AcademicYear,
     CriteriaCategory, CriteriaItem, CriteriaRule, CriteriaVersion,
-    Submission, AcademicGradeBreakdown, ClassIndexResult, SystemSetting
+    Submission, AcademicGradeBreakdown, ClassIndexResult, SystemSetting,
+    UserGroupModel
 )
 from .views import parse_student_email, allocate_student_from_email, calculate_submission_score
 
@@ -4685,3 +4686,159 @@ class StudentRepresentativeGroupWorkflowTests(TestCase):
         self.assertEqual(sub.status, 'Student Rep Verified')
 
 
+class PrizesGroupRestrictionTest(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.ay = AcademicYear.objects.create(year='2026-2027', is_active=True)
+        self.category = CriteriaCategory.objects.create(
+            code='cat-prizes',
+            category='Prizes'
+        )
+        self.item_marian = CriteriaItem.objects.create(
+            id=701,
+            category=self.category,
+            title='From Marian College',
+            marks=0,
+            type='count',
+            rules_json={
+                'subItems': {
+                    '1st Prize (Individual)': 10,
+                    '1st Prize (group)': 5
+                }
+            }
+        )
+        self.student = User.objects.create(
+            username='regular.student@mariancollege.org',
+            email='regular.student@mariancollege.org',
+            role='student'
+        )
+        self.student_rep = User.objects.create(
+            username='santhosh.25pmc152@mariancollege.org',
+            email='santhosh.25pmc152@mariancollege.org',
+            role='student'
+        )
+        UserGroupModel.objects.create(
+            group_id='grp-dqc-student-rep',
+            name='DQC Student Rep Group',
+            members=[self.student_rep.email]
+        )
+
+    def test_regular_student_can_submit_individual_prize(self):
+        self.client.force_authenticate(user=self.student)
+        res = self.client.post('/api/submissions/', {
+            'criteriaId': 701,
+            'academicYear': '2026-2027',
+            'description': 'Won 1st Prize Individual',
+            'status': 'Submitted',
+            'evidence': {
+                'subItem': '1st Prize (Individual)'
+            }
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+
+    def test_regular_student_blocked_from_submitting_group_prize(self):
+        self.client.force_authenticate(user=self.student)
+        res = self.client.post('/api/submissions/', {
+            'criteriaId': 701,
+            'academicYear': '2026-2027',
+            'description': 'Won 1st Prize Group',
+            'status': 'Submitted',
+            'evidence': {
+                'subItem': '1st Prize (Group)'
+            }
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertIn("Group prizes", res.data.get('error', ''))
+
+    def test_student_rep_allowed_to_submit_group_prize(self):
+        self.client.force_authenticate(user=self.student_rep)
+        res = self.client.post('/api/submissions/', {
+            'criteriaId': 701,
+            'academicYear': '2026-2027',
+            'description': 'Won 1st Prize Group',
+            'status': 'Submitted',
+            'evidence': {
+                'subItem': '1st Prize (Group)'
+            }
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+
+
+class StaffEmailRestrictionsTest(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.admin = User.objects.create(
+            username='admin@mariancollege.org',
+            email='admin@mariancollege.org',
+            role='admin'
+        )
+        self.client.force_authenticate(user=self.admin)
+        self.category = CriteriaCategory.objects.create(
+            code='cat-eval-staff-test',
+            category='Staff Test Cat',
+            evaluators=[]
+        )
+
+    def test_evaluator_staff_email_permitted(self):
+        """Staff email allen.george@mariancollege.org can be added as evaluator."""
+        res = self.client.post('/api/evaluators/', {
+            'email': 'allen.george@mariancollege.org',
+            'name': 'Allen George',
+            'assigned_categories': ['cat-eval-staff-test']
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(res.data['email'], 'allen.george@mariancollege.org')
+
+    def test_evaluator_student_email_rejected(self):
+        """Student email amal.25pmc114@mariancollege.org is rejected in Evaluator Management."""
+        res = self.client.post('/api/evaluators/', {
+            'email': 'amal.25pmc114@mariancollege.org',
+            'name': 'Amal Student',
+            'assigned_categories': ['cat-eval-staff-test']
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("Evaluators must use staff email address", res.data.get('error', ''))
+
+    def test_class_teachers_council_staff_email_permitted(self):
+        """Staff email kochumol.abraham@mariancollege.org can be added to Class Teachers Council."""
+        res = self.client.post('/api/user-groups/', {
+            'id': 'grp-class-teachers',
+            'name': 'Class Teachers Council',
+            'description': 'Faculty advisors',
+            'members': ['kochumol.abraham@mariancollege.org']
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertIn('kochumol.abraham@mariancollege.org', res.data['members'])
+
+    def test_class_teachers_council_student_email_rejected(self):
+        """Student email amal.25pmc114@mariancollege.org is rejected for Class Teachers Council."""
+        res = self.client.post('/api/user-groups/', {
+            'id': 'grp-class-teachers',
+            'name': 'Class Teachers Council',
+            'description': 'Faculty advisors',
+            'members': ['amal.25pmc114@mariancollege.org']
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("Class Teachers Council only permits staff emails", res.data.get('error', ''))
+
+    def test_dqc_student_rep_group_student_email_permitted(self):
+        """Student email amal.25pmc114@mariancollege.org can be added to DQC Student Rep Group."""
+        res = self.client.post('/api/user-groups/', {
+            'id': 'grp-dqc-student-rep',
+            'name': 'DQC Student Rep Group',
+            'description': 'DQC representatives',
+            'members': ['amal.25pmc114@mariancollege.org']
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertIn('amal.25pmc114@mariancollege.org', res.data['members'])
+
+    def test_dqc_student_rep_group_staff_email_rejected(self):
+        """Staff email allen.george@mariancollege.org is rejected for DQC Student Rep Group."""
+        res = self.client.post('/api/user-groups/', {
+            'id': 'grp-dqc-student-rep',
+            'name': 'DQC Student Rep Group',
+            'description': 'DQC representatives',
+            'members': ['allen.george@mariancollege.org']
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("DQC Student Rep Group only permits student emails", res.data.get('error', ''))
