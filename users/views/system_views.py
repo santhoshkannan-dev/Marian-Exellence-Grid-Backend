@@ -15,6 +15,56 @@ from .base import record_system_audit_event, is_user_student_rep, is_staff_email
 logger = logging.getLogger(__name__)
 
 
+def _cleanup_removed_group_members(group_id: str, group_name: str, old_members: list, new_members: list):
+    """
+    When members are removed from a group, clean up any DB assignments they held.
+    - Class Teachers Council: clear class_teacher FK on any class the user is assigned to.
+    - DQC Student Rep Group: clear dqc_member FK on any class the user is assigned to.
+    """
+    from users.models import Class, User as UserModel
+    old_set = set(e.strip().lower() for e in old_members if isinstance(e, str))
+    new_set = set(e.strip().lower() for e in new_members if isinstance(e, str))
+    removed_emails = old_set - new_set
+    if not removed_emails:
+        return
+
+    is_class_teachers = (group_id == 'grp-class-teachers' or 'class teacher' in group_name.lower())
+    is_dqc = (
+        group_id in ('grp-dqc-student-rep',) or
+        'dqc' in group_id.lower() or 'dqc' in group_name.lower() or
+        'dac' in group_name.lower()
+    )
+    is_student_rep = (
+        group_id == 'grp-student-reps' or 'student rep' in group_name.lower()
+    ) and not is_dqc
+
+    for email in removed_emails:
+        try:
+            member_user = UserModel.objects.filter(email__iexact=email).first()
+            if not member_user:
+                continue
+            if is_class_teachers:
+                # Clear any class where this user is the class teacher
+                affected_classes = Class.objects.filter(class_teacher=member_user)
+                for cls in affected_classes:
+                    cls.class_teacher = None
+                    cls.save(update_fields=['class_teacher'])
+                    logger.info(f"Cleared class_teacher for class '{cls.name}' because '{email}' was removed from Class Teachers Council.")
+                # Also clear class_name on the user if it was set by teacher allocation
+                if member_user.class_name and Class.objects.filter(class_teacher=member_user).count() == 0:
+                    member_user.class_name = None
+                    member_user.save(update_fields=['class_name'])
+            if is_dqc or is_student_rep:
+                # Clear any class where this user is the dqc_member
+                affected_classes = Class.objects.filter(dqc_member=member_user)
+                for cls in affected_classes:
+                    cls.dqc_member = None
+                    cls.save(update_fields=['dqc_member'])
+                    logger.info(f"Cleared dqc_member for class '{cls.name}' because '{email}' was removed from DQC/Rep group.")
+        except Exception as cleanup_err:
+            logger.warning(f"Cleanup error for removed member '{email}': {cleanup_err}")
+
+
 class SystemSettingView(APIView):
     permission_classes = [IsAdminOrReadOnly]
 
@@ -139,6 +189,10 @@ class UserGroupListView(APIView):
         if not isinstance(members, list):
             return Response({"error": "members must be a list of email strings."}, status=status.HTTP_400_BAD_REQUEST)
 
+        # Load old members before update for cleanup comparison
+        old_group = UserGroupModel.objects.filter(group_id=clean_id).first()
+        old_members = list(old_group.members or []) if old_group else []
+
         group, _ = UserGroupModel.objects.update_or_create(
             group_id=clean_id,
             defaults={
@@ -147,6 +201,9 @@ class UserGroupListView(APIView):
                 'members': members
             }
         )
+
+        # Cleanup DB assignments for removed members
+        _cleanup_removed_group_members(clean_id, clean_name, old_members, members)
 
         return Response({
             "id": group.group_id,
@@ -214,11 +271,17 @@ class UserGroupDetailView(APIView):
                         status=status.HTTP_400_BAD_REQUEST
                     )
 
+            old_members = list(g.members or [])
             g.name = name
             g.description = description
             if 'members' in request.data:
                 g.members = members
             g.save()
+
+            # Cleanup DB assignments for removed members
+            if 'members' in request.data:
+                _cleanup_removed_group_members(pk, g.name, old_members, members)
+
             return Response({
                 "id": g.group_id,
                 "name": g.name,

@@ -28,6 +28,110 @@ except ImportError:
     google_requests = None
 
 
+def build_user_auth_dict(user, picture=None):
+    from users.models import UserGroupModel, Class as ClassModel
+    from django.db.models import Q as DjangoQ
+    user_email_lower = (user.email or '').strip().lower()
+
+    # Check Class Teachers Council membership
+    class_teacher_group = UserGroupModel.objects.filter(
+        DjangoQ(group_id='grp-class-teachers') | DjangoQ(name__icontains='class teacher')
+    ).first()
+    is_class_teacher = bool(
+        class_teacher_group and class_teacher_group.members and
+        any(isinstance(m, str) and m.strip().lower() == user_email_lower for m in class_teacher_group.members)
+    )
+    # Also check DB assignment (faculty assigned as class_teacher on any class)
+    if not is_class_teacher and user.role == 'faculty':
+        is_class_teacher = ClassModel.objects.filter(
+            DjangoQ(class_teacher=user) | DjangoQ(class_teacher__email__iexact=user.email)
+        ).exists()
+
+    # Get the class this teacher is assigned to
+    assigned_teacher_class = None
+    if is_class_teacher or user.role == 'faculty':
+        assigned_cls = ClassModel.objects.filter(
+            DjangoQ(class_teacher=user) | DjangoQ(class_teacher__email__iexact=user.email)
+        ).first()
+        if assigned_cls:
+            assigned_teacher_class = assigned_cls.name
+
+    # Check Evaluator group membership
+    evaluator_group = UserGroupModel.objects.filter(
+        DjangoQ(group_id='grp-evaluators') | DjangoQ(group_id__icontains='evaluat') |
+        DjangoQ(name__icontains='evaluator') | DjangoQ(name__icontains='evaluation committee')
+    ).first()
+    is_evaluator = bool(
+        user.role in ('evaluation', 'iqac', 'admin') or
+        (evaluator_group and evaluator_group.members and
+         any(isinstance(m, str) and m.strip().lower() == user_email_lower for m in evaluator_group.members))
+    )
+
+    # Check DQC Student Rep Group membership
+    dqc_group = UserGroupModel.objects.filter(
+        DjangoQ(group_id='grp-dqc-student-rep') | DjangoQ(group_id__icontains='dqc') |
+        DjangoQ(name__icontains='dqc')
+    ).first()
+    is_dqc_rep = bool(
+        dqc_group and dqc_group.members and
+        any(isinstance(m, str) and m.strip().lower() == user_email_lower for m in dqc_group.members)
+    )
+    # Also check DB dqc_member FK on class
+    if not is_dqc_rep and user.role == 'student':
+        is_dqc_rep = ClassModel.objects.filter(
+            DjangoQ(dqc_member=user) | DjangoQ(dqc_member__email__iexact=user.email)
+        ).exists()
+
+    # Check Student Rep Group membership
+    rep_group = UserGroupModel.objects.filter(
+        DjangoQ(group_id='grp-student-reps') | DjangoQ(name__icontains='student rep')
+    ).first()
+    is_student_rep = is_dqc_rep or bool(
+        rep_group and rep_group.members and
+        any(isinstance(m, str) and m.strip().lower() == user_email_lower for m in rep_group.members)
+    )
+
+    # Build available_roles list and determine priority_role
+    available_roles = []
+    if is_class_teacher or (user.role == 'faculty' and assigned_teacher_class):
+        available_roles.append('class_teacher')
+    if is_evaluator:
+        available_roles.append('evaluator')
+
+    # Priority: class_teacher > evaluator > admin > iqac > student > faculty (base)
+    if 'class_teacher' in available_roles:
+        priority_role = 'class_teacher'
+    elif 'evaluator' in available_roles:
+        priority_role = 'evaluator'
+    elif user.role == 'admin':
+        priority_role = 'admin'
+    elif user.role == 'iqac':
+        priority_role = 'iqac'
+    elif user.role == 'student':
+        priority_role = 'student'
+    else:
+        priority_role = user.role or 'faculty'
+
+    return {
+        "id": user.id,
+        "email": user.email,
+        "name": user.get_full_name() or user.username,
+        "role": user.role,
+        "department": user.department.name if user.department else None,
+        "department_code": user.department.code if user.department else None,
+        "class_name": user.class_name.name if user.class_name else None,
+        "picture": picture,
+        # Multi-role metadata
+        "is_class_teacher": is_class_teacher,
+        "assigned_class_name": assigned_teacher_class,
+        "is_evaluator": is_evaluator,
+        "is_dqc_rep": is_dqc_rep,
+        "is_student_rep": is_student_rep,
+        "available_roles": available_roles,
+        "priority_role": priority_role,
+    }
+
+
 class GoogleLoginView(APIView):
     permission_classes = [AllowAny]
     throttle_scope = 'login'
@@ -121,16 +225,7 @@ class GoogleLoginView(APIView):
             return Response(
                 {
                     "tokens": tokens,
-                    "user": {
-                        "id": user.id,
-                        "email": user.email,
-                        "name": user.get_full_name() or user.username,
-                        "role": user.role,
-                        "department": user.department.name if user.department else None,
-                        "department_code": user.department.code if user.department else None,
-                        "class_name": user.class_name.name if user.class_name else None,
-                        "picture": picture,
-                    }
+                    "user": build_user_auth_dict(user, picture=picture)
                 },
                 status=status.HTTP_200_OK
             )
@@ -252,15 +347,7 @@ class DevBypassLoginView(APIView):
         return Response(
             {
                 "tokens": tokens,
-                "user": {
-                    "id": user.id,
-                    "email": user.email,
-                    "name": user.get_full_name() or user.username,
-                    "role": user.role,
-                    "department": user.department.name if user.department else None,
-                    "department_code": user.department.code if user.department else None,
-                    "class_name": user.class_name.name if user.class_name else None,
-                }
+                "user": build_user_auth_dict(user)
             }
         )
 
@@ -270,17 +357,7 @@ class UserProfileView(APIView):
 
     def get(self, request):
         user = allocate_student_from_email(request.user)
-        return Response(
-            {
-                "id": user.id,
-                "email": user.email,
-                "name": user.get_full_name() or user.username,
-                "role": user.role,
-                "department": user.department.name if user.department else None,
-                "department_code": user.department.code if user.department else None,
-                "class_name": user.class_name.name if user.class_name else None,
-            }
-        )
+        return Response(build_user_auth_dict(user))
 
     def put(self, request):
         user = request.user
