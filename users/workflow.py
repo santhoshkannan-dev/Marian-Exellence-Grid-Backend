@@ -76,7 +76,7 @@ UNEDITABLE_BY_STUDENT_STATES = {
 
 
 def is_user_student_rep_for_class(user: User, class_obj: Optional[Class]) -> bool:
-    """Determine if an authenticated student user is a verified DQC rep for a class."""
+    """Determine if an authenticated student user is a verified DQC rep or Student Rep for a class."""
     if not user or not getattr(user, 'is_authenticated', False):
         return False
     if getattr(user, 'role', '') != 'student':
@@ -90,6 +90,19 @@ def is_user_student_rep_for_class(user: User, class_obj: Optional[Class]) -> boo
     # 2. Flag on user matching class
     if (getattr(user, 'is_student_rep', False) or getattr(user, 'is_dqc_member', False)) and user.class_name_id == class_obj.id:
         return True
+    # 3. Check UserGroupMember table
+    from users.models import UserGroupMember
+    user_email = (user.email or '').strip().lower()
+    if user_email:
+        members = UserGroupMember.objects.filter(
+            group__group_id__in=['grp-student-reps', 'grp-dqc-student-rep'],
+            email__iexact=user_email
+        )
+        for m in members:
+            if m.assigned_class and m.assigned_class.strip().lower() == class_obj.name.strip().lower():
+                return True
+        if members.exists() and user.class_name_id == class_obj.id:
+            return True
     return False
 
 
@@ -99,13 +112,24 @@ def is_user_class_advisor(user: User, class_obj: Optional[Class]) -> bool:
         return False
     if getattr(user, 'role', '') == 'admin' or getattr(user, 'is_superuser', False):
         return True
-    if getattr(user, 'role', '') != 'faculty':
+    if getattr(user, 'role', '') not in ('faculty', 'teacher'):
         return False
     if not class_obj:
         return True
     # Primary check: Class.class_teacher
     if class_obj.class_teacher_id == user.id:
         return True
+    user_email = (user.email or '').strip().lower()
+    if class_obj.class_teacher and class_obj.class_teacher.email.strip().lower() == user_email:
+        return True
+    from users.models import UserGroupMember
+    if user_email:
+        ct_member = UserGroupMember.objects.filter(
+            group__group_id='grp-class-teachers',
+            email__iexact=user_email
+        ).first()
+        if ct_member and ct_member.assigned_class and ct_member.assigned_class.strip().lower() == class_obj.name.strip().lower():
+            return True
     # Secondary check: Department affiliation if no specific teacher is set
     if not class_obj.class_teacher_id and class_obj.department_id and user.department_id == class_obj.department_id:
         return True
@@ -118,18 +142,26 @@ def is_evaluator_assigned_to_item(user: User, criteria_id: int) -> bool:
         return False
     if getattr(user, 'role', '') == 'admin' or getattr(user, 'is_superuser', False):
         return True
-    if getattr(user, 'role', '') != 'evaluation':
+    user_email = (user.email or '').strip().lower()
+    from users.models import UserGroupMember, EvaluatorCategoryAssignment
+    is_eval_role = (
+        getattr(user, 'role', '') in ('evaluation', 'evaluator') or
+        UserGroupMember.objects.filter(group__group_id='grp-evaluation-committee', email__iexact=user_email).exists()
+    )
+    if not is_eval_role:
         return False
     
     item = CriteriaItem.objects.filter(pk=criteria_id).select_related('category').first()
     if not item or not item.category:
+        return True
+
+    if EvaluatorCategoryAssignment.objects.filter(category=item.category, member__email__iexact=user_email).exists():
         return True
     
     cat_evaluators = item.category.evaluators
     if not cat_evaluators:
         return True
     
-    user_email = (user.email or '').strip().lower()
     allowed_emails = [str(e).strip().lower() for e in cat_evaluators if e]
     return user_email in allowed_emails
 

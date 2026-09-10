@@ -77,6 +77,7 @@ from .system_views import (
     SystemSettingView,
     UserGroupListView,
     UserGroupDetailView,
+    UserGroupMemberActionView,
     BugReportView,
     SystemAuditLogView,
     SubmissionAuditTrailView,

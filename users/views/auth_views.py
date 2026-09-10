@@ -16,6 +16,7 @@ from users.services.user_service import (
     parse_name_from_email,
     allocate_student_from_email,
     determine_role_from_email,
+    get_user_roles_and_dual_status,
 )
 
 logger = logging.getLogger(__name__)
@@ -137,6 +138,7 @@ class GoogleLoginView(APIView):
             user = allocate_student_from_email(user)
 
             tokens = get_tokens_for_user(user)
+            auth_info = get_user_roles_and_dual_status(user)
 
             return Response(
                 {
@@ -145,7 +147,10 @@ class GoogleLoginView(APIView):
                         "id": user.id,
                         "email": user.email,
                         "name": user.get_full_name() or user.username,
-                        "role": user.role,
+                        "role": auth_info['role'],
+                        "has_dual_role": auth_info['has_dual_role'],
+                        "available_roles": auth_info['available_roles'],
+                        "badge": auth_info['badge'],
                         "department": user.department.name if user.department else None,
                         "department_code": user.department.code if user.department else None,
                         "class_name": user.class_name.name if user.class_name else None,
@@ -268,6 +273,8 @@ class DevBypassLoginView(APIView):
 
         user = allocate_student_from_email(user)
         tokens = get_tokens_for_user(user)
+        auth_info = get_user_roles_and_dual_status(user)
+        effective_role = override_role if (override_role and override_role not in ('admin', 'faculty', 'evaluation')) else auth_info['role']
 
         return Response(
             {
@@ -276,7 +283,10 @@ class DevBypassLoginView(APIView):
                     "id": user.id,
                     "email": user.email,
                     "name": user.get_full_name() or user.username,
-                    "role": user.role,
+                    "role": effective_role,
+                    "has_dual_role": auth_info['has_dual_role'],
+                    "available_roles": auth_info['available_roles'],
+                    "badge": auth_info['badge'],
                     "department": user.department.name if user.department else None,
                     "department_code": user.department.code if user.department else None,
                     "class_name": user.class_name.name if user.class_name else None,
@@ -290,12 +300,16 @@ class UserProfileView(APIView):
 
     def get(self, request):
         user = allocate_student_from_email(request.user)
+        auth_info = get_user_roles_and_dual_status(user)
         return Response(
             {
                 "id": user.id,
                 "email": user.email,
                 "name": user.get_full_name() or user.username,
-                "role": user.role,
+                "role": auth_info['role'],
+                "has_dual_role": auth_info['has_dual_role'],
+                "available_roles": auth_info['available_roles'],
+                "badge": auth_info['badge'],
                 "department": user.department.name if user.department else None,
                 "department_code": user.department.code if user.department else None,
                 "class_name": user.class_name.name if user.class_name else None,
@@ -339,13 +353,17 @@ class UserProfileView(APIView):
                 )
 
         user.save()
+        auth_info = get_user_roles_and_dual_status(user)
 
         return Response(
             {
                 "id": user.id,
                 "email": user.email,
                 "name": user.get_full_name() or user.username,
-                "role": user.role,
+                "role": auth_info['role'],
+                "has_dual_role": auth_info['has_dual_role'],
+                "available_roles": auth_info['available_roles'],
+                "badge": auth_info['badge'],
                 "department": user.department.name if user.department else None,
                 "department_code": user.department.code if user.department else None,
                 "class_name": user.class_name.name if user.class_name else None,

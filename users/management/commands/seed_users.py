@@ -526,5 +526,109 @@ class Command(BaseCommand):
                     is_negative=True if item_data["type"] == 'negative' else False
                 )
 
+        # 7. Seed Official User Groups (strictly 4 official groups)
+        from users.models import UserGroupModel, UserGroupMember, EvaluatorCategoryAssignment
+        UserGroupModel.objects.exclude(group_id__in=[
+            'grp-evaluation-committee',
+            'grp-class-teachers',
+            'grp-dqc-student-rep',
+            'grp-student-reps'
+        ]).delete()
+
+        official_groups = [
+            {
+                "group_id": "grp-evaluation-committee",
+                "name": "Evaluation Committee",
+                "description": "Evaluator members assigned to review activity submissions.",
+            },
+            {
+                "group_id": "grp-class-teachers",
+                "name": "Class Teachers Council",
+                "description": "Faculty members acting as class advisors.",
+            },
+            {
+                "group_id": "grp-dqc-student-rep",
+                "name": "DQC Student Rep Group",
+                "description": "Data Quality Cell student representatives responsible for initial verification of peer submissions, and access to all categories for submissions of class they belong to.",
+            },
+            {
+                "group_id": "grp-student-reps",
+                "name": "Student Representatives",
+                "description": "Class representatives responsible for initial verification of peer submissions of class they belong to only.",
+            },
+        ]
+
+        created_groups = {}
+        for gdata in official_groups:
+            grp, _ = UserGroupModel.objects.update_or_create(
+                group_id=gdata["group_id"],
+                defaults={
+                    "name": gdata["name"],
+                    "description": gdata["description"]
+                }
+            )
+            created_groups[gdata["group_id"]] = grp
+            self.stdout.write(f"Seeded User Group: {grp.name} ({grp.group_id})")
+
+        # Seed group members with peer details
+        mca_class = Class.objects.filter(name="II MCA").first()
+        pgdca_dept = Department.objects.filter(code="PGDCA").first()
+
+        # 1. Allen George -> Evaluation Committee
+        eval_member, _ = UserGroupMember.objects.update_or_create(
+            group=created_groups["grp-evaluation-committee"],
+            email="allen.george@mariancollege.org",
+            defaults={
+                "name": "Allen George",
+                "user": seeded_users.get("allen.george@mariancollege.org"),
+                "department": pgdca_dept,
+            }
+        )
+        # Assign all categories to Allen George
+        for cat in CriteriaCategory.objects.all():
+            EvaluatorCategoryAssignment.objects.get_or_create(member=eval_member, category=cat)
+            if "allen.george@mariancollege.org" not in cat.evaluators:
+                cat.evaluators.append("allen.george@mariancollege.org")
+                cat.save(update_fields=["evaluators"])
+
+        # 2. Kochumol Abraham -> Class Teachers Council
+        UserGroupMember.objects.update_or_create(
+            group=created_groups["grp-class-teachers"],
+            email="kochumol.abraham@mariancollege.org",
+            defaults={
+                "name": "Kochumol Abraham",
+                "user": seeded_users.get("kochumol.abraham@mariancollege.org"),
+                "department": pgdca_dept,
+                "assigned_class": mca_class,
+            }
+        )
+
+        # 3. Santhosh Kannan -> DQC Student Rep Group & Student Representatives
+        UserGroupMember.objects.update_or_create(
+            group=created_groups["grp-dqc-student-rep"],
+            email="santhosh.25pmc152@mariancollege.org",
+            defaults={
+                "name": "Santhosh Kannan",
+                "user": seeded_users.get("santhosh.25pmc152@mariancollege.org"),
+                "department": pgdca_dept,
+                "assigned_class": mca_class,
+                "badge": "DQC member",
+            }
+        )
+        UserGroupMember.objects.update_or_create(
+            group=created_groups["grp-student-reps"],
+            email="santhosh.25pmc152@mariancollege.org",
+            defaults={
+                "name": "Santhosh Kannan",
+                "user": seeded_users.get("santhosh.25pmc152@mariancollege.org"),
+                "department": pgdca_dept,
+                "assigned_class": mca_class,
+                "badge": "Student Rep",
+            }
+        )
+
+        for grp in created_groups.values():
+            grp.sync_json_members()
+
         self.stdout.write(self.style.SUCCESS("Database seeding completed successfully!"))
 

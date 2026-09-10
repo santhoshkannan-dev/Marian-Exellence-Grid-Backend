@@ -314,8 +314,27 @@ class UserService:
         return "student"
 
     @staticmethod
+    def is_user_dqc_rep(user):
+        from users.models import Class, UserGroupMember, UserGroupModel
+        if not user or not getattr(user, 'is_authenticated', False):
+            return False
+        if getattr(user, 'is_dqc_member', False):
+            return True
+        if Class.objects.filter(dqc_member=user).exists():
+            return True
+        user_email = (getattr(user, 'email', '') or '').strip().lower()
+        if not user_email:
+            return False
+        if UserGroupMember.objects.filter(group__group_id='grp-dqc-student-rep', email__iexact=user_email).exists():
+            return True
+        dqc_group = UserGroupModel.objects.filter(group_id='grp-dqc-student-rep').first()
+        if dqc_group and dqc_group.members and any(isinstance(e, str) and e.strip().lower() == user_email for e in dqc_group.members):
+            return True
+        return False
+
+    @staticmethod
     def is_user_student_rep(user):
-        from users.models import Class, UserGroupModel
+        from users.models import Class, UserGroupModel, UserGroupMember
         if not user or not getattr(user, 'is_authenticated', False):
             return False
         if getattr(user, 'is_student_rep', False) or getattr(user, 'is_dqc_member', False):
@@ -326,12 +345,110 @@ class UserService:
         if user_email:
             if Class.objects.filter(dqc_member__email__iexact=user_email).exists():
                 return True
+            if UserGroupMember.objects.filter(group__group_id__in=['grp-student-reps', 'grp-dqc-student-rep'], email__iexact=user_email).exists():
+                return True
             rep_group = UserGroupModel.objects.filter(
-                Q(group_id='grp-student-reps') | Q(name__icontains='student rep') | Q(name__icontains='dqc')
+                Q(group_id__in=['grp-student-reps', 'grp-dqc-student-rep']) | Q(name__icontains='student rep') | Q(name__icontains='dqc')
             ).first()
             if rep_group and rep_group.members and any(isinstance(e, str) and e.strip().lower() == user_email for e in rep_group.members):
                 return True
         return False
+
+
+    @staticmethod
+    def get_user_badge(user):
+        """
+        Returns 'DQC member' if the user is a DQC representative,
+        or 'Student Rep' if the user is a class student representative,
+        otherwise None.
+        """
+        if UserService.is_user_dqc_rep(user):
+            return "DQC member"
+        if UserService.is_user_student_rep(user):
+            return "Student Rep"
+        return None
+
+    @staticmethod
+    def get_user_roles_and_dual_status(user):
+        """
+        Determines the available roles and whether a staff user has dual roles
+        (Class Teachers Council AND Evaluation Committee).
+        Returns:
+            dict with keys: 'role', 'has_dual_role', 'available_roles', 'badge'
+        """
+        from users.models import Class, UserGroupMember, UserGroupModel, CriteriaCategory
+        email = (getattr(user, 'email', '') or '').strip().lower()
+        base_role = getattr(user, 'role', 'student')
+
+        if base_role == 'admin':
+            return {
+                'role': 'admin',
+                'has_dual_role': False,
+                'available_roles': ['admin'],
+                'badge': None
+            }
+
+        badge = UserService.get_user_badge(user)
+
+        # Check if student
+        if base_role == 'student' or UserService.determine_role_from_email(email) == 'student':
+            return {
+                'role': 'student',
+                'has_dual_role': False,
+                'available_roles': ['student'],
+                'badge': badge
+            }
+
+        # Staff user: check membership in Class Teachers Council and Evaluation Committee
+        in_class_teachers = False
+        if UserGroupMember.objects.filter(group__group_id='grp-class-teachers', email__iexact=email).exists():
+            in_class_teachers = True
+        elif Class.objects.filter(class_teacher=user).exists() or Class.objects.filter(class_teacher__email__iexact=email).exists():
+            in_class_teachers = True
+        else:
+            ct_group = UserGroupModel.objects.filter(group_id='grp-class-teachers').first()
+            if ct_group and ct_group.members and any(isinstance(e, str) and e.strip().lower() == email for e in ct_group.members):
+                in_class_teachers = True
+
+        in_evaluation_committee = False
+        if UserGroupMember.objects.filter(group__group_id='grp-evaluation-committee', email__iexact=email).exists():
+            in_evaluation_committee = True
+        elif CriteriaCategory.objects.filter(evaluators__contains=email).exists():
+            in_evaluation_committee = True
+        else:
+            ec_group = UserGroupModel.objects.filter(group_id='grp-evaluation-committee').first()
+            if ec_group and ec_group.members and any(isinstance(e, str) and e.strip().lower() == email for e in ec_group.members):
+                in_evaluation_committee = True
+
+        if in_class_teachers and in_evaluation_committee:
+            return {
+                'role': 'teacher',  # Dual role default landing is Class Teachers window
+                'has_dual_role': True,
+                'available_roles': ['teacher', 'evaluator'],
+                'badge': None
+            }
+        elif in_evaluation_committee:
+            return {
+                'role': 'evaluator',
+                'has_dual_role': False,
+                'available_roles': ['evaluator'],
+                'badge': None
+            }
+        elif in_class_teachers:
+            return {
+                'role': 'teacher',
+                'has_dual_role': False,
+                'available_roles': ['teacher'],
+                'badge': None
+            }
+        else:
+            # General faculty default
+            return {
+                'role': 'teacher' if base_role == 'faculty' else base_role,
+                'has_dual_role': False,
+                'available_roles': ['teacher'],
+                'badge': None
+            }
 
 
 # Standalone alias exports for backward-compatibility
@@ -344,3 +461,7 @@ parse_student_email = UserService.parse_student_email
 allocate_student_from_email = UserService.allocate_student_from_email
 determine_role_from_email = UserService.determine_role_from_email
 is_user_student_rep = UserService.is_user_student_rep
+is_user_dqc_rep = UserService.is_user_dqc_rep
+get_user_badge = UserService.get_user_badge
+get_user_roles_and_dual_status = UserService.get_user_roles_and_dual_status
+

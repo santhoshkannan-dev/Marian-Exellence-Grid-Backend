@@ -4,7 +4,7 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
 
-from users.models import AcademicYear, Department, Course, Class, User
+from users.models import AcademicYear, Department, Course, Class, User, UserGroupModel, UserGroupMember
 from users.serializers import DepartmentSerializer, CourseSerializer
 from users.permissions import (
     IsAdminOrPublicReadOnly,
@@ -61,6 +61,64 @@ OFFICIAL_CLASS_ORDER = [
     # 13. PG Department of Computer Applications
     "I MCA", "II MCA",
 ]
+
+
+def sync_class_teacher_group_assignment(cls, new_teacher, old_teacher=None):
+    ct_group = UserGroupModel.objects.filter(group_id='grp-class-teachers').first()
+    if not ct_group:
+        return
+    if old_teacher and old_teacher != new_teacher:
+        has_other = Class.objects.filter(class_teacher=old_teacher).exclude(id=cls.id).exists()
+        if not has_other:
+            UserGroupMember.objects.filter(group=ct_group, email__iexact=old_teacher.email).update(assigned_class=None)
+    if new_teacher:
+        member, _ = UserGroupMember.objects.get_or_create(
+            group=ct_group,
+            email=new_teacher.email.lower().strip(),
+            defaults={
+                'user': new_teacher,
+                'name': new_teacher.get_full_name() or new_teacher.username,
+                'department': cls.department.name if cls.department else None,
+                'assigned_class': cls.name
+            }
+        )
+        member.user = new_teacher
+        member.name = new_teacher.get_full_name() or new_teacher.username
+        if cls.department:
+            member.department = cls.department.name
+        member.assigned_class = cls.name
+        member.save()
+    ct_group.sync_json_members()
+
+
+def sync_dqc_member_group_assignment(cls, new_student, old_student=None):
+    dqc_group = UserGroupModel.objects.filter(group_id='grp-dqc-student-rep').first()
+    if not dqc_group:
+        return
+    if old_student and old_student != new_student:
+        has_other = Class.objects.filter(dqc_member=old_student).exclude(id=cls.id).exists()
+        if not has_other:
+            UserGroupMember.objects.filter(group=dqc_group, email__iexact=old_student.email).delete()
+    if new_student:
+        member, _ = UserGroupMember.objects.get_or_create(
+            group=dqc_group,
+            email=new_student.email.lower().strip(),
+            defaults={
+                'user': new_student,
+                'name': new_student.get_full_name() or new_student.username,
+                'department': cls.department.name if cls.department else None,
+                'assigned_class': cls.name,
+                'badge': 'DQC member'
+            }
+        )
+        member.user = new_student
+        member.name = new_student.get_full_name() or new_student.username
+        if cls.department:
+            member.department = cls.department.name
+        member.assigned_class = cls.name
+        member.badge = 'DQC member'
+        member.save()
+    dqc_group.sync_json_members()
 
 
 class AcademicYearListView(APIView):
@@ -510,6 +568,7 @@ class ClassListView(APIView):
                     if not Class.objects.filter(class_teacher=old_teacher).exclude(id=cls.id).exists():
                         old_teacher.class_name = None
                         old_teacher.save(update_fields=['class_name'])
+                    sync_class_teacher_group_assignment(cls, None, old_teacher)
             else:
                 try:
                     teacher = User.objects.get(email=teacher_email)
@@ -519,8 +578,8 @@ class ClassListView(APIView):
                             "error": f"Faculty '{teacher.get_full_name() or teacher_email}' is already assigned as Class Advisor to '{other_class.name}'."
                         }, status=status.HTTP_400_BAD_REQUEST)
 
-                    if cls.class_teacher and cls.class_teacher != teacher:
-                        old_teacher = cls.class_teacher
+                    old_teacher = cls.class_teacher if cls.class_teacher and cls.class_teacher != teacher else None
+                    if old_teacher:
                         if not Class.objects.filter(class_teacher=old_teacher).exclude(id=cls.id).exists():
                             old_teacher.class_name = None
                             old_teacher.save(update_fields=['class_name'])
@@ -529,12 +588,15 @@ class ClassListView(APIView):
                     teacher.class_name = cls
                     teacher.department = cls.department
                     teacher.save(update_fields=['class_name', 'department'])
+                    sync_class_teacher_group_assignment(cls, teacher, old_teacher)
                 except User.DoesNotExist:
                     return Response({"error": f"Teacher with email '{teacher_email}' not found"}, status=status.HTTP_404_NOT_FOUND)
 
         if dqc_email is not None:
             if dqc_email == "":
+                old_dqc = cls.dqc_member
                 cls.dqc_member = None
+                sync_dqc_member_group_assignment(cls, None, old_dqc)
             else:
                 try:
                     student = User.objects.get(email=dqc_email)
@@ -549,7 +611,9 @@ class ClassListView(APIView):
                             "error": f"Student '{student.get_full_name() or dqc_email}' belongs to '{student.class_name.name}' and cannot be assigned to '{cls.name}'."
                         }, status=status.HTTP_400_BAD_REQUEST)
 
+                    old_dqc = cls.dqc_member if cls.dqc_member and cls.dqc_member != student else None
                     cls.dqc_member = student
+                    sync_dqc_member_group_assignment(cls, student, old_dqc)
                 except User.DoesNotExist:
                     return Response({"error": f"Student with email '{dqc_email}' not found"}, status=status.HTTP_404_NOT_FOUND)
 
@@ -732,6 +796,7 @@ class ClassDetailView(APIView):
                     if not Class.objects.filter(class_teacher=old_teacher).exclude(id=cls.id).exists():
                         old_teacher.class_name = None
                         old_teacher.save(update_fields=['class_name'])
+                    sync_class_teacher_group_assignment(cls, None, old_teacher)
             else:
                 try:
                     teacher = User.objects.get(email=teacher_email)
@@ -741,8 +806,8 @@ class ClassDetailView(APIView):
                             {"error": f"Faculty '{teacher.get_full_name() or teacher_email}' is already assigned as Class Advisor to '{other_class.name}'."},
                             status=status.HTTP_400_BAD_REQUEST
                         )
-                    if cls.class_teacher and cls.class_teacher != teacher:
-                        old_teacher = cls.class_teacher
+                    old_teacher = cls.class_teacher if cls.class_teacher and cls.class_teacher != teacher else None
+                    if old_teacher:
                         if not Class.objects.filter(class_teacher=old_teacher).exclude(id=cls.id).exists():
                             old_teacher.class_name = None
                             old_teacher.save(update_fields=['class_name'])
@@ -750,12 +815,15 @@ class ClassDetailView(APIView):
                     teacher.class_name = cls
                     teacher.department = cls.department
                     teacher.save(update_fields=['class_name', 'department'])
+                    sync_class_teacher_group_assignment(cls, teacher, old_teacher)
                 except User.DoesNotExist:
                     return Response({"error": f"Teacher with email '{teacher_email}' not found"}, status=status.HTTP_404_NOT_FOUND)
 
         if dqc_email is not None:
             if dqc_email == "":
+                old_dqc = cls.dqc_member
                 cls.dqc_member = None
+                sync_dqc_member_group_assignment(cls, None, old_dqc)
             else:
                 try:
                     student = User.objects.get(email=dqc_email)
@@ -770,7 +838,9 @@ class ClassDetailView(APIView):
                             {"error": f"Student '{student.get_full_name() or dqc_email}' belongs to '{student.class_name.name}' and cannot be assigned to '{cls.name}'."},
                             status=status.HTTP_400_BAD_REQUEST
                         )
+                    old_dqc = cls.dqc_member if cls.dqc_member and cls.dqc_member != student else None
                     cls.dqc_member = student
+                    sync_dqc_member_group_assignment(cls, student, old_dqc)
                 except User.DoesNotExist:
                     return Response({"error": f"Student with email '{dqc_email}' not found"}, status=status.HTTP_404_NOT_FOUND)
 

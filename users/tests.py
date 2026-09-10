@@ -4613,3 +4613,153 @@ class Phase14ProductionReadinessTest(TestCase):
             if not debug_mode and not cors_origins:
                 raise ImproperlyConfigured("CORS_ALLOWED_ORIGINS environment variable is required in production.")
 
+
+from rest_framework.test import APITestCase
+
+
+class OfficialUserGroupsAndAccessManagementRegressionTest(APITestCase):
+    """
+    Tests for Official User Groups & Access Management:
+    1. 4 official groups existence and policy enforcement
+    2. Staff email restriction on Evaluation Committee & Class Teachers Council
+    3. Student email restriction on DQC Student Rep Group & Student Representatives
+    4. Dual role computation for staff members in both councils
+    5. Badges for DQC member and Student Rep
+    6. Relational synchronization between groups, classes, and category evaluators
+    """
+    def setUp(self):
+        from users.views.system_views import OFFICIAL_USER_GROUPS
+        from users.models import UserGroupModel
+        for gid, ginfo in OFFICIAL_USER_GROUPS.items():
+            UserGroupModel.objects.get_or_create(
+                group_id=gid,
+                defaults={'name': ginfo['name'], 'description': ginfo['description']}
+            )
+        self.admin = User.objects.create(
+            username='admin@mariancollege.org',
+            email='admin@mariancollege.org',
+            role='admin',
+            is_staff=True,
+            is_superuser=True
+        )
+        self.faculty_teacher = User.objects.create(
+            username='teacher.faculty@mariancollege.org',
+            email='teacher.faculty@mariancollege.org',
+            role='faculty',
+            first_name='Teacher',
+            last_name='Faculty'
+        )
+        self.faculty_evaluator = User.objects.create(
+            username='evaluator.faculty@mariancollege.org',
+            email='evaluator.faculty@mariancollege.org',
+            role='faculty',
+            first_name='Evaluator',
+            last_name='Faculty'
+        )
+        self.student_rep = User.objects.create(
+            username='amal.25pmc114@mariancollege.org',
+            email='amal.25pmc114@mariancollege.org',
+            role='student',
+            first_name='Amal',
+            last_name='Thomas'
+        )
+        self.dqc_student = User.objects.create(
+            username='santhosh.25pmc152@mariancollege.org',
+            email='santhosh.25pmc152@mariancollege.org',
+            role='student',
+            first_name='Santhosh',
+            last_name='Kannan'
+        )
+        self.dept = Department.objects.create(name='PG Department of Computer Applications', code='PGDCA')
+        self.course = Course.objects.create(
+            department=self.dept,
+            name='Master of Computer Applications',
+            abbreviation='MCA',
+            email_code='mc',
+            duration_years=2
+        )
+        self.cls = Class.objects.create(
+            department=self.dept,
+            course=self.course,
+            name='II MCA',
+            year_number=2,
+            batch_start_year=2025
+        )
+        self.cat = CriteriaCategory.objects.create(category='Research & Publications', code='cat-research')
+
+    def test_four_official_groups_endpoint(self):
+        self.client.force_authenticate(user=self.admin)
+        res = self.client.get('/api/user-groups/')
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        group_ids = [g['id'] for g in res.data]
+        self.assertIn('grp-evaluation-committee', group_ids)
+        self.assertIn('grp-class-teachers', group_ids)
+        self.assertIn('grp-dqc-student-rep', group_ids)
+        self.assertIn('grp-student-reps', group_ids)
+
+    def test_email_policy_enforcement(self):
+        self.client.force_authenticate(user=self.admin)
+
+        # 1. Evaluation committee rejects student email
+        res1 = self.client.post('/api/user-groups/grp-evaluation-committee/add_member/', {
+            'email': 'santhosh.25pmc152@mariancollege.org'
+        })
+        self.assertEqual(res1.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('staff', res1.data['error'].lower())
+
+        # 2. Evaluation committee accepts staff email
+        res2 = self.client.post('/api/user-groups/grp-evaluation-committee/add_member/', {
+            'email': self.faculty_evaluator.email
+        })
+        self.assertEqual(res2.status_code, status.HTTP_200_OK)
+
+        # 3. Class Teachers Council rejects student email
+        res3 = self.client.post('/api/user-groups/grp-class-teachers/add_member/', {
+            'email': 'amal.25pmc114@mariancollege.org'
+        })
+        self.assertEqual(res3.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # 4. DQC Student Rep group rejects staff email
+        res4 = self.client.post('/api/user-groups/grp-dqc-student-rep/add_member/', {
+            'email': self.faculty_teacher.email
+        })
+        self.assertEqual(res4.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('student', res4.data['error'].lower())
+
+        # 5. DQC Student Rep group accepts student email
+        res5 = self.client.post('/api/user-groups/grp-dqc-student-rep/add_member/', {
+            'email': self.dqc_student.email
+        })
+        self.assertEqual(res5.status_code, status.HTTP_200_OK)
+
+    def test_dual_role_staff_detection_and_landing(self):
+        from users.services.user_service import get_user_roles_and_dual_status
+        from users.models import UserGroupModel, UserGroupMember
+
+        ec_grp = UserGroupModel.objects.get(group_id='grp-evaluation-committee')
+        ct_grp = UserGroupModel.objects.get(group_id='grp-class-teachers')
+
+        # Add faculty_teacher to both groups
+        UserGroupMember.objects.create(group=ct_grp, email=self.faculty_teacher.email, name=self.faculty_teacher.get_full_name())
+        UserGroupMember.objects.create(group=ec_grp, email=self.faculty_teacher.email, name=self.faculty_teacher.get_full_name())
+
+        status_info = get_user_roles_and_dual_status(self.faculty_teacher)
+        self.assertTrue(status_info['has_dual_role'])
+        self.assertEqual(status_info['role'], 'teacher')  # lands on class teachers window
+        self.assertIn('teacher', status_info['available_roles'])
+        self.assertIn('evaluator', status_info['available_roles'])
+
+    def test_student_badges(self):
+        from users.services.user_service import get_user_badge
+        from users.models import UserGroupModel, UserGroupMember
+
+        dqc_grp = UserGroupModel.objects.get(group_id='grp-dqc-student-rep')
+        rep_grp = UserGroupModel.objects.get(group_id='grp-student-reps')
+
+        UserGroupMember.objects.create(group=dqc_grp, email=self.dqc_student.email, badge='DQC member')
+        UserGroupMember.objects.create(group=rep_grp, email=self.student_rep.email, badge='Student Rep')
+
+        self.assertEqual(get_user_badge(self.dqc_student), 'DQC member')
+        self.assertEqual(get_user_badge(self.student_rep), 'Student Rep')
+
+

@@ -648,6 +648,47 @@ class UserGroupModel(models.Model):
     def __str__(self):
         return f"{self.name} ({self.group_id})"
 
+    def sync_json_members(self):
+        self.members = list(self.memberships.values_list('email', flat=True))
+        self.save(update_fields=['members'])
+
+
+class UserGroupMember(models.Model):
+    group = models.ForeignKey(UserGroupModel, on_delete=models.CASCADE, related_name='memberships')
+    user = models.ForeignKey('User', on_delete=models.SET_NULL, null=True, blank=True, related_name='group_memberships')
+    email = models.EmailField(max_length=255)
+    name = models.CharField(max_length=255, blank=True, default='')
+    department = models.ForeignKey('Department', on_delete=models.SET_NULL, null=True, blank=True)
+    assigned_class = models.ForeignKey('Class', on_delete=models.SET_NULL, null=True, blank=True, related_name='assigned_group_members')
+    badge = models.CharField(max_length=50, blank=True, default='') # 'DQC member', 'Student Rep'
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=['group', 'email'], name='unique_group_member_email')
+        ]
+        ordering = ['id']
+
+    def __str__(self):
+        return f"{self.email} ({self.group.name})"
+
+
+class EvaluatorCategoryAssignment(models.Model):
+    member = models.ForeignKey(UserGroupMember, on_delete=models.CASCADE, related_name='category_assignments')
+    category = models.ForeignKey('CriteriaCategory', on_delete=models.CASCADE, related_name='evaluator_assignments')
+    assigned_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=['member', 'category'], name='unique_member_category_assignment')
+        ]
+        ordering = ['id']
+
+    def __str__(self):
+        return f"{self.member.email} -> {self.category.category}"
+
+
 class Champion(models.Model):
     year = models.CharField(max_length=20)
     category = models.CharField(max_length=20, default='UG')

@@ -149,7 +149,32 @@ class CriteriaCategoryDetailView(APIView):
             return Response({"error": "Category not found"}, status=status.HTTP_404_NOT_FOUND)
         serializer = CriteriaCategorySerializer(category, data=request.data, partial=True)
         if serializer.is_valid():
-            serializer.save()
+            cat = serializer.save()
+            if 'evaluators' in request.data:
+                from users.models import UserGroupModel, UserGroupMember, EvaluatorCategoryAssignment, User
+                ec_group, _ = UserGroupModel.objects.get_or_create(
+                    group_id='grp-evaluation-committee',
+                    defaults={'name': 'Evaluation Committee', 'description': 'Evaluator members assigned to review activity submissions'}
+                )
+                current_emails = [str(e).strip().lower() for e in (cat.evaluators or []) if e and isinstance(e, str)]
+                EvaluatorCategoryAssignment.objects.filter(category=cat).exclude(member__email__in=current_emails).delete()
+                for em in current_emails:
+                    u = User.objects.filter(email__iexact=em).first()
+                    member, _ = UserGroupMember.objects.get_or_create(
+                        group=ec_group,
+                        email=em,
+                        defaults={
+                            'user': u,
+                            'name': u.get_full_name() if u else em.split('@')[0].capitalize(),
+                            'department': u.department.name if u and u.department else None
+                        }
+                    )
+                    if u and not member.user:
+                        member.user = u
+                        member.save(update_fields=['user'])
+                    EvaluatorCategoryAssignment.objects.get_or_create(member=member, category=cat)
+                ec_group.sync_json_members()
+
             record_system_audit_event(
                 action='CRITERIA_CHANGE',
                 object_type='CriteriaCategory',
