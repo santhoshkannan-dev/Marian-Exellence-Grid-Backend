@@ -61,8 +61,13 @@ def build_user_auth_dict(user, picture=None):
         DjangoQ(group_id='grp-evaluators') | DjangoQ(group_id__icontains='evaluat') |
         DjangoQ(name__icontains='evaluator') | DjangoQ(name__icontains='evaluation committee')
     ).first()
+    # Check if user appears in any CriteriaCategory.evaluators list (dual-role: faculty+evaluator)
+    from users.models import CriteriaCategory
+    is_evaluator_via_category = CriteriaCategory.objects.filter(evaluators__contains=[user_email_lower]).exists() if not (user.role == 'evaluation') else False
+
     is_evaluator = bool(
-        user.role in ('evaluation', 'iqac', 'admin') or
+        user.role == 'evaluation' or
+        is_evaluator_via_category or
         (evaluator_group and evaluator_group.members and
          any(isinstance(m, str) and m.strip().lower() == user_email_lower for m in evaluator_group.members))
     )
@@ -95,18 +100,18 @@ def build_user_auth_dict(user, picture=None):
     available_roles = []
     if is_class_teacher or (user.role == 'faculty' and assigned_teacher_class):
         available_roles.append('class_teacher')
-    if is_evaluator:
+    if is_evaluator and user.role not in ('admin', 'iqac'):
         available_roles.append('evaluator')
 
-    # Priority: class_teacher > evaluator > admin > iqac > student > faculty (base)
-    if 'class_teacher' in available_roles:
-        priority_role = 'class_teacher'
-    elif 'evaluator' in available_roles:
-        priority_role = 'evaluator'
-    elif user.role == 'admin':
+    # Priority: admin > iqac > class_teacher > evaluator > student > faculty (base)
+    if user.role == 'admin':
         priority_role = 'admin'
     elif user.role == 'iqac':
         priority_role = 'iqac'
+    elif 'class_teacher' in available_roles:
+        priority_role = 'class_teacher'
+    elif 'evaluator' in available_roles or user.role == 'evaluation':
+        priority_role = 'evaluator'
     elif user.role == 'student':
         priority_role = 'student'
     else:
