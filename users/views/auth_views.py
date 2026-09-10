@@ -110,7 +110,7 @@ def build_user_auth_dict(user, picture=None):
     available_roles = []
     if is_class_teacher or user.role == 'faculty':
         available_roles.append('class_teacher')
-    if is_evaluator:
+    if is_evaluator and user.role not in ('admin', 'iqac'):
         available_roles.append('evaluator')
     if user.role == 'admin':
         available_roles.append('admin')
@@ -119,15 +119,15 @@ def build_user_auth_dict(user, picture=None):
     if user.role == 'student':
         available_roles.append('student')
 
-    # Priority: class_teacher > evaluator > admin > iqac > student > faculty (base)
-    if 'class_teacher' in available_roles:
-        priority_role = 'class_teacher'
-    elif 'evaluator' in available_roles:
-        priority_role = 'evaluator'
-    elif user.role == 'admin':
+    # Priority: admin > iqac > class_teacher > evaluator > student > faculty (base)
+    if user.role == 'admin':
         priority_role = 'admin'
     elif user.role == 'iqac':
         priority_role = 'iqac'
+    elif 'class_teacher' in available_roles:
+        priority_role = 'class_teacher'
+    elif 'evaluator' in available_roles or user.role == 'evaluation':
+        priority_role = 'evaluator'
     elif user.role == 'student':
         priority_role = 'student'
     else:

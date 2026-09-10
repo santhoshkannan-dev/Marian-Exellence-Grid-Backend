@@ -104,7 +104,9 @@ class EvaluatorManagementView(APIView):
         )
 
         if not created:
-            if user.role not in ('admin', 'iqac', 'faculty'):
+            # Do NOT override role for existing staff/faculty/admin users —
+            # they keep their primary role; evaluator assignment is tracked via CriteriaCategory.evaluators
+            if user.role not in ('admin', 'iqac', 'faculty', 'evaluation'):
                 user.role = 'evaluation'
             user.is_active = True
             if name:
