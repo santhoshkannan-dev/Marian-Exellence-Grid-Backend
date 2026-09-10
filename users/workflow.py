@@ -81,14 +81,19 @@ def is_user_student_rep_for_class(user: User, class_obj: Optional[Class]) -> boo
         return False
     if getattr(user, 'role', '') != 'student':
         return False
+
+    from .services.user_service import UserService
+    if not UserService.is_user_student_rep(user):
+        return False
+
     if not class_obj:
-        return getattr(user, 'is_student_rep', False) or getattr(user, 'is_dqc_member', False)
+        return True
 
     # 1. Direct DQC assignment on the class
     if class_obj.dqc_member_id == user.id:
         return True
-    # 2. Flag on user matching class
-    if (getattr(user, 'is_student_rep', False) or getattr(user, 'is_dqc_member', False)) and user.class_name_id == class_obj.id:
+    # 2. Flag on user matching class or user's assigned class
+    if user.class_name_id and user.class_name_id == class_obj.id:
         return True
     return False
 

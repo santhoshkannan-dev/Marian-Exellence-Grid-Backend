@@ -98,9 +98,11 @@ class SubmissionService:
 
         if getattr(user, 'role', None) == 'student':
             if UserService.is_user_student_rep(user):
-                rep_classes = Class.objects.filter(
+                rep_classes = list(Class.objects.filter(
                     Q(dqc_member=user) | Q(dqc_member__email__iexact=user.email)
-                )
+                ))
+                if user.class_name and user.class_name not in rep_classes:
+                    rep_classes.append(user.class_name)
                 queryset = queryset.filter(Q(user=user) | Q(user__class_name__in=rep_classes))
             else:
                 queryset = queryset.filter(user=user)

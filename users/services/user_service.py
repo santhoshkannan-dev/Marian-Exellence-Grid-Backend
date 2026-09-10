@@ -310,11 +310,13 @@ class UserService:
         if user_email:
             if Class.objects.filter(dqc_member__email__iexact=user_email).exists():
                 return True
-            rep_group = UserGroupModel.objects.filter(
-                Q(group_id='grp-student-reps') | Q(name__icontains='student rep') | Q(name__icontains='dqc')
-            ).first()
-            if rep_group and rep_group.members and any(isinstance(e, str) and e.strip().lower() == user_email for e in rep_group.members):
-                return True
+            rep_groups = UserGroupModel.objects.filter(
+                Q(group_id__icontains='rep') | Q(group_id__icontains='dqc') |
+                Q(name__icontains='student rep') | Q(name__icontains='representative') | Q(name__icontains='dqc')
+            )
+            for rg in rep_groups:
+                if rg.members and any(isinstance(e, str) and e.strip().lower() == user_email for e in rg.members):
+                    return True
         return False
 
 

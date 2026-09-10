@@ -61,6 +61,22 @@ class SystemSettingView(APIView):
         return Response({"success": True}, status=status.HTTP_200_OK)
 
 
+def sync_student_rep_group_members(group):
+    """Ensure student reps are linked as dqc_member for their class if unassigned."""
+    if not group or not group.members:
+        return
+    gid = (group.group_id or '').lower()
+    gname = (group.name or '').lower()
+    if 'rep' in gid or 'dqc' in gid or 'rep' in gname or 'dqc' in gname:
+        from users.models import User, Class
+        for email in group.members:
+            if isinstance(email, str) and email.strip():
+                u = User.objects.filter(email__iexact=email.strip()).first()
+                if u and u.class_name and not u.class_name.dqc_member_id:
+                    u.class_name.dqc_member = u
+                    u.class_name.save(update_fields=['dqc_member'])
+
+
 class UserGroupListView(APIView):
     permission_classes = [IsAdminOrReadOnly]
 
@@ -105,6 +121,7 @@ class UserGroupListView(APIView):
                 'members': members
             }
         )
+        sync_student_rep_group_members(group)
 
         return Response({
             "id": group.group_id,
@@ -137,6 +154,7 @@ class UserGroupDetailView(APIView):
             if 'members' in request.data:
                 g.members = request.data.get('members')
             g.save()
+            sync_student_rep_group_members(g)
             return Response({
                 "id": g.group_id,
                 "name": g.name,

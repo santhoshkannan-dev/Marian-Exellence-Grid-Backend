@@ -408,9 +408,11 @@ class SubmissionDetailView(APIView):
             if submission.user_id != user.id:
                 if not is_user_student_rep(user):
                     return Response({"error": "You do not have permission to view this submission."}, status=status.HTTP_403_FORBIDDEN)
-                rep_classes = Class.objects.filter(
+                rep_classes = list(Class.objects.filter(
                     Q(dqc_member=user) | Q(dqc_member__email__iexact=user.email)
-                )
+                ))
+                if user.class_name and user.class_name not in rep_classes:
+                    rep_classes.append(user.class_name)
                 if not (submission.user and submission.user.class_name in rep_classes):
                     return Response({"error": "You do not have permission to view this submission."}, status=status.HTTP_403_FORBIDDEN)
         else:
@@ -465,9 +467,11 @@ class SubmissionDetailView(APIView):
                         status=status.HTTP_403_FORBIDDEN
                     )
             elif is_rep:
-                rep_classes = Class.objects.filter(
+                rep_classes = list(Class.objects.filter(
                     Q(dqc_member=user) | Q(dqc_member__email__iexact=user.email)
-                )
+                ))
+                if user.class_name and user.class_name not in rep_classes:
+                    rep_classes.append(user.class_name)
                 if not (submission.user and submission.user.class_name in rep_classes):
                     return Response(
                         {"error": "Student representative is not assigned to this student's class."},

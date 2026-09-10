@@ -118,6 +118,8 @@ class GoogleLoginView(APIView):
 
             tokens = get_tokens_for_user(user)
 
+            is_rep = UserService.is_user_student_rep(user)
+
             return Response(
                 {
                     "tokens": tokens,
@@ -130,6 +132,8 @@ class GoogleLoginView(APIView):
                         "department_code": user.department.code if user.department else None,
                         "class_name": user.class_name.name if user.class_name else None,
                         "picture": picture,
+                        "is_student_rep": is_rep,
+                        "isStudentRep": is_rep,
                     }
                 },
                 status=status.HTTP_200_OK
@@ -249,6 +253,8 @@ class DevBypassLoginView(APIView):
         user = allocate_student_from_email(user)
         tokens = get_tokens_for_user(user)
 
+        is_rep = UserService.is_user_student_rep(user)
+
         return Response(
             {
                 "tokens": tokens,
@@ -260,6 +266,8 @@ class DevBypassLoginView(APIView):
                     "department": user.department.name if user.department else None,
                     "department_code": user.department.code if user.department else None,
                     "class_name": user.class_name.name if user.class_name else None,
+                    "is_student_rep": is_rep,
+                    "isStudentRep": is_rep,
                 }
             }
         )
@@ -270,6 +278,7 @@ class UserProfileView(APIView):
 
     def get(self, request):
         user = allocate_student_from_email(request.user)
+        is_rep = UserService.is_user_student_rep(user)
         return Response(
             {
                 "id": user.id,
@@ -279,6 +288,8 @@ class UserProfileView(APIView):
                 "department": user.department.name if user.department else None,
                 "department_code": user.department.code if user.department else None,
                 "class_name": user.class_name.name if user.class_name else None,
+                "is_student_rep": is_rep,
+                "isStudentRep": is_rep,
             }
         )
 

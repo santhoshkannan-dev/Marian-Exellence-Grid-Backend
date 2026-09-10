@@ -6,10 +6,10 @@ Institutional Formula Reference (from frontend/docs/scoring-logic.md):
           S = Gross Evaluated Marks (sum of verified marks on Evaluated/Locked submissions)
           P = Class Penalty Points (Class.negative_points)
   Step 2: Class Strength Moderation Mark
-          Mod = min(200.0, max(0.0, 2.0 * (N - n)))
+          Mod = min(100.0, max(0.0, 2.0 * (N - n)))
           N = Class Size (Class.num_students)
           n = Benchmark Minimum Class Size (SystemSetting['smallest_class_size'])
-          Range: strictly bounded between 0.0 and 200.0 marks.
+          Range: strictly bounded between 0.0 and 100.0 marks.
   Step 3: Total Score = max(0.0, Net Score + Mod)
   Step 4: Class Index Mark (M) = Total Score / N
           Per-capita normalized institutional ranking metric.
@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 SCORING_ENGINE_VERSION = 'v1.0-authoritative'
 DEFAULT_BENCHMARK_CLASS_SIZE = 20.0
-MAX_MODERATION_MARK = 200.0
+MAX_MODERATION_MARK = 100.0
 MODERATION_FACTOR = 2.0
 
 # Authoritative Institutional Pillar Categorization
@@ -79,7 +79,7 @@ def get_pillar_for_category(category_identifier: str) -> str:
 def calculate_class_moderation(N: int, n: float) -> float:
     """
     Step 2: Class Strength Moderation Mark.
-    Mod = min(200.0, max(0.0, 2.0 * (N - n)))
+    Mod = min(100.0, max(0.0, 2.0 * (N - n)))
     """
     n_val = float(n) if n is not None else 0.0
     diff = float(N) - n_val
@@ -510,7 +510,7 @@ def explain_class_score(cls, academic_year: Optional[str] = None, n_benchmark: O
 
     steps = [
         f"Step 1 (Net Score): Gross Marks S ({S:.2f}) - Penalty Points P ({P:.2f}) = Net Score ({net:.2f})",
-        f"Step 2 (Moderation Mark): min(200.0, max(0.0, 2.0 * (N ({N}) - n ({n})))) = Moderation ({mod:.2f})",
+        f"Step 2 (Moderation Mark): min(100.0, max(0.0, 2.0 * (N ({N}) - n ({n})))) = Moderation ({mod:.2f})",
         f"Step 3 (Total Moderated Score): max(0.0, Net Score ({net:.2f}) + Moderation ({mod:.2f})) = Total Score ({total:.2f})",
     ]
     if N > 0:
@@ -523,7 +523,7 @@ def explain_class_score(cls, academic_year: Optional[str] = None, n_benchmark: O
         "explanation_steps": steps,
         "formula_spec": {
             "step_1": "Net Score = S - P",
-            "step_2": "Mod = min(200.0, max(0.0, 2.0 * (N - n)))",
+            "step_2": "Mod = min(100.0, max(0.0, 2.0 * (N - n)))",
             "step_3": "Total Score = max(0.0, Net Score + Mod)",
             "step_4": "Class Index M = Total Score / N",
         },
