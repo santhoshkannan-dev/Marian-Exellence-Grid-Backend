@@ -91,20 +91,37 @@ class SubmissionService:
 
     @staticmethod
     def filter_submissions_for_user(user, academic_year=None):
-        from users.models import Submission, Class
+        from users.models import Submission, Class, UserGroupModel
         from users.services.user_service import UserService
+        from django.db.models import Q
 
         queryset = Submission.objects.select_related('user', 'user__class_name', 'user__department').all()
 
         if getattr(user, 'role', None) == 'student':
             if UserService.is_user_student_rep(user):
-                rep_classes = Class.objects.filter(
-                    Q(dqc_member=user) | Q(dqc_member__email__iexact=user.email)
-                )
+                # Build the set of classes this rep is authorized to see
+                # 1. Direct dqc_member FK on class
+                rep_class_q = Q(dqc_member=user) | Q(dqc_member__email__iexact=user.email)
+
+                # 2. Rep's own class (they are a student in it)
+                if getattr(user, 'class_name', None):
+                    rep_class_q |= Q(id=user.class_name_id)
+
+                # 3. Parse class from email structure
+                user_email = (user.email or '').strip().lower()
+                parsed = UserService.parse_student_email(user_email)
+                if parsed and parsed.get('class_name'):
+                    rep_class_q |= Q(name__iexact=parsed['class_name'])
+
+                rep_classes = Class.objects.filter(rep_class_q).distinct()
+
+                # Submissions: own submissions OR submissions from students in those classes
                 queryset = queryset.filter(Q(user=user) | Q(user__class_name__in=rep_classes))
             else:
                 queryset = queryset.filter(user=user)
         elif getattr(user, 'role', None) == 'faculty':
+            # Faculty (class teacher) sees submissions from their assigned class
+            # AND falls back to department if no class assigned
             advised_classes = Class.objects.filter(class_teacher=user)
             dept_q = Q(user__department=user.department) if user.department else Q(pk__in=[])
             if advised_classes.exists() or user.department:

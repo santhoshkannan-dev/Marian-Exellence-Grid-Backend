@@ -4,7 +4,8 @@ from rest_framework import status
 from .models import (
     Department, Course, Class, User, AcademicYear,
     CriteriaCategory, CriteriaItem, CriteriaRule, CriteriaVersion,
-    Submission, AcademicGradeBreakdown, ClassIndexResult, SystemSetting
+    Submission, AcademicGradeBreakdown, ClassIndexResult, SystemSetting,
+    UserGroupModel
 )
 from .views import parse_student_email, allocate_student_from_email, calculate_submission_score
 
@@ -640,17 +641,17 @@ class APISecurityAndAuthorizationTest(TestCase):
             entry = results_by_size[size]
             m_val = entry['M']
             mod_val = entry['moderation_mark']
-            # Moderation mark must be within [0, 200]
+            # Moderation mark must be within [0, 100]
             self.assertGreaterEqual(mod_val, 0.0)
-            self.assertLessEqual(mod_val, 200.0)
+            self.assertLessEqual(mod_val, 100.0)
             # Index must be approximately 15.0 (between 15.0 and 17.0)
             self.assertGreaterEqual(m_val, 15.0)
             self.assertLessEqual(m_val, 17.0)
 
         # Confirm Class A (20) index is exactly 15.00
         self.assertAlmostEqual(results_by_size[20]['M'], 15.00, places=2)
-        # Confirm Class D (120) index is 16.67 (bounded gentle moderation boost, not 2000x)
-        self.assertAlmostEqual(results_by_size[120]['M'], 16.67, places=2)
+        # Confirm Class D (120) index is 15.83 (bounded gentle moderation boost with 100 cap)
+        self.assertAlmostEqual(results_by_size[120]['M'], 15.83, places=2)
 
     def test_academic_grade_breakdown_full_accounting(self):
         """Verify that all students must be accounted for and pass percentage is accurate."""
@@ -2731,21 +2732,21 @@ class Phase6ScoringEngineRegressionTest(TestCase):
         idx_b = calculate_class_index(tot_b, N=40)
         self.assertEqual(idx_b, 16.0000)
 
-        # Class C: N=80, n=20, S=1200, P=0
+        # Class C: N=80, n=20, S=1200, P=0 -> capped at 100.0 moderation (2*(80-20)=120 -> 100)
         mod_c = calculate_class_moderation(N=80, n=20)
-        self.assertEqual(mod_c, 120.0)
+        self.assertEqual(mod_c, 100.0)
         tot_c = calculate_total_score(net_score=calculate_net_score(1200, 0), moderation_mark=mod_c)
-        self.assertEqual(tot_c, 1320.0)
+        self.assertEqual(tot_c, 1300.0)
         idx_c = calculate_class_index(tot_c, N=80)
-        self.assertEqual(idx_c, 16.5000)
+        self.assertEqual(idx_c, 16.2500)
 
-        # Class D: N=120, n=20, S=1800, P=0 -> capped at 200.0 moderation
+        # Class D: N=120, n=20, S=1800, P=0 -> capped at 100.0 moderation
         mod_d = calculate_class_moderation(N=120, n=20)
-        self.assertEqual(mod_d, 200.0)  # Capped at 200
+        self.assertEqual(mod_d, 100.0)  # Capped at 100
         tot_d = calculate_total_score(net_score=calculate_net_score(1800, 0), moderation_mark=mod_d)
-        self.assertEqual(tot_d, 2000.0)
+        self.assertEqual(tot_d, 1900.0)
         idx_d = calculate_class_index(tot_d, N=120)
-        self.assertAlmostEqual(idx_d, 16.6667, places=3)
+        self.assertAlmostEqual(idx_d, 15.8333, places=3)
 
     # 2. Single Student Class (N=1)
     def test_class_with_single_student(self):
@@ -2927,15 +2928,15 @@ class Phase7RankingCorrectnessTest(TestCase):
         ranks = {r['class_name']: r['rank'] for r in ranked}
         indices = {r['class_name']: r['M'] for r in ranked}
 
-        # Larger cohorts receive slight coordination bonus (<= 1.67 index pts)
-        self.assertAlmostEqual(indices['Batch 120'], 16.6667, places=3)
-        self.assertEqual(indices['Batch 80'], 16.5000)
+        # Larger cohorts receive moderation bonus capped at 100
+        self.assertAlmostEqual(indices['Batch 120'], 15.8333, places=3)
+        self.assertEqual(indices['Batch 80'], 16.2500)
         self.assertEqual(indices['Batch 40'], 16.0000)
         self.assertEqual(indices['Batch 20'], 15.0000)
 
-        self.assertEqual(ranks['Batch 120'], 1)
-        self.assertEqual(ranks['Batch 80'], 2)
-        self.assertEqual(ranks['Batch 40'], 3)
+        self.assertEqual(ranks['Batch 80'], 1)
+        self.assertEqual(ranks['Batch 40'], 2)
+        self.assertEqual(ranks['Batch 120'], 3)
         self.assertEqual(ranks['Batch 20'], 4)
 
     # 2. Perfect scores
@@ -4090,11 +4091,11 @@ class Phase13ComprehensiveRegressionTest(TestCase):
         sub.refresh_from_db()
         self.assertEqual(sub.status, 'Teacher Verified')
 
-    def test_moderation_mark_bounded_at_200(self):
-        """Class size N=10000 still only receives 200.0 moderation marks max."""
+    def test_moderation_mark_bounded_at_100(self):
+        """Class size N=10000 still only receives 100.0 moderation marks max."""
         from users.scoring_engine import calculate_class_moderation
         mod = calculate_class_moderation(N=10000, n=20.0)
-        self.assertEqual(mod, 200.0)
+        self.assertEqual(mod, 100.0)
 
     def test_moderation_mark_is_zero_for_class_below_benchmark(self):
         """A class smaller than benchmark receives exactly 0.0 moderation (never negative)."""
@@ -4613,3 +4614,231 @@ class Phase14ProductionReadinessTest(TestCase):
             if not debug_mode and not cors_origins:
                 raise ImproperlyConfigured("CORS_ALLOWED_ORIGINS environment variable is required in production.")
 
+
+class StudentRepresentativeGroupWorkflowTests(TestCase):
+    """
+    Validates end-to-end Student Representative identification from UserGroupModel,
+    login responses (is_student_rep / isStudentRep), class scoping, and verification workflow.
+    """
+    def setUp(self):
+        from users.models import Department, Class, User, UserGroupModel, Submission, CriteriaItem, CriteriaCategory
+        self.dept = Department.objects.create(name='Computer Applications DQC Test', code='PGDCA_DQCT', email_prefix='p', level='PG')
+        self.cls = Class.objects.create(name='II MCA REGTEST', department=self.dept, num_students=30)
+        self.rep_user = User.objects.create_user(
+            username='santhosh.testrep@mariancollege.org',
+            email='santhosh.testrep@mariancollege.org',
+            role='student',
+            class_name=self.cls,
+            department=self.dept
+        )
+        self.peer_student = User.objects.create_user(
+            username='amal.testpeer@mariancollege.org',
+            email='amal.testpeer@mariancollege.org',
+            role='student',
+            class_name=self.cls,
+            department=self.dept
+        )
+        self.cat = CriteriaCategory.objects.create(code='cat-online-courses', category='Online Courses')
+        self.crit = CriteriaItem.objects.create(id=201, title='SWAYAM NPTEL', category=self.cat, type='fixed')
+
+        # Add to student rep user group
+        self.group = UserGroupModel.objects.create(
+            group_id='grp-student-reps',
+            name='Student Representatives',
+            members=['santhosh.testrep@mariancollege.org']
+        )
+        from users.views.system_views import sync_student_rep_group_members
+        sync_student_rep_group_members(self.group)
+
+    def test_student_rep_identified_by_user_service(self):
+        from users.services.user_service import UserService
+        self.assertTrue(UserService.is_user_student_rep(self.rep_user))
+        self.assertFalse(UserService.is_user_student_rep(self.peer_student))
+
+    def test_student_rep_flag_in_auth_profile(self):
+        client = APIClient()
+        client.force_authenticate(user=self.rep_user)
+        resp = client.get('/api/auth/profile/')
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.data.get('is_student_rep'))
+        self.assertTrue(resp.data.get('isStudentRep'))
+
+    def test_student_rep_can_view_and_verify_class_peer_submission(self):
+        from users.models import Submission
+        sub = Submission.objects.create(
+            user=self.peer_student,
+            criteria_id=201,
+            academic_year='2025-2026',
+            description='Online Course Evidence',
+            status='Submitted',
+            marks=5.0
+        )
+        client = APIClient()
+        client.force_authenticate(user=self.rep_user)
+        # Rep can view peer submission
+        resp = client.get(f'/api/submissions/{sub.id}/')
+        self.assertEqual(resp.status_code, 200)
+
+        # Rep can verify peer submission
+        put_resp = client.put(f'/api/submissions/{sub.id}/', {'status': 'Student Rep Verified'}, format='json')
+        self.assertEqual(put_resp.status_code, 200)
+        sub.refresh_from_db()
+        self.assertEqual(sub.status, 'Student Rep Verified')
+
+
+class PrizesGroupRestrictionTest(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.ay = AcademicYear.objects.create(year='2026-2027', is_active=True)
+        self.category = CriteriaCategory.objects.create(
+            code='cat-prizes',
+            category='Prizes'
+        )
+        self.item_marian = CriteriaItem.objects.create(
+            id=701,
+            category=self.category,
+            title='From Marian College',
+            marks=0,
+            type='count',
+            rules_json={
+                'subItems': {
+                    '1st Prize (Individual)': 10,
+                    '1st Prize (group)': 5
+                }
+            }
+        )
+        self.student = User.objects.create(
+            username='regular.student@mariancollege.org',
+            email='regular.student@mariancollege.org',
+            role='student'
+        )
+        self.student_rep = User.objects.create(
+            username='santhosh.25pmc152@mariancollege.org',
+            email='santhosh.25pmc152@mariancollege.org',
+            role='student'
+        )
+        UserGroupModel.objects.create(
+            group_id='grp-dqc-student-rep',
+            name='DQC Student Rep Group',
+            members=[self.student_rep.email]
+        )
+
+    def test_regular_student_can_submit_individual_prize(self):
+        self.client.force_authenticate(user=self.student)
+        res = self.client.post('/api/submissions/', {
+            'criteriaId': 701,
+            'academicYear': '2026-2027',
+            'description': 'Won 1st Prize Individual',
+            'status': 'Submitted',
+            'evidence': {
+                'subItem': '1st Prize (Individual)'
+            }
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+
+    def test_regular_student_blocked_from_submitting_group_prize(self):
+        self.client.force_authenticate(user=self.student)
+        res = self.client.post('/api/submissions/', {
+            'criteriaId': 701,
+            'academicYear': '2026-2027',
+            'description': 'Won 1st Prize Group',
+            'status': 'Submitted',
+            'evidence': {
+                'subItem': '1st Prize (Group)'
+            }
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertIn("Group prizes", res.data.get('error', ''))
+
+    def test_student_rep_allowed_to_submit_group_prize(self):
+        self.client.force_authenticate(user=self.student_rep)
+        res = self.client.post('/api/submissions/', {
+            'criteriaId': 701,
+            'academicYear': '2026-2027',
+            'description': 'Won 1st Prize Group',
+            'status': 'Submitted',
+            'evidence': {
+                'subItem': '1st Prize (Group)'
+            }
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+
+
+class StaffEmailRestrictionsTest(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.admin = User.objects.create(
+            username='admin@mariancollege.org',
+            email='admin@mariancollege.org',
+            role='admin'
+        )
+        self.client.force_authenticate(user=self.admin)
+        self.category = CriteriaCategory.objects.create(
+            code='cat-eval-staff-test',
+            category='Staff Test Cat',
+            evaluators=[]
+        )
+
+    def test_evaluator_staff_email_permitted(self):
+        """Staff email allen.george@mariancollege.org can be added as evaluator."""
+        res = self.client.post('/api/evaluators/', {
+            'email': 'allen.george@mariancollege.org',
+            'name': 'Allen George',
+            'assigned_categories': ['cat-eval-staff-test']
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(res.data['email'], 'allen.george@mariancollege.org')
+
+    def test_evaluator_student_email_rejected(self):
+        """Student email amal.25pmc114@mariancollege.org is rejected in Evaluator Management."""
+        res = self.client.post('/api/evaluators/', {
+            'email': 'amal.25pmc114@mariancollege.org',
+            'name': 'Amal Student',
+            'assigned_categories': ['cat-eval-staff-test']
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("Evaluators must use staff email address", res.data.get('error', ''))
+
+    def test_class_teachers_council_staff_email_permitted(self):
+        """Staff email kochumol.abraham@mariancollege.org can be added to Class Teachers Council."""
+        res = self.client.post('/api/user-groups/', {
+            'id': 'grp-class-teachers',
+            'name': 'Class Teachers Council',
+            'description': 'Faculty advisors',
+            'members': ['kochumol.abraham@mariancollege.org']
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertIn('kochumol.abraham@mariancollege.org', res.data['members'])
+
+    def test_class_teachers_council_student_email_rejected(self):
+        """Student email amal.25pmc114@mariancollege.org is rejected for Class Teachers Council."""
+        res = self.client.post('/api/user-groups/', {
+            'id': 'grp-class-teachers',
+            'name': 'Class Teachers Council',
+            'description': 'Faculty advisors',
+            'members': ['amal.25pmc114@mariancollege.org']
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("Class Teachers Council only permits staff emails", res.data.get('error', ''))
+
+    def test_dqc_student_rep_group_student_email_permitted(self):
+        """Student email amal.25pmc114@mariancollege.org can be added to DQC Student Rep Group."""
+        res = self.client.post('/api/user-groups/', {
+            'id': 'grp-dqc-student-rep',
+            'name': 'DQC Student Rep Group',
+            'description': 'DQC representatives',
+            'members': ['amal.25pmc114@mariancollege.org']
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertIn('amal.25pmc114@mariancollege.org', res.data['members'])
+
+    def test_dqc_student_rep_group_staff_email_rejected(self):
+        """Staff email allen.george@mariancollege.org is rejected for DQC Student Rep Group."""
+        res = self.client.post('/api/user-groups/', {
+            'id': 'grp-dqc-student-rep',
+            'name': 'DQC Student Rep Group',
+            'description': 'DQC representatives',
+            'members': ['allen.george@mariancollege.org']
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("DQC Student Rep Group only permits student emails", res.data.get('error', ''))
