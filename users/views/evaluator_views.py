@@ -14,6 +14,9 @@ class EvaluatorManagementView(APIView):
     permission_classes = [IsAdminRole]
 
     def get(self, request):
+        from users.models import UserGroupModel
+        from django.db.models import Q
+
         categories = list(CriteriaCategory.objects.all())
         all_evaluator_emails = set()
         for cat in categories:
@@ -26,6 +29,17 @@ class EvaluatorManagementView(APIView):
         for u in eval_users:
             if u.email:
                 all_evaluator_emails.add(u.email.strip().lower())
+
+        # Also pull evaluators from all evaluator UserGroups
+        eval_groups = UserGroupModel.objects.filter(
+            Q(group_id='grp-evaluators') | Q(group_id='grp-evaluation-committee') |
+            Q(group_id__icontains='evaluat') | Q(name__icontains='evaluat')
+        )
+        for g in eval_groups:
+            if g.members and isinstance(g.members, list):
+                for e in g.members:
+                    if isinstance(e, str) and e.strip():
+                        all_evaluator_emails.add(e.strip().lower())
 
         user_map = {u.email.lower(): u for u in User.objects.filter(email__in=all_evaluator_emails).select_related('department')}
 
@@ -53,6 +67,7 @@ class EvaluatorManagementView(APIView):
         return Response(result, status=status.HTTP_200_OK)
 
     def post(self, request):
+        from users.models import UserGroupModel
         email = request.data.get('email', '')
         if not email or not isinstance(email, str):
             return Response({"error": "Email is required."}, status=status.HTTP_400_BAD_REQUEST)
@@ -89,12 +104,23 @@ class EvaluatorManagementView(APIView):
         )
 
         if not created:
-            user.role = 'evaluation'
+            if user.role not in ('admin', 'iqac', 'faculty'):
+                user.role = 'evaluation'
             user.is_active = True
             if name:
                 user.first_name = first_name
                 user.last_name = last_name
             user.save()
+
+        # Sync with UserGroupModel
+        for gid in ('grp-evaluators', 'grp-evaluation-committee'):
+            g = UserGroupModel.objects.filter(group_id=gid).first()
+            if g:
+                cur_members = list(g.members or [])
+                if email not in [m.lower() for m in cur_members if isinstance(m, str)]:
+                    cur_members.append(email)
+                    g.members = cur_members
+                    g.save(update_fields=['members'])
 
         categories = CriteriaCategory.objects.all()
         assigned_codes = []
@@ -198,6 +224,16 @@ class EvaluatorDetailView(APIView):
                 if email in current_evaluators:
                     cat.evaluators = [e for e in current_evaluators if e != email]
                     cat.save(update_fields=['evaluators'])
+
+        # Remove from UserGroupModel evaluator groups
+        from users.models import UserGroupModel
+        for gid in ('grp-evaluators', 'grp-evaluation-committee'):
+            g = UserGroupModel.objects.filter(group_id=gid).first()
+            if g and g.members:
+                cur_members = [m for m in g.members if isinstance(m, str) and m.lower() != email]
+                if len(cur_members) != len(g.members):
+                    g.members = cur_members
+                    g.save(update_fields=['members'])
 
         # Delete user if role is evaluation/evaluator
         try:

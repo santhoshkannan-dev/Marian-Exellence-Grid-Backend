@@ -228,14 +228,8 @@ class SubmissionListView(APIView):
                     cat_name = (criteria_item_check.category.category or '').lower() if criteria_item_check.category else ''
                     cat_code = (criteria_item_check.category.code or '').lower() if criteria_item_check.category else ''
 
-                    is_prize_category = ('prize' in cat_name or 'prize' in cat_code or cat_code == 'cat-prizes' or str(criteria_item_check.category_id) in ('701', 'cat-prizes'))
-                    is_evaluation_category = not is_prize_category and (
-                        'academic' in cat_name or 'academic' in cat_code or
-                        'documentation' in cat_name or 'documentation' in cat_code or
-                        'programs organized' in cat_name or 'programs organized' in cat_code or
-                        cat_code in ('cat-academics', 'cat-documentation', 'cat-programs-organized')
-                    )
-                    if is_evaluation_category and not is_dqc:
+                    cat_access = getattr(criteria_item_check.category, 'access_level', '') or ''
+                    if cat_access in ('student_rep_only', 'dqc_only') and not is_dqc:
                         return Response(
                             {"error": "Access Denied: Only students present in the DQC Student Rep Group can upload to this evaluation category."},
                             status=status.HTTP_403_FORBIDDEN
@@ -520,14 +514,8 @@ class SubmissionDetailView(APIView):
                         cat_name = (target_item.category.category or '').lower() if target_item.category else ''
                         cat_code = (target_item.category.code or '').lower() if target_item.category else ''
 
-                        is_prize_category = ('prize' in cat_name or 'prize' in cat_code or cat_code == 'cat-prizes' or str(target_item.category_id) in ('701', 'cat-prizes'))
-                        is_evaluation_category = not is_prize_category and (
-                            'academic' in cat_name or 'academic' in cat_code or
-                            'documentation' in cat_name or 'documentation' in cat_code or
-                            'programs organized' in cat_name or 'programs organized' in cat_code or
-                            cat_code in ('cat-academics', 'cat-documentation', 'cat-programs-organized')
-                        )
-                        if is_evaluation_category and not is_dqc:
+                        cat_access = getattr(target_item.category, 'access_level', '') or ''
+                        if cat_access in ('student_rep_only', 'dqc_only') and not is_dqc:
                             return Response(
                                 {"error": "Access Denied: Only students present in the DQC Student Rep Group can upload to this evaluation category."},
                                 status=status.HTTP_403_FORBIDDEN
@@ -554,7 +542,23 @@ class SubmissionDetailView(APIView):
 
             elif is_rep:
                 rep_classes = UserService.get_student_rep_classes(user)
-                if not (submission.user and submission.user.class_name in rep_classes):
+                sub_user = submission.user
+                if sub_user and not sub_user.class_name:
+                    UserService.allocate_student_from_email(sub_user)
+
+                is_rep_for_submission = False
+                if sub_user and sub_user.class_name:
+                    if sub_user.class_name in rep_classes or any(c.id == sub_user.class_name_id for c in rep_classes):
+                        is_rep_for_submission = True
+                elif sub_user and sub_user.email:
+                    parsed_sub = UserService.parse_student_email(sub_user.email)
+                    if parsed_sub and parsed_sub.get('class_name'):
+                        for c in rep_classes:
+                            if c.name and c.name.strip().lower() == parsed_sub['class_name'].strip().lower():
+                                is_rep_for_submission = True
+                                break
+
+                if not is_rep_for_submission:
                     return Response(
                         {"error": "Student representative is not assigned to this student's class."},
                         status=status.HTTP_403_FORBIDDEN

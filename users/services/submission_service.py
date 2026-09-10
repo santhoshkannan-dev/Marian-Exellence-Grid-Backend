@@ -99,24 +99,20 @@ class SubmissionService:
 
         if getattr(user, 'role', None) == 'student':
             if UserService.is_user_student_rep(user):
-                # Build the set of classes this rep is authorized to see
-                # 1. Direct dqc_member FK on class
-                rep_class_q = Q(dqc_member=user) | Q(dqc_member__email__iexact=user.email)
+                rep_classes = UserService.get_student_rep_classes(user)
 
-                # 2. Rep's own class (they are a student in it)
-                if getattr(user, 'class_name', None):
-                    rep_class_q |= Q(id=user.class_name_id)
+                peer_q = Q(user__class_name__in=rep_classes)
+                for rc in rep_classes:
+                    if rc.name:
+                        peer_q |= Q(user__class_name__name__iexact=rc.name)
 
-                # 3. Parse class from email structure
                 user_email = (user.email or '').strip().lower()
-                parsed = UserService.parse_student_email(user_email)
-                if parsed and parsed.get('class_name'):
-                    rep_class_q |= Q(name__iexact=parsed['class_name'])
+                rep_parsed = UserService.parse_email_code(user_email)
+                if rep_parsed:
+                    code_str = f"{str(rep_parsed['batch_year'])[-2:]}{rep_parsed['level_char']}{rep_parsed['email_code']}"
+                    peer_q |= Q(user__email__icontains=f".{code_str}")
 
-                rep_classes = Class.objects.filter(rep_class_q).distinct()
-
-                # Submissions: own submissions OR submissions from students in those classes
-                queryset = queryset.filter(Q(user=user) | Q(user__class_name__in=rep_classes))
+                queryset = queryset.filter(Q(user=user) | peer_q)
             else:
                 queryset = queryset.filter(user=user)
         elif getattr(user, 'role', None) == 'faculty':
@@ -136,6 +132,7 @@ class SubmissionService:
 
     @staticmethod
     def serialize_submission_for_user(s, user):
+        from users.services.user_service import UserService
         is_staff_or_eval = bool(
             user and getattr(user, 'is_authenticated', False) and (
                 getattr(user, 'role', '') in ('admin', 'iqac', 'faculty', 'evaluation') or
@@ -146,14 +143,32 @@ class SubmissionService:
         is_owner = bool(user and getattr(user, 'is_authenticated', False) and s.user_id == user.id)
         can_see_eval_remarks = is_owner or is_staff_or_eval
 
+        resolved_class_name = None
+        if s.user:
+            if s.user.class_name:
+                resolved_class_name = s.user.class_name.name
+            elif s.user.email:
+                parsed = UserService.parse_student_email(s.user.email)
+                if parsed and parsed.get('class_name'):
+                    resolved_class_name = parsed.get('class_name')
+
+        user_display_name = None
+        if s.user:
+            if hasattr(s.user, 'name') and s.user.name:
+                user_display_name = s.user.name
+            elif s.user.first_name or s.user.last_name:
+                user_display_name = f"{s.user.first_name} {s.user.last_name}".strip()
+            elif s.user.email:
+                user_display_name = UserService.parse_name_from_email(s.user.email)
+
         return {
             "id": s.id,
             "studentId": s.user.id if s.user else 1,
             "user_email": s.user.email if s.user else None,
             "userEmail": s.user.email if s.user else None,
-            "user_name": s.user.name if s.user and hasattr(s.user, 'name') else s.user.email if s.user else None,
-            "className": s.user.class_name.name if s.user and s.user.class_name else None,
-            "class_name": s.user.class_name.name if s.user and s.user.class_name else None,
+            "user_name": user_display_name,
+            "className": resolved_class_name,
+            "class_name": resolved_class_name,
             "criteriaId": s.criteria_id,
             "academicYear": s.academic_year,
             "description": s.description,

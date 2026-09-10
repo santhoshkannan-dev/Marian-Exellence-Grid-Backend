@@ -353,7 +353,7 @@ class UserService:
         if not user or not getattr(user, 'is_authenticated', False):
             return False
         user_email = (getattr(user, 'email', '') or '').strip().lower()
-        if not user_email or not UserService.is_student_email(user_email):
+        if not user_email:
             return False
 
         dqc_groups = UserGroupModel.objects.filter(
@@ -373,26 +373,28 @@ class UserService:
         if not user or not getattr(user, 'is_authenticated', False):
             return False
         user_email = (getattr(user, 'email', '') or '').strip().lower()
-        if not user_email or not UserService.is_student_email(user_email):
+        if not user_email:
             return False
-
-        if UserService.is_user_dqc_rep(user):
-            return True
 
         if getattr(user, 'is_student_rep', False) or getattr(user, 'is_dqc_member', False):
             return True
         if Class.objects.filter(dqc_member=user).exists():
             return True
-        if user_email:
-            if Class.objects.filter(dqc_member__email__iexact=user_email).exists():
+        if Class.objects.filter(dqc_member__email__iexact=user_email).exists():
+            return True
+
+        rep_groups = UserGroupModel.objects.filter(
+            Q(group_id__in=['grp-student-reps', 'grp-dqc-student-rep']) |
+            Q(group_id__icontains='rep') | Q(group_id__icontains='dqc') |
+            Q(name__icontains='student rep') | Q(name__icontains='representative') | Q(name__icontains='dqc')
+        )
+        for rg in rep_groups:
+            if rg.members and any(isinstance(e, str) and e.strip().lower() == user_email for e in rg.members):
                 return True
-            rep_groups = UserGroupModel.objects.filter(
-                Q(group_id='grp-student-reps') | Q(group_id__icontains='rep') | Q(group_id__icontains='dqc') |
-                Q(name__icontains='student rep') | Q(name__icontains='representative') | Q(name__icontains='dqc')
-            )
-            for rg in rep_groups:
-                if rg.members and any(isinstance(e, str) and e.strip().lower() == user_email for e in rg.members):
-                    return True
+
+        if UserService.is_user_dqc_rep(user):
+            return True
+
         return False
 
     @staticmethod
@@ -417,7 +419,12 @@ class UserService:
             if parsed and parsed.get('class_name'):
                 q |= Q(name__iexact=parsed['class_name'])
 
-        return Class.objects.filter(q).distinct()
+        classes = Class.objects.filter(q).distinct()
+        if not classes.exists() and user_email:
+            UserService.allocate_student_from_email(user)
+            if getattr(user, 'class_name', None):
+                classes = Class.objects.filter(id=user.class_name_id)
+        return classes
 
 
 # Standalone alias exports for backward-compatibility
