@@ -335,7 +335,6 @@ class CriteriaItem(models.Model):
     category = models.ForeignKey(CriteriaCategory, on_delete=models.CASCADE, related_name='items')
     version = models.ForeignKey(CriteriaVersion, on_delete=models.SET_NULL, null=True, blank=True, related_name='items')
     title = models.CharField(max_length=255)
-    access_level = models.CharField(max_length=20, default='all_students')
     type = models.CharField(max_length=20) # 'count', 'fixed', 'range', 'negative', 'academic_grades', 'date'
     marks = models.FloatField(default=0.0)
     rules_json = models.JSONField(blank=True, null=True) # Deprecated flexible metadata

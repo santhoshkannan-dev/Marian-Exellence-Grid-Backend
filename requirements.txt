@@ -6,4 +6,3 @@ google-auth
 requests
 psycopg2-binary
 gunicorn>=21.2.0
-Pillow

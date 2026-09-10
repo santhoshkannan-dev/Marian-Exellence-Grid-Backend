@@ -81,35 +81,15 @@ def is_user_student_rep_for_class(user: User, class_obj: Optional[Class]) -> boo
         return False
     if getattr(user, 'role', '') != 'student':
         return False
-
-    from .services.user_service import UserService
-    if not UserService.is_user_student_rep(user):
-        return False
-
     if not class_obj:
-        return True
+        return getattr(user, 'is_student_rep', False) or getattr(user, 'is_dqc_member', False)
 
-    # 1. Direct DQC assignment on the class (primary, most authoritative)
+    # 1. Direct DQC assignment on the class
     if class_obj.dqc_member_id == user.id:
         return True
-    # 2. Flag on user matching class or user's assigned class
-    if user.class_name_id and user.class_name_id == class_obj.id:
+    # 2. Flag on user matching class
+    if (getattr(user, 'is_student_rep', False) or getattr(user, 'is_dqc_member', False)) and user.class_name_id == class_obj.id:
         return True
-    # 3. User's class_name matches the submission class (student rep in their own class)
-    if user.class_name_id and user.class_name_id == class_obj.id:
-        from users.models import UserGroupModel
-        from django.db.models import Q
-        user_email_lower = (user.email or '').strip().lower()
-        dqc_groups = UserGroupModel.objects.filter(
-            Q(group_id='grp-dqc-student-rep') |
-            Q(group_id__icontains='dqc') |
-            Q(name__icontains='dqc') |
-            Q(group_id='grp-student-reps') |
-            Q(name__icontains='student rep')
-        )
-        for grp in dqc_groups:
-            if grp.members and any(isinstance(m, str) and m.strip().lower() == user_email_lower for m in grp.members):
-                return True
     return False
 
 

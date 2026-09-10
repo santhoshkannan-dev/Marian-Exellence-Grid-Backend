@@ -215,50 +215,6 @@ class SubmissionListView(APIView):
         except (ValueError, TypeError):
             pass
 
-        # Enforce category & item access restrictions for students:
-        # Only students present in DQC Student Rep Group can upload/access:
-        # - Evaluation-level categories (Academics, Documentation, Programs Organized)
-        # - Items with access_level == 'student_rep_only'
-        # - Group prizes (1st Prize, 2nd Prize, 3rd Prize, Participation Group)
-        try:
-            if getattr(user, 'role', None) == 'student':
-                is_dqc = UserService.is_user_dqc_rep(user)
-                criteria_item_check = CriteriaItem.objects.select_related('category').filter(pk=criteria_id).first()
-                if criteria_item_check:
-                    cat_name = (criteria_item_check.category.category or '').lower() if criteria_item_check.category else ''
-                    cat_code = (criteria_item_check.category.code or '').lower() if criteria_item_check.category else ''
-
-                    is_prize_category = ('prize' in cat_name or 'prize' in cat_code or cat_code == 'cat-prizes' or str(criteria_item_check.category_id) in ('701', 'cat-prizes'))
-                    is_evaluation_category = not is_prize_category and (
-                        'academic' in cat_name or 'academic' in cat_code or
-                        'documentation' in cat_name or 'documentation' in cat_code or
-                        'programs organized' in cat_name or 'programs organized' in cat_code or
-                        cat_code in ('cat-academics', 'cat-documentation', 'cat-programs-organized')
-                    )
-                    if is_evaluation_category and not is_dqc:
-                        return Response(
-                            {"error": "Access Denied: Only students present in the DQC Student Rep Group can upload to this evaluation category."},
-                            status=status.HTTP_403_FORBIDDEN
-                        )
-
-
-                    if getattr(criteria_item_check, 'access_level', '') == 'student_rep_only' and not is_dqc:
-                        return Response(
-                            {"error": "Access Denied: Only students present in the DQC Student Rep Group can submit this activity item."},
-                            status=status.HTTP_403_FORBIDDEN
-                        )
-
-                    if 'prize' in cat_name or 'prize' in cat_code or str(criteria_item_check.category_id) in ('701', 'cat-prizes') or criteria_item_check.id == 701:
-                        ev = evidence if isinstance(evidence, dict) else {}
-                        sub_item_val = str(ev.get('subItem') or ev.get('prizesSubItem') or '').lower()
-                        if 'group' in sub_item_val and not is_dqc:
-                            return Response(
-                                {"error": "Group prizes (1st, 2nd, 3rd Prize & Participation Group) can only be submitted by students present in the DQC Student Rep Group."},
-                                status=status.HTTP_403_FORBIDDEN
-                            )
-        except Exception:
-            pass
-
         # Academic Grade Breakdown Validation & Auto-Calculation
         if isinstance(evidence, dict) and "grades" in evidence:
             grades_data = evidence.get("grades") or {}
@@ -452,11 +408,9 @@ class SubmissionDetailView(APIView):
             if submission.user_id != user.id:
                 if not is_user_student_rep(user):
                     return Response({"error": "You do not have permission to view this submission."}, status=status.HTTP_403_FORBIDDEN)
-                rep_classes = list(Class.objects.filter(
+                rep_classes = Class.objects.filter(
                     Q(dqc_member=user) | Q(dqc_member__email__iexact=user.email)
-                ))
-                if user.class_name and user.class_name not in rep_classes:
-                    rep_classes.append(user.class_name)
+                )
                 if not (submission.user and submission.user.class_name in rep_classes):
                     return Response({"error": "You do not have permission to view this submission."}, status=status.HTTP_403_FORBIDDEN)
         else:
@@ -510,50 +464,10 @@ class SubmissionDetailView(APIView):
                         {"error": "Unauthorized: Students cannot assign evaluation marks."},
                         status=status.HTTP_403_FORBIDDEN
                     )
-
-                # Enforce category & item access restrictions for students modifying submissions
-                try:
-                    is_dqc = UserService.is_user_dqc_rep(user)
-                    target_item_id = request.data.get('criteriaId') or submission.criteria_id
-                    target_item = CriteriaItem.objects.select_related('category').filter(pk=target_item_id).first()
-                    if target_item:
-                        cat_name = (target_item.category.category or '').lower() if target_item.category else ''
-                        cat_code = (target_item.category.code or '').lower() if target_item.category else ''
-
-                        is_prize_category = ('prize' in cat_name or 'prize' in cat_code or cat_code == 'cat-prizes' or str(target_item.category_id) in ('701', 'cat-prizes'))
-                        is_evaluation_category = not is_prize_category and (
-                            'academic' in cat_name or 'academic' in cat_code or
-                            'documentation' in cat_name or 'documentation' in cat_code or
-                            'programs organized' in cat_name or 'programs organized' in cat_code or
-                            cat_code in ('cat-academics', 'cat-documentation', 'cat-programs-organized')
-                        )
-                        if is_evaluation_category and not is_dqc:
-                            return Response(
-                                {"error": "Access Denied: Only students present in the DQC Student Rep Group can upload to this evaluation category."},
-                                status=status.HTTP_403_FORBIDDEN
-                            )
-
-
-                        if getattr(target_item, 'access_level', '') == 'student_rep_only' and not is_dqc:
-                            return Response(
-                                {"error": "Access Denied: Only students present in the DQC Student Rep Group can submit this activity item."},
-                                status=status.HTTP_403_FORBIDDEN
-                            )
-
-                        if 'prize' in cat_name or 'prize' in cat_code or str(target_item.category_id) in ('701', 'cat-prizes') or target_item.id == 701:
-                            new_evidence = request.data.get('evidence')
-                            if isinstance(new_evidence, dict) and not is_dqc:
-                                sub_item_val = str(new_evidence.get('subItem') or new_evidence.get('prizesSubItem') or '').lower()
-                                if 'group' in sub_item_val:
-                                    return Response(
-                                        {"error": "Group prizes (1st, 2nd, 3rd Prize & Participation Group) can only be submitted by students present in the DQC Student Rep Group."},
-                                        status=status.HTTP_403_FORBIDDEN
-                                    )
-                except Exception:
-                    pass
-
             elif is_rep:
-                rep_classes = UserService.get_student_rep_classes(user)
+                rep_classes = Class.objects.filter(
+                    Q(dqc_member=user) | Q(dqc_member__email__iexact=user.email)
+                )
                 if not (submission.user and submission.user.class_name in rep_classes):
                     return Response(
                         {"error": "Student representative is not assigned to this student's class."},
