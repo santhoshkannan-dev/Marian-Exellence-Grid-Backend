@@ -13,7 +13,6 @@ USER_ROLE_CHOICES = [
     ("student", "Student"),
     ("faculty", "Faculty"),
     ("evaluation", "Evaluation Team"),
-    ("iqac", "IQAC"),
     ("admin", "Admin"),
 ]
 
@@ -175,7 +174,6 @@ class User(AbstractUser):
         ("student", "Student"),
         ("faculty", "Faculty"),
         ("evaluation", "Evaluation Team"),
-        ("iqac", "IQAC"),
         ("admin", "Admin"),
     ]
 
@@ -205,7 +203,7 @@ class User(AbstractUser):
     class Meta:
         constraints = [
             models.CheckConstraint(
-                condition=models.Q(role__in=['student', 'faculty', 'evaluation', 'iqac', 'admin']),
+                condition=models.Q(role__in=['student', 'faculty', 'evaluation', 'admin']),
                 name='check_user_role_valid'
             ),
             models.CheckConstraint(

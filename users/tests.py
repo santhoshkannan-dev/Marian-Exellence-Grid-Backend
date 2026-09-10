@@ -926,9 +926,9 @@ class Phase1SecurityRemediationRegressionTest(TestCase):
             is_staff=True
         )
         self.iqac_user = User.objects.create(
-            username='iqac@mariancollege.org',
-            email='iqac@mariancollege.org',
-            role='iqac',
+            username='inst_admin@mariancollege.org',
+            email='inst_admin@mariancollege.org',
+            role='admin',
             is_staff=True
         )
         self.admin = User.objects.create(
@@ -1361,11 +1361,11 @@ class Phase2AuthorizationHardeningRegressionTest(TestCase):
         )
 
         self.iqac_user = User.objects.create(
-            username='iqac.officer@mariancollege.org',
-            email='iqac.officer@mariancollege.org',
-            role='iqac',
-            first_name='IQAC',
-            last_name='Officer'
+            username='mod.admin@mariancollege.org',
+            email='mod.admin@mariancollege.org',
+            role='admin',
+            first_name='Moderator',
+            last_name='Admin'
         )
         self.admin = User.objects.create(
             username='admin.inst@mariancollege.org',
@@ -2691,8 +2691,8 @@ class Phase6ScoringEngineRegressionTest(TestCase):
             password='TestPassword@123', role='admin', is_staff=True, is_superuser=True
         )
         self.iqac = User.objects.create_user(
-            email='iqac.scoring@mariancollege.org', username='iqac_scoring',
-            password='TestPassword@123', role='iqac', is_staff=True
+            email='admin2.scoring@mariancollege.org', username='admin2_scoring',
+            password='TestPassword@123', role='admin', is_staff=True
         )
 
         # Criteria categories
@@ -3773,10 +3773,10 @@ class Phase13ComprehensiveRegressionTest(TestCase):
             first_name='Phase13', last_name='Evaluator', is_staff=True
         )
         self.iqac = User.objects.create_user(
-            username='p13.iqac@marian.edu',
-            email='p13.iqac@marian.edu',
-            password=None, role='iqac',
-            first_name='Phase13', last_name='IQAC', is_staff=True
+            username='p13.admin2@marian.edu',
+            email='p13.admin2@marian.edu',
+            password=None, role='admin',
+            first_name='Phase13', last_name='Admin2', is_staff=True
         )
         self.admin = User.objects.create_user(
             username='p13.admin@marian.edu',

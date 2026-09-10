@@ -62,7 +62,9 @@ class GoogleLoginView(APIView):
 
             email = id_info.get("email")
             google_id = id_info.get("sub")
-            full_name = id_info.get("name", "")
+            full_name = id_info.get("name", "").strip()
+            given_name = id_info.get("given_name", "").strip()
+            family_name = id_info.get("family_name", "").strip()
             picture = id_info.get("picture")
 
             if not email:
@@ -78,6 +80,11 @@ class GoogleLoginView(APIView):
                     status=status.HTTP_403_FORBIDDEN
                 )
 
+            if not full_name and (given_name or family_name):
+                full_name = f"{given_name} {family_name}".strip()
+            if not full_name:
+                full_name = parse_name_from_email(email)
+
             detected_role = determine_role_from_email(email)
 
             try:
@@ -88,14 +95,27 @@ class GoogleLoginView(APIView):
                         status=status.HTTP_403_FORBIDDEN
                     )
             except User.DoesNotExist:
+                names = full_name.split(" ", 1) if full_name else [email.split("@")[0], ""]
+                first_n = names[0]
+                last_n = names[1] if len(names) > 1 else ""
+
                 if detected_role == 'student':
-                    names = full_name.split(" ", 1) if full_name else [email.split("@")[0], ""]
                     user = User.objects.create(
                         username=email,
                         email=email,
-                        first_name=names[0],
-                        last_name=names[1] if len(names) > 1 else "",
+                        first_name=first_n,
+                        last_name=last_n,
                         role='student',
+                        google_id=google_id
+                    )
+                elif detected_role == 'faculty':
+                    user = User.objects.create(
+                        username=email,
+                        email=email,
+                        first_name=first_n,
+                        last_name=last_n,
+                        role='faculty',
+                        is_staff=True,
                         google_id=google_id
                     )
                 else:
@@ -222,7 +242,7 @@ class DevBypassLoginView(APIView):
                 )
 
             if override_role and override_role != user.role:
-                if override_role in ('admin', 'iqac', 'faculty', 'evaluation'):
+                if override_role in ('admin', 'faculty', 'evaluation'):
                     return Response(
                         {"error": "Selecting an arbitrary privileged role via development bypass is strictly prohibited."},
                         status=status.HTTP_403_FORBIDDEN

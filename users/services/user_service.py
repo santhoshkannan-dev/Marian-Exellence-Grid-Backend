@@ -20,23 +20,46 @@ class UserService:
             "access": str(refresh.access_token),
         }
 
+    DEPARTMENT_COURSE_MAP = {
+        'ce': {'course': 'BACE', 'department': 'Department of English / Languages', 'dept_code': 'ENG', 'level': 'UG', 'multi_batch': False, 'duration': 3, 'display_course': 'BACE'},
+        'bm': {'course': 'B.Com', 'department': 'School of Commerce and Professional Studies', 'dept_code': 'SCPS', 'level': 'UG', 'multi_batch': True, 'duration': 3, 'display_course': 'BCOM'},
+        'mm': {'course': 'M.Com', 'department': 'School of Commerce and Professional Studies', 'dept_code': 'SCPS', 'level': 'PG', 'multi_batch': True, 'duration': 2, 'display_course': 'MCOM'},
+        'bf': {'course': 'B.Com FinTech', 'department': 'School of Commerce and Professional Studies', 'dept_code': 'SCPS', 'level': 'UG', 'multi_batch': False, 'duration': 3, 'display_course': 'BCOM (FINTECH)'},
+        'bb': {'course': 'BBA', 'department': 'UG Department of Business Administration', 'dept_code': 'UGBBA', 'level': 'UG', 'multi_batch': True, 'duration': 3, 'display_course': 'BBA'},
+        'bc': {'course': 'BCA', 'department': 'UG Department of Computer Applications', 'dept_code': 'UGDCA', 'level': 'UG', 'multi_batch': True, 'duration': 3, 'display_course': 'BCA'},
+        'sw': {'course': 'BSW', 'department': 'School of Social Work', 'dept_code': 'SSW', 'level': 'UG', 'multi_batch': True, 'duration': 3, 'display_course': 'BSW'},
+        'psw': {'course': 'MSW', 'department': 'School of Social Work', 'dept_code': 'SSW', 'level': 'PG', 'multi_batch': False, 'duration': 2, 'display_course': 'MSW'},
+        'ma': {'course': 'B.Sc Mathematics', 'department': 'Department of Mathematics', 'dept_code': 'MATHS', 'level': 'UG', 'multi_batch': False, 'duration': 3, 'display_course': 'MATHS'},
+        'cm': {'course': 'MCMS', 'department': 'Department of Communication and Media Studies', 'dept_code': 'MCMS', 'level': 'PG', 'multi_batch': False, 'duration': 2, 'display_course': 'MCMS'},
+        'ht': {'course': 'MHTM', 'department': 'Department of Hospitality and Tourism Management', 'dept_code': 'MHTM', 'level': 'PG', 'multi_batch': False, 'duration': 2, 'display_course': 'MHTM'},
+        'ph': {'course': 'M.Sc Integrated Physics', 'department': 'Department of Physics', 'dept_code': 'PHYSICS', 'level': 'Integrated', 'multi_batch': False, 'duration': 5, 'display_course': 'MSC PHYSICS'},
+        'ec': {'course': 'BA Economics', 'department': 'Department of Economics', 'dept_code': 'ECONOMICS', 'level': 'UG', 'multi_batch': False, 'duration': 3, 'display_course': 'ECONOMICS'},
+        'py': {'course': 'B.Sc Psychology', 'department': 'Department of Psychology', 'dept_code': 'PSYCHOLOGY', 'level': 'UG', 'multi_batch': False, 'duration': 3, 'display_course': 'PSYCHOLOGY'},
+        'ba': {'course': 'MBA', 'department': 'Masters of Business Administration', 'dept_code': 'MBA', 'level': 'PG', 'multi_batch': True, 'duration': 2, 'display_course': 'MBA'},
+        'mc': {'course': 'MCA', 'department': 'PG Department of Computer Applications', 'dept_code': 'PGDCA', 'level': 'PG', 'multi_batch': False, 'duration': 2, 'display_course': 'MCA'},
+    }
+
+    SECTION_MAP = {'1': 'A', '2': 'B', '3': 'C'}
+    ROMAN_YEARS = {1: 'I', 2: 'II', 3: 'III', 4: 'IV', 5: 'V', 6: 'VI'}
+
     @staticmethod
     def parse_name_from_email(email):
         """
-        Dynamically derives user name from email local part for any email.
-        e.g. amal.thomas.25pmc114@mariancollege.org -> 'Amal Thomas'
-        e.g. kochumol.abraham@mariancollege.org -> 'Kochumol Abraham'
-        e.g. amal.25pmc114@mariancollege.org -> 'Amal'
+        Derives user name from email local part.
+        Staff: kochumol.abraham@mariancollege.org -> 'Kochumol Abraham'
+        Student: santhosh.25pmc152@mariancollege.org -> 'Santhosh'
+                 amal.thomas.25pmc114@mariancollege.org -> 'Amal Thomas'
         """
         if not email or '@' not in email:
             return "User"
-        local_part = email.split('@')[0]
+        local_part = email.strip().split('@')[0]
         parts = local_part.split('.')
         name_parts = []
         for part in parts:
             if any(char.isdigit() for char in part):
                 break
-            name_parts.append(part.capitalize())
+            if part:
+                name_parts.append(part.capitalize())
         if name_parts:
             return " ".join(name_parts)
         return parts[0].capitalize()
@@ -44,49 +67,52 @@ class UserService:
     @staticmethod
     def parse_email_code(email):
         """
-        Parses the raw code segment from a Marian College student email.
-        Returns dict with level_char, email_code, batch_year, roll_digits, roll_number, section_hint
-        e.g. amal.25pmc114@mariancollege.org ->
-             level_char='p', email_code='mc', batch_year=2025, roll_digits='114', roll_number=14
+        Parses the code segment from Marian student email:
+        Formula: [name].YYLCCDXX@mariancollege.org
+        e.g. santhosh.25pmc152@mariancollege.org ->
+             batch_year=2025, level_char='p', email_code='mc', section_digit='1', roll_number=52
         """
         if not email or '@' not in email:
             return None
-        local_part = email.split('@')[0]
+        email_clean = email.strip().lower()
+        domain = email_clean.split('@')[1] if '@' in email_clean else ''
+        if domain != 'mariancollege.org':
+            return None
+        local_part = email_clean.split('@')[0]
         parts = local_part.split('.')
         if len(parts) < 2:
             return None
 
-        # The code segment is the last part that starts with digits
-        code_part = None
-        for p in reversed(parts):
-            if len(p) >= 5 and p[:2].isdigit():
-                code_part = p
-                break
-        if not code_part:
-            return None
+        # Code segment is the last part
+        code_part = parts[-1]
+        import re
+        # Pattern: YY (2 digits) + L (1 char [upi]) + CC (2 chars [a-z]) + D (1 digit) + XX (2 digits)
+        match = re.match(r'^(\d{2})([upi])([a-z]{2})(\d)(\d{2})$', code_part)
+        if not match:
+            # Fallback for roll format variations if any
+            match = re.match(r'^(\d{2})([upi])([a-z]{2})(\d)(\d+)$', code_part)
+            if not match:
+                return None
 
-        batch_year = 2000 + int(code_part[:2])
-        level_char = code_part[2].lower()       # 'p' or 'u'
-        email_code = code_part[3:5].lower()     # 'mc', 'bc' etc.
-        roll_digits = code_part[5:]              # '114', '214'
+        batch_str, level_char, course_code_str, section_digit, roll_digits = match.groups()
+        batch_year = 2000 + int(batch_str)
+        roll_number = int(roll_digits) if roll_digits.isdigit() else None
 
-        # Derive section hint from roll series (100-series -> A, 200-series -> B ...)
-        section_hint = ''
-        roll_number = None
-        if roll_digits.isdigit():
-            roll_num = int(roll_digits)
-            roll_number = roll_num % 100       # actual roll: last two digits
-            series = roll_num // 100
-            section_map = {1: 'A', 2: 'B', 3: 'C', 4: 'D', 5: 'E', 6: 'F'}
-            section_hint = section_map.get(series, 'A')
+        # Determine MSW vs BSW by Level ('p' = MSW, 'u' = BSW)
+        lookup_code = course_code_str
+        if course_code_str == 'sw' and level_char == 'p':
+            lookup_code = 'psw'
 
         return {
-            'level_char': level_char,
-            'email_code': email_code,
+            'batch_str': batch_str,
             'batch_year': batch_year,
-            'roll_digits': roll_digits,
+            'level_char': level_char,
+            'course_code_str': course_code_str,
+            'lookup_code': lookup_code,
+            'section_digit': section_digit,
+            'roll_digits': f"{section_digit}{roll_digits}",
+            'student_id': roll_digits,
             'roll_number': roll_number,
-            'section_hint': section_hint,
         }
 
     @staticmethod
@@ -108,86 +134,73 @@ class UserService:
     @classmethod
     def parse_student_email(cls, email):
         """
-        Parses Marian College student email format using DB Course/Department lookup.
-        Returns a dict with resolved department, class name, batch_year, roll_number etc.
-        Falls back to basic inference if no matching Course found in DB.
+        Parses Marian College student email format:
+        [name].YYLCCDXX@mariancollege.org
+        Returns resolved department, course, class name, batch_year, roll_number.
         """
-        from users.models import Course
+        from users.models import Course, Department
 
         parsed_code = cls.parse_email_code(email)
         if not parsed_code:
             return None
 
-        level_char = parsed_code['level_char']
-        email_code = parsed_code['email_code']
         batch_year = parsed_code['batch_year']
+        level_char = parsed_code['level_char']
+        lookup_code = parsed_code['lookup_code']
+        section_digit = parsed_code['section_digit']
         roll_number = parsed_code['roll_number']
         roll_digits = parsed_code['roll_digits']
-        section_hint = parsed_code['section_hint']
 
-        # Calculate year-in-course from active academic year
+        # Year number calculation from active academic year
         active_year_start = cls.get_active_year_start()
         year_number = active_year_start - batch_year + 1
         year_roman = cls.get_year_roman(year_number)
 
-        # --- Try DB-driven resolution first ---
-        try:
-            course = Course.objects.select_related('department').get(
-                email_code=email_code,
-                department__email_prefix=level_char
-            )
-            dept_obj = course.department
-            section = section_hint if course.is_multi_batch else ''
-            class_name = f"{year_roman} {course.abbreviation} {section}".strip() if section else f"{year_roman} {course.abbreviation}"
-            return {
-                'first_name': cls.parse_name_from_email(email),
-                'batch_year': batch_year,
-                'year_number': year_number,
-                'level': 'Postgraduate' if level_char == 'p' else 'Undergraduate',
-                'course': course,
-                'course_name': course.abbreviation,
-                'department_name': dept_obj.name,
-                'department_code': dept_obj.code,
-                'department_obj': dept_obj,
-                'section': section,
-                'class_name': class_name,
-                'roll_number': roll_number,
-                'roll_digits': roll_digits,
-                'db_resolved': True,
-            }
-        except Course.DoesNotExist:
-            pass
+        course_info = cls.DEPARTMENT_COURSE_MAP.get(lookup_code)
+        if not course_info:
+            return None
 
-        # --- Fallback: infer from hardcoded map ---
-        course_map = {
-            'mc': ('Master of Computer Applications', 'MCA', 'PGDCA'),
-            'bc': ('Bachelor of Computer Applications', 'BCA', 'UGDCA'),
-            'ba': ('Bachelor of Business Administration', 'BBA', 'UGDBA'),
-            'cm': ('Commerce', 'BCom', 'UGCOM'),
-            'sw': ('Social Work', 'MSW', 'PGSW'),
+        display_name = course_info.get('display_course', course_info['course'])
+        is_multi_batch = course_info.get('multi_batch', False)
+
+        section = ''
+        if is_multi_batch:
+            section = cls.SECTION_MAP.get(section_digit, 'A')
+            class_name = f"{year_roman} {display_name} {section}".strip()
+        else:
+            class_name = f"{year_roman} {display_name}".strip()
+
+        # Database lookup
+        dept_obj = Department.objects.filter(code=course_info['dept_code']).first() or Department.objects.filter(name=course_info['department']).first()
+        course_obj = None
+        if dept_obj:
+            course_obj = Course.objects.filter(department=dept_obj, email_code=lookup_code).first()
+            if not course_obj and lookup_code == 'psw':
+                course_obj = Course.objects.filter(department=dept_obj, email_code='sw').first()
+
+        level_name = 'Postgraduate' if level_char == 'p' else ('Integrated' if level_char == 'i' else 'Undergraduate')
+        roman_year = cls.ROMAN_YEARS.get(year_number, str(year_number))
+
+        return {
+            'name': cls.parse_name_from_email(email),
+            'first_name': cls.parse_name_from_email(email),
+            'batch_year': batch_year,
+            'year_number': year_number,
+            'year': roman_year,
+            'level': level_name,
+            'course': course_obj,
+            'course_name': course_info['course'],
+            'course_abbreviation': display_name,
+            'department': course_info['department'],
+            'department_name': course_info['department'],
+            'department_code': course_info['dept_code'],
+            'department_obj': dept_obj,
+            'section': section,
+            'class_name': class_name,
+            'roll_number': roll_number,
+            'roll_digits': roll_digits,
+            'db_resolved': bool(dept_obj and course_obj),
         }
-        if email_code in course_map:
-            full_name, abbr, dept_code = course_map[email_code]
-            section = section_hint if level_char == 'u' else ''
-            class_name = f"{year_roman} {abbr} {section}".strip() if section else f"{year_roman} {abbr}"
-            return {
-                'first_name': cls.parse_name_from_email(email),
-                'batch_year': batch_year,
-                'year_number': year_number,
-                'level': 'Postgraduate' if level_char == 'p' else 'Undergraduate',
-                'course': None,
-                'course_name': abbr,
-                'department_name': full_name,
-                'department_code': dept_code,
-                'department_obj': None,
-                'section': section,
-                'class_name': class_name,
-                'roll_number': roll_number,
-                'roll_digits': roll_digits,
-                'db_resolved': False,
-            }
-
-        return None
 
     @classmethod
     def allocate_student_from_email(cls, user):
@@ -229,53 +242,52 @@ class UserService:
                 user.last_name = name_parts[1]
                 update_fields.add('last_name')
 
-        if parsed.get('db_resolved') and parsed.get('department_obj'):
-            dept_obj = parsed['department_obj']
-            course = parsed['course']
-            year_number = parsed['year_number']
-            section = parsed.get('section', '')
-            class_name = parsed['class_name']
-
-            class_obj, created = Class.objects.get_or_create(
-                course=course,
-                year_number=year_number,
-                section=section,
-                defaults={
-                    'name': class_name,
-                    'department': dept_obj,
-                }
-            )
-            if created or class_obj.department != dept_obj:
-                class_obj.department = dept_obj
-                class_obj.save()
-
-            user.department = dept_obj
-            user.class_name = class_obj
-
-        else:
-            dept_code = parsed['department_code']
-            dept_name = parsed['department_name']
-            class_name = parsed['class_name']
-
-            dept_obj = Department.objects.filter(code=dept_code).first() or Department.objects.filter(name=dept_name).first()
+        dept_obj = parsed.get('department_obj')
+        if not dept_obj and parsed.get('department_code'):
+            dept_obj = Department.objects.filter(code=parsed['department_code']).first() or Department.objects.filter(name=parsed['department_name']).first()
             if not dept_obj:
                 try:
-                    dept_obj, _ = Department.objects.get_or_create(
-                        code=dept_code,
-                        defaults={'name': dept_name}
+                    dept_obj = Department.objects.create(
+                        code=parsed['department_code'],
+                        name=parsed['department_name']
                     )
                 except Exception:
-                    dept_obj = Department.objects.filter(name=dept_name).first() or Department.objects.filter(code=dept_code).first()
+                    dept_obj = Department.objects.filter(code=parsed['department_code']).first()
 
+        course = parsed.get('course')
+        year_number = parsed.get('year_number')
+        section = parsed.get('section', '')
+        class_name = parsed.get('class_name')
+
+        class_obj = None
+        if course and dept_obj and year_number:
+            class_obj = Class.objects.filter(
+                course=course,
+                year_number=year_number,
+                section=section
+            ).first()
+
+        if not class_obj and class_name:
             class_obj = Class.objects.filter(name=class_name).first()
-            if not class_obj:
-                class_obj = Class.objects.create(name=class_name, department=dept_obj)
-            elif dept_obj and class_obj.department != dept_obj:
-                class_obj.department = dept_obj
-                class_obj.save(update_fields=['department'])
 
-            user.department = dept_obj
-            user.class_name = class_obj
+        if not class_obj and dept_obj and class_name:
+            class_obj, _ = Class.objects.get_or_create(
+                name=class_name,
+                defaults={
+                    'department': dept_obj,
+                    'course': course,
+                    'year_number': year_number,
+                    'section': section,
+                    'batch_start_year': parsed.get('batch_year')
+                }
+            )
+
+        if class_obj and dept_obj and class_obj.department != dept_obj:
+            class_obj.department = dept_obj
+            class_obj.save(update_fields=['department'])
+
+        user.department = dept_obj
+        user.class_name = class_obj
 
         user.save(update_fields=list(update_fields))
         return user
@@ -284,14 +296,18 @@ class UserService:
     def determine_role_from_email(email):
         """
         Determines user role based on Marian College email format:
-        - name.number (e.g. santhosh.25pmc152, amal.25pmc114) -> student
+        - name.number (e.g. santhosh.25pmc152, amal.25pmc114, faizah.24uce109) -> student
         - name.name (e.g. kochumol.abraham) -> faculty (staff)
         """
-        username_part = email.split('@')[0]
+        if not email or '@' not in email:
+            return "student"
+        username_part = email.strip().split('@')[0].lower()
+        if username_part in ('admin',):
+            return "admin"
         parts = username_part.split('.')
         if len(parts) >= 2:
-            second_part = parts[1]
-            if any(char.isdigit() for char in second_part):
+            last_part = parts[-1]
+            if any(char.isdigit() for char in last_part):
                 return "student"
             else:
                 return "faculty"

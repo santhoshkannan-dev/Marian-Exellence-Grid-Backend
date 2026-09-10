@@ -165,9 +165,9 @@ class BugReportView(APIView):
 
     def get(self, request):
         user = request.user
-        if not (user and user.is_authenticated and (getattr(user, 'role', None) in ('admin', 'iqac') or user.is_staff or user.is_superuser)):
+        if not (user and user.is_authenticated and (getattr(user, 'role', None) == 'admin' or user.is_staff or user.is_superuser)):
             return Response(
-                {"error": "Authentication required. Only administrators and IQAC coordinators can view bug reports."},
+                {"error": "Authentication required. Only administrators can view bug reports."},
                 status=status.HTTP_401_UNAUTHORIZED if not (user and user.is_authenticated) else status.HTTP_403_FORBIDDEN
             )
         reports = BugReport.objects.all()
@@ -205,7 +205,7 @@ class BugReportView(APIView):
 class SystemAuditLogView(APIView):
     """
     Read-only institutional audit ledger endpoint.
-    Strictly restricted to Admin and IQAC coordinators.
+    Strictly restricted to Administrators.
     No modifications or deletions are allowed via this or any endpoint.
     """
     permission_classes = [IsAuthenticated]
@@ -213,9 +213,9 @@ class SystemAuditLogView(APIView):
     def get(self, request):
         user = request.user
         user_role = getattr(user, 'role', '')
-        if not (user.is_superuser or user_role in ('admin', 'iqac')):
+        if not (user.is_superuser or user_role == 'admin'):
             return Response(
-                {"error": "Unauthorized: Only administrators and IQAC coordinators can inspect the system audit trail."},
+                {"error": "Unauthorized: Only administrators can inspect the system audit trail."},
                 status=status.HTTP_403_FORBIDDEN
             )
 
@@ -257,7 +257,7 @@ class SubmissionAuditTrailView(APIView):
         is_owner = bool(submission.user_id == user.id)
 
         allowed = False
-        if user.is_superuser or user_role in ('admin', 'iqac', 'evaluation'):
+        if user.is_superuser or user_role in ('admin', 'evaluation'):
             allowed = True
         elif is_owner:
             allowed = True

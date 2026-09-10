@@ -14,45 +14,52 @@ from users.permissions import (
 logger = logging.getLogger(__name__)
 
 OFFICIAL_DEPT_ORDER = [
+    'ENG',
+    'SCPS',
+    'UGBBA',
     'UGDCA',
-    'PGDCA',
-    'COMMERCE',
-    'BBA_MBA',
-    'SOCIAL_WORK',
-    'PHYSICS',
-    'ECONOMICS',
+    'SSW',
     'MATHS',
-    'BACE',
     'MCMS',
     'MHTM',
+    'PHYSICS',
+    'ECONOMICS',
     'PSYCHOLOGY',
-    'IQAC',
-    'ADMIN'
+    'MBA',
+    'PGDCA',
 ]
 
 OFFICIAL_CLASS_ORDER = [
-    # 1. Department of Computer Applications
-    "I BCA A", "I BCA B", "II BCA A", "II BCA B", "III BCA A", "III BCA B", "I MCA", "II MCA",
-    # 2. Department of Commerce
-    "I BCOM A", "I BCOM B", "I BCOM C", "I BCOM (FINTECH)", "II BCOM A", "II BCOM B", "II BCOM C", "III BCOM A", "III BCOM B", "III BCOM C", "I MCOM A", "I MCOM B", "II MCOM A", "II MCOM B",
-    # 3. Department of Business Administration
-    "I BBA A", "I BBA B", "II BBA A", "II BBA B", "III BBA A", "III BBA B", "I MBA A", "I MBA B", "I MBA C", "II MBA A", "II MBA B", "II MBA C",
-    # 4. Department of Social Work
-    "I BSW A", "I BSW B", "II BSW A", "II BSW B", "III BSW A", "III BSW B", "I MSW", "II MSW",
-    # 5. Department of Physics
-    "I MSC PHYSICS", "II MSC PHYSICS", "III MSC PHYSICS", "IV MSC PHYSICS", "V MSC PHYSICS",
-    # 6. Department of Economics
-    "I ECONOMICS", "II ECONOMICS", "III ECONOMICS",
-    # 7. Department of Mathematics
-    "I MATHS", "II MATHS", "III MATHS",
-    # 8. Department of English / Communicative English
+    # 1. Department of English / Languages
     "I BACE", "II BACE", "III BACE",
-    # 9. Department of Communication & Media Studies
+    # 2. School of Commerce and Professional Studies
+    "I BCOM A", "I BCOM B", "I BCOM C", "I BCOM (FINTECH)",
+    "II BCOM A", "II BCOM B", "II BCOM C",
+    "III BCOM A", "III BCOM B", "III BCOM C",
+    "I MCOM A", "I MCOM B", "II MCOM A", "II MCOM B",
+    # 3. UG Department of Business Administration
+    "I BBA A", "I BBA B", "II BBA A", "II BBA B", "III BBA A", "III BBA B",
+    # 4. UG Department of Computer Applications
+    "I BCA A", "I BCA B", "II BCA A", "II BCA B", "III BCA A", "III BCA B",
+    # 5. School of Social Work
+    "I BSW A", "I BSW B", "II BSW A", "II BSW B", "III BSW A", "III BSW B",
+    "I MSW", "II MSW",
+    # 6. Department of Mathematics
+    "I MATHS", "II MATHS", "III MATHS",
+    # 7. Department of Communication and Media Studies
     "I MCMS", "II MCMS",
-    # 10. Department of Hospitality & Tourism Management
+    # 8. Department of Hospitality and Tourism Management
     "I MHTM", "II MHTM",
+    # 9. Department of Physics
+    "I MSC PHYSICS", "II MSC PHYSICS", "III MSC PHYSICS", "IV MSC PHYSICS", "V MSC PHYSICS",
+    # 10. Department of Economics
+    "I ECONOMICS", "II ECONOMICS", "III ECONOMICS",
     # 11. Department of Psychology
-    "I PSYCHOLOGY"
+    "I PSYCHOLOGY", "II PSYCHOLOGY", "III PSYCHOLOGY",
+    # 12. Masters of Business Administration
+    "I MBA A", "I MBA B", "I MBA C", "II MBA A", "II MBA B", "II MBA C",
+    # 13. PG Department of Computer Applications
+    "I MCA", "II MCA",
 ]
 
 
@@ -369,7 +376,7 @@ class ClassListView(APIView):
         user = request.user
         is_staff_or_admin = bool(
             user and getattr(user, 'is_authenticated', False) and (
-                getattr(user, 'role', '') in ('admin', 'iqac', 'faculty') or
+                getattr(user, 'role', '') in ('admin', 'faculty') or
                 getattr(user, 'is_staff', False) or
                 getattr(user, 'is_superuser', False)
             )
@@ -398,9 +405,9 @@ class ClassListView(APIView):
 
     def post(self, request):
         user = request.user
-        if not (user and user.is_authenticated and (getattr(user, 'role', None) in ('admin', 'iqac') or user.is_staff or user.is_superuser)):
+        if not (user and user.is_authenticated and (getattr(user, 'role', None) == 'admin' or user.is_staff or user.is_superuser)):
             return Response(
-                {"error": "Unauthorized: Only administrators and IQAC coordinators can create classes."},
+                {"error": "Unauthorized: Only administrators can create classes."},
                 status=status.HTTP_403_FORBIDDEN
             )
         course_id = request.data.get('course_id')

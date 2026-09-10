@@ -1,5 +1,5 @@
 from django.core.management.base import BaseCommand
-from users.models import Department, Class, User, AcademicYear
+from users.models import Department, Course, Class, User, AcademicYear
 from users.views import allocate_student_from_email
 
 class Command(BaseCommand):
@@ -23,146 +23,182 @@ class Command(BaseCommand):
                 obj.is_active = ay["is_active"]
                 obj.save()
 
-        # Purge outdated legacy departments and non-matching classes if any
-        outdated_dept_codes = ["UGDCA", "PGDCA", "CS"]
-        Department.objects.filter(code__in=outdated_dept_codes).delete()
+        # Purge outdated legacy departments, courses, classes, and non-existing users
+        User.objects.filter(email='iqac@mariancollege.org').delete()
+        User.objects.all().update(class_name=None, department=None)
+        Class.objects.all().delete()
+        Course.objects.all().delete()
+        Department.objects.all().delete()
 
-        # 2. Seed Departments in exact specified order
+        # 2. Seed 13 Official Academic Departments in exact order
         departments_data = [
-            {"name": "Department of Computer Applications", "code": "DCA"},
-            {"name": "Department of Commerce", "code": "COMMERCE"},
-            {"name": "Department of Business Administration", "code": "BBA_MBA"},
-            {"name": "Department of Social Work", "code": "SOCIAL_WORK"},
-            {"name": "Department of Physics", "code": "PHYSICS"},
-            {"name": "Department of Economics", "code": "ECONOMICS"},
-            {"name": "Department of Mathematics", "code": "MATHS"},
-            {"name": "Department of English / Communicative English", "code": "BACE"},
-            {"name": "Department of Communication & Media Studies", "code": "MCMS"},
-            {"name": "Department of Hospitality & Tourism Management", "code": "MHTM"},
-            {"name": "Department of Psychology", "code": "PSYCHOLOGY"},
-            {"name": "Internal Quality Assurance Cell", "code": "IQAC"},
-            {"name": "Administration", "code": "ADMIN"},
+            {"name": "Department of English / Languages", "code": "ENG", "level": "UG", "email_prefix": "u"},
+            {"name": "School of Commerce and Professional Studies", "code": "SCPS", "level": "UG", "email_prefix": "u"},
+            {"name": "UG Department of Business Administration", "code": "UGBBA", "level": "UG", "email_prefix": "u"},
+            {"name": "UG Department of Computer Applications", "code": "UGDCA", "level": "UG", "email_prefix": "u"},
+            {"name": "School of Social Work", "code": "SSW", "level": "UG", "email_prefix": "u"},
+            {"name": "Department of Mathematics", "code": "MATHS", "level": "UG", "email_prefix": "u"},
+            {"name": "Department of Communication and Media Studies", "code": "MCMS", "level": "PG", "email_prefix": "p"},
+            {"name": "Department of Hospitality and Tourism Management", "code": "MHTM", "level": "PG", "email_prefix": "p"},
+            {"name": "Department of Physics", "code": "PHYSICS", "level": "UG", "email_prefix": "i"},
+            {"name": "Department of Economics", "code": "ECONOMICS", "level": "UG", "email_prefix": "u"},
+            {"name": "Department of Psychology", "code": "PSYCHOLOGY", "level": "UG", "email_prefix": "u"},
+            {"name": "Masters of Business Administration", "code": "MBA", "level": "PG", "email_prefix": "p"},
+            {"name": "PG Department of Computer Applications", "code": "PGDCA", "level": "PG", "email_prefix": "p"},
         ]
 
         departments = {}
         for dept in departments_data:
-            obj, created = Department.objects.get_or_create(code=dept["code"], defaults={"name": dept["name"]})
-            if not created and obj.name != dept["name"]:
-                obj.name = dept["name"]
-                obj.save()
+            obj = Department.objects.create(
+                name=dept["name"],
+                code=dept["code"],
+                level=dept["level"],
+                email_prefix=dept["email_prefix"]
+            )
             departments[dept["code"]] = obj
-            if created:
-                self.stdout.write(f"Created Department: {obj.name}")
+            self.stdout.write(f"Created Department: {obj.name} ({obj.code})")
 
-        # 3. Seed Classes in exact specified order
-        classes_data = [
-            # 1. Department of Computer Applications
-            {"name": "I BCA A", "dept_code": "DCA"},
-            {"name": "I BCA B", "dept_code": "DCA"},
-            {"name": "II BCA A", "dept_code": "DCA"},
-            {"name": "II BCA B", "dept_code": "DCA"},
-            {"name": "III BCA A", "dept_code": "DCA"},
-            {"name": "III BCA B", "dept_code": "DCA"},
-            {"name": "I MCA", "dept_code": "DCA"},
-            {"name": "II MCA", "dept_code": "DCA"},
-
-            # 2. Department of Commerce
-            {"name": "I BCOM A", "dept_code": "COMMERCE"},
-            {"name": "I BCOM B", "dept_code": "COMMERCE"},
-            {"name": "I BCOM C", "dept_code": "COMMERCE"},
-            {"name": "I BCOM (FINTECH)", "dept_code": "COMMERCE"},
-            {"name": "II BCOM A", "dept_code": "COMMERCE"},
-            {"name": "II BCOM B", "dept_code": "COMMERCE"},
-            {"name": "II BCOM C", "dept_code": "COMMERCE"},
-            {"name": "III BCOM A", "dept_code": "COMMERCE"},
-            {"name": "III BCOM B", "dept_code": "COMMERCE"},
-            {"name": "III BCOM C", "dept_code": "COMMERCE"},
-            {"name": "I MCOM A", "dept_code": "COMMERCE"},
-            {"name": "I MCOM B", "dept_code": "COMMERCE"},
-            {"name": "II MCOM A", "dept_code": "COMMERCE"},
-            {"name": "II MCOM B", "dept_code": "COMMERCE"},
-
-            # 3. Department of Business Administration
-            {"name": "I BBA A", "dept_code": "BBA_MBA"},
-            {"name": "I BBA B", "dept_code": "BBA_MBA"},
-            {"name": "II BBA A", "dept_code": "BBA_MBA"},
-            {"name": "II BBA B", "dept_code": "BBA_MBA"},
-            {"name": "III BBA A", "dept_code": "BBA_MBA"},
-            {"name": "III BBA B", "dept_code": "BBA_MBA"},
-            {"name": "I MBA A", "dept_code": "BBA_MBA"},
-            {"name": "I MBA B", "dept_code": "BBA_MBA"},
-            {"name": "I MBA C", "dept_code": "BBA_MBA"},
-            {"name": "II MBA A", "dept_code": "BBA_MBA"},
-            {"name": "II MBA B", "dept_code": "BBA_MBA"},
-            {"name": "II MBA C", "dept_code": "BBA_MBA"},
-
-            # 4. Department of Social Work
-            {"name": "I BSW A", "dept_code": "SOCIAL_WORK"},
-            {"name": "I BSW B", "dept_code": "SOCIAL_WORK"},
-            {"name": "II BSW A", "dept_code": "SOCIAL_WORK"},
-            {"name": "II BSW B", "dept_code": "SOCIAL_WORK"},
-            {"name": "III BSW A", "dept_code": "SOCIAL_WORK"},
-            {"name": "III BSW B", "dept_code": "SOCIAL_WORK"},
-            {"name": "I MSW", "dept_code": "SOCIAL_WORK"},
-            {"name": "II MSW", "dept_code": "SOCIAL_WORK"},
-
-            # 5. Department of Physics (Integrated M.Sc. Physics)
-            {"name": "I MSC PHYSICS", "dept_code": "PHYSICS"},
-            {"name": "II MSC PHYSICS", "dept_code": "PHYSICS"},
-            {"name": "III MSC PHYSICS", "dept_code": "PHYSICS"},
-            {"name": "IV MSC PHYSICS", "dept_code": "PHYSICS"},
-            {"name": "V MSC PHYSICS", "dept_code": "PHYSICS"},
-
-            # 6. Department of Economics
-            {"name": "I ECONOMICS", "dept_code": "ECONOMICS"},
-            {"name": "II ECONOMICS", "dept_code": "ECONOMICS"},
-            {"name": "III ECONOMICS", "dept_code": "ECONOMICS"},
-
-            # 7. Department of Mathematics
-            {"name": "I MATHS", "dept_code": "MATHS"},
-            {"name": "II MATHS", "dept_code": "MATHS"},
-            {"name": "III MATHS", "dept_code": "MATHS"},
-
-            # 8. Department of English / Communicative English
-            {"name": "I BACE", "dept_code": "BACE"},
-            {"name": "II BACE", "dept_code": "BACE"},
-            {"name": "III BACE", "dept_code": "BACE"},
-
-            # 9. Department of Communication & Media Studies
-            {"name": "I MCMS", "dept_code": "MCMS"},
-            {"name": "II MCMS", "dept_code": "MCMS"},
-
-            # 10. Department of Hospitality & Tourism Management
-            {"name": "I MHTM", "dept_code": "MHTM"},
-            {"name": "II MHTM", "dept_code": "MHTM"},
-
-            # 11. Department of Psychology
-            {"name": "I PSYCHOLOGY", "dept_code": "PSYCHOLOGY"},
+        # 3. Seed 16 Official Courses
+        courses_data = [
+            {"dept_code": "ENG", "name": "BA Communicative English", "abbreviation": "BACE", "email_code": "ce", "is_multi_batch": False, "duration_years": 3},
+            {"dept_code": "SCPS", "name": "Bachelor of Commerce", "abbreviation": "B.Com", "email_code": "bm", "is_multi_batch": True, "duration_years": 3},
+            {"dept_code": "SCPS", "name": "Master of Commerce", "abbreviation": "M.Com", "email_code": "mm", "is_multi_batch": True, "duration_years": 2},
+            {"dept_code": "SCPS", "name": "B.Com FinTech with Applied AI", "abbreviation": "B.Com FinTech", "email_code": "bf", "is_multi_batch": False, "duration_years": 3},
+            {"dept_code": "UGBBA", "name": "Bachelor of Business Administration", "abbreviation": "BBA", "email_code": "bb", "is_multi_batch": True, "duration_years": 3},
+            {"dept_code": "UGDCA", "name": "Bachelor of Computer Applications", "abbreviation": "BCA", "email_code": "bc", "is_multi_batch": True, "duration_years": 3},
+            {"dept_code": "SSW", "name": "Bachelor of Social Work", "abbreviation": "BSW", "email_code": "sw", "is_multi_batch": True, "duration_years": 3},
+            {"dept_code": "SSW", "name": "Master of Social Work", "abbreviation": "MSW", "email_code": "psw", "is_multi_batch": False, "duration_years": 2},
+            {"dept_code": "MATHS", "name": "B.Sc Mathematics", "abbreviation": "MATHS", "email_code": "ma", "is_multi_batch": False, "duration_years": 3},
+            {"dept_code": "MCMS", "name": "Master of Communication and Media Studies", "abbreviation": "MCMS", "email_code": "cm", "is_multi_batch": False, "duration_years": 2},
+            {"dept_code": "MHTM", "name": "Master of Hospitality and Tourism Management", "abbreviation": "MHTM", "email_code": "ht", "is_multi_batch": False, "duration_years": 2},
+            {"dept_code": "PHYSICS", "name": "M.Sc Integrated Physics", "abbreviation": "MSC PHYSICS", "email_code": "ph", "is_multi_batch": False, "duration_years": 5},
+            {"dept_code": "ECONOMICS", "name": "BA Economics", "abbreviation": "ECONOMICS", "email_code": "ec", "is_multi_batch": False, "duration_years": 3},
+            {"dept_code": "PSYCHOLOGY", "name": "B.Sc Psychology", "abbreviation": "PSYCHOLOGY", "email_code": "py", "is_multi_batch": False, "duration_years": 3},
+            {"dept_code": "MBA", "name": "Master of Business Administration", "abbreviation": "MBA", "email_code": "ba", "is_multi_batch": True, "duration_years": 2},
+            {"dept_code": "PGDCA", "name": "Master of Computer Applications", "abbreviation": "MCA", "email_code": "mc", "is_multi_batch": False, "duration_years": 2},
         ]
 
-        valid_class_names = [cls["name"] for cls in classes_data]
-        Class.objects.exclude(name__in=valid_class_names).delete()
+        courses = {}
+        for c in courses_data:
+            dept = departments[c["dept_code"]]
+            obj = Course.objects.create(
+                department=dept,
+                name=c["name"],
+                abbreviation=c["abbreviation"],
+                email_code=c["email_code"],
+                is_multi_batch=c["is_multi_batch"],
+                duration_years=c["duration_years"],
+            )
+            courses[c["email_code"]] = obj
+            self.stdout.write(f"Created Course: {obj.abbreviation} ({obj.email_code})")
+
+        # 4. Seed 65 Official Classes
+        classes_data = [
+            # 1. BACE (ce)
+            {"name": "I BACE", "course_code": "ce", "year_number": 1, "section": ""},
+            {"name": "II BACE", "course_code": "ce", "year_number": 2, "section": ""},
+            {"name": "III BACE", "course_code": "ce", "year_number": 3, "section": ""},
+            # 2. B.Com (bm) - Div A, B, C
+            {"name": "I BCOM A", "course_code": "bm", "year_number": 1, "section": "A"},
+            {"name": "I BCOM B", "course_code": "bm", "year_number": 1, "section": "B"},
+            {"name": "I BCOM C", "course_code": "bm", "year_number": 1, "section": "C"},
+            {"name": "II BCOM A", "course_code": "bm", "year_number": 2, "section": "A"},
+            {"name": "II BCOM B", "course_code": "bm", "year_number": 2, "section": "B"},
+            {"name": "II BCOM C", "course_code": "bm", "year_number": 2, "section": "C"},
+            {"name": "III BCOM A", "course_code": "bm", "year_number": 3, "section": "A"},
+            {"name": "III BCOM B", "course_code": "bm", "year_number": 3, "section": "B"},
+            {"name": "III BCOM C", "course_code": "bm", "year_number": 3, "section": "C"},
+            # 3. B.Com FinTech (bf)
+            {"name": "I BCOM (FINTECH)", "course_code": "bf", "year_number": 1, "section": ""},
+            {"name": "II BCOM (FINTECH)", "course_code": "bf", "year_number": 2, "section": ""},
+            {"name": "III BCOM (FINTECH)", "course_code": "bf", "year_number": 3, "section": ""},
+            # 4. BBA (bb) - Div A, B
+            {"name": "I BBA A", "course_code": "bb", "year_number": 1, "section": "A"},
+            {"name": "I BBA B", "course_code": "bb", "year_number": 1, "section": "B"},
+            {"name": "II BBA A", "course_code": "bb", "year_number": 2, "section": "A"},
+            {"name": "II BBA B", "course_code": "bb", "year_number": 2, "section": "B"},
+            {"name": "III BBA A", "course_code": "bb", "year_number": 3, "section": "A"},
+            {"name": "III BBA B", "course_code": "bb", "year_number": 3, "section": "B"},
+            # 5. BCA (bc) - Div A, B
+            {"name": "I BCA A", "course_code": "bc", "year_number": 1, "section": "A"},
+            {"name": "I BCA B", "course_code": "bc", "year_number": 1, "section": "B"},
+            {"name": "II BCA A", "course_code": "bc", "year_number": 2, "section": "A"},
+            {"name": "II BCA B", "course_code": "bc", "year_number": 2, "section": "B"},
+            {"name": "III BCA A", "course_code": "bc", "year_number": 3, "section": "A"},
+            {"name": "III BCA B", "course_code": "bc", "year_number": 3, "section": "B"},
+            # 6. BSW (sw) - Div A, B
+            {"name": "I BSW A", "course_code": "sw", "year_number": 1, "section": "A"},
+            {"name": "I BSW B", "course_code": "sw", "year_number": 1, "section": "B"},
+            {"name": "II BSW A", "course_code": "sw", "year_number": 2, "section": "A"},
+            {"name": "II BSW B", "course_code": "sw", "year_number": 2, "section": "B"},
+            {"name": "III BSW A", "course_code": "sw", "year_number": 3, "section": "A"},
+            {"name": "III BSW B", "course_code": "sw", "year_number": 3, "section": "B"},
+            # 7. B.Sc Mathematics (ma)
+            {"name": "I MATHS", "course_code": "ma", "year_number": 1, "section": ""},
+            {"name": "II MATHS", "course_code": "ma", "year_number": 2, "section": ""},
+            {"name": "III MATHS", "course_code": "ma", "year_number": 3, "section": ""},
+            # 8. BA Economics (ec)
+            {"name": "I ECONOMICS", "course_code": "ec", "year_number": 1, "section": ""},
+            {"name": "II ECONOMICS", "course_code": "ec", "year_number": 2, "section": ""},
+            {"name": "III ECONOMICS", "course_code": "ec", "year_number": 3, "section": ""},
+            # 9. B.Sc Psychology (py)
+            {"name": "I PSYCHOLOGY", "course_code": "py", "year_number": 1, "section": ""},
+            {"name": "II PSYCHOLOGY", "course_code": "py", "year_number": 2, "section": ""},
+            {"name": "III PSYCHOLOGY", "course_code": "py", "year_number": 3, "section": ""},
+            # 10. MBA (ba) - Div A, B, C
+            {"name": "I MBA A", "course_code": "ba", "year_number": 1, "section": "A"},
+            {"name": "I MBA B", "course_code": "ba", "year_number": 1, "section": "B"},
+            {"name": "I MBA C", "course_code": "ba", "year_number": 1, "section": "C"},
+            {"name": "II MBA A", "course_code": "ba", "year_number": 2, "section": "A"},
+            {"name": "II MBA B", "course_code": "ba", "year_number": 2, "section": "B"},
+            {"name": "II MBA C", "course_code": "ba", "year_number": 2, "section": "C"},
+            # 11. MCA (mc)
+            {"name": "I MCA", "course_code": "mc", "year_number": 1, "section": ""},
+            {"name": "II MCA", "course_code": "mc", "year_number": 2, "section": ""},
+            # 12. M.Com (mm) - Div A, B
+            {"name": "I MCOM A", "course_code": "mm", "year_number": 1, "section": "A"},
+            {"name": "I MCOM B", "course_code": "mm", "year_number": 1, "section": "B"},
+            {"name": "II MCOM A", "course_code": "mm", "year_number": 2, "section": "A"},
+            {"name": "II MCOM B", "course_code": "mm", "year_number": 2, "section": "B"},
+            # 13. MSW (psw)
+            {"name": "I MSW", "course_code": "psw", "year_number": 1, "section": ""},
+            {"name": "II MSW", "course_code": "psw", "year_number": 2, "section": ""},
+            # 14. MCMS (cm)
+            {"name": "I MCMS", "course_code": "cm", "year_number": 1, "section": ""},
+            {"name": "II MCMS", "course_code": "cm", "year_number": 2, "section": ""},
+            # 15. MHTM (ht)
+            {"name": "I MHTM", "course_code": "ht", "year_number": 1, "section": ""},
+            {"name": "II MHTM", "course_code": "ht", "year_number": 2, "section": ""},
+            # 16. M.Sc Integrated Physics (ph)
+            {"name": "I MSC PHYSICS", "course_code": "ph", "year_number": 1, "section": ""},
+            {"name": "II MSC PHYSICS", "course_code": "ph", "year_number": 2, "section": ""},
+            {"name": "III MSC PHYSICS", "course_code": "ph", "year_number": 3, "section": ""},
+            {"name": "IV MSC PHYSICS", "course_code": "ph", "year_number": 4, "section": ""},
+            {"name": "V MSC PHYSICS", "course_code": "ph", "year_number": 5, "section": ""},
+        ]
 
         classes = {}
         for cls in classes_data:
-            dept = departments[cls["dept_code"]]
-            obj, created = Class.objects.get_or_create(name=cls["name"], defaults={"department": dept})
-            if not created and obj.department != dept:
-                obj.department = dept
-                obj.save()
+            course = courses[cls["course_code"]]
+            dept = course.department
+            obj = Class.objects.create(
+                name=cls["name"],
+                department=dept,
+                course=course,
+                year_number=cls["year_number"],
+                section=cls["section"],
+            )
             classes[cls["name"]] = obj
-            if created:
-                self.stdout.write(f"Created Class: {obj.name}")
+            self.stdout.write(f"Created Class: {obj.name}")
 
-        # 4. Seed Users
+        # 5. Seed Users (without IQAC)
         users_data = [
-            ("santhosh.25pmc152@mariancollege.org", "student", "DCA", "II MCA", False, False, "Santhosh", "Kannan"),
-            ("amal.25pmc114@mariancollege.org", "student", "DCA", "II MCA", False, False, "Amal", "Thomas"),
-            ("santhosh.25ubc154@mariancollege.org", "student", "DCA", "II BCA A", False, False, "Santhosh", "Kannan"),
-            ("kochumol.abraham@mariancollege.org", "faculty", "DCA", None, True, False, "Kochumol", "Abraham"),
-            ("allen.george@mariancollege.org", "evaluation", "DCA", None, True, False, "Allen", "George"),
-            ("iqac@mariancollege.org", "iqac", "IQAC", None, True, False, "IQAC", "Coordinator"),
-            ("admin@mariancollege.org", "admin", "ADMIN", None, True, True, "System", "Administrator"),
+            ("santhosh.25pmc152@mariancollege.org", "student", "PGDCA", "II MCA", False, False, "Santhosh", "Kannan"),
+            ("amal.25pmc114@mariancollege.org", "student", "PGDCA", "II MCA", False, False, "Amal", "Thomas"),
+            ("santhosh.25ubc154@mariancollege.org", "student", "UGDCA", "II BCA A", False, False, "Santhosh", "Kannan"),
+            ("kochumol.abraham@mariancollege.org", "faculty", "PGDCA", None, True, False, "Kochumol", "Abraham"),
+            ("allen.george@mariancollege.org", "evaluation", "PGDCA", None, True, False, "Allen", "George"),
+            ("admin@mariancollege.org", "admin", None, None, True, True, "System", "Administrator"),
         ]
 
         seeded_users = {}

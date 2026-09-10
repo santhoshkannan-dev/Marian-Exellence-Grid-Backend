@@ -97,7 +97,7 @@ def is_user_class_advisor(user: User, class_obj: Optional[Class]) -> bool:
     """Determine if an authenticated faculty user is the assigned advisor for a class."""
     if not user or not getattr(user, 'is_authenticated', False):
         return False
-    if getattr(user, 'role', '') in ('admin', 'iqac') or getattr(user, 'is_superuser', False):
+    if getattr(user, 'role', '') == 'admin' or getattr(user, 'is_superuser', False):
         return True
     if getattr(user, 'role', '') != 'faculty':
         return False
@@ -116,7 +116,7 @@ def is_evaluator_assigned_to_item(user: User, criteria_id: int) -> bool:
     """Check if an evaluator is assigned to the criteria item's category."""
     if not user or not getattr(user, 'is_authenticated', False):
         return False
-    if getattr(user, 'role', '') in ('admin', 'iqac') or getattr(user, 'is_superuser', False):
+    if getattr(user, 'role', '') == 'admin' or getattr(user, 'is_superuser', False):
         return True
     if getattr(user, 'role', '') != 'evaluation':
         return False
@@ -157,7 +157,7 @@ def determine_stage(target_status: str, actor: Optional[User]) -> Tuple[int, str
             return 3, "Class Teacher Verification"
         elif actor_role == 'evaluation':
             return 4, "Central Evaluation"
-        elif actor_role in ('iqac', 'admin'):
+        elif actor_role == 'admin':
             return 5, "Mark Moderation & Locking"
         return 2, "Review Decision"
     return 1, "Workflow Transition"
@@ -188,18 +188,18 @@ def validate_workflow_transition(
         return False, "Authentication required to perform workflow transitions.", stage_num, stage_name
 
     user_role = getattr(user, 'role', '')
-    is_admin = user_role in ('admin', 'iqac') or getattr(user, 'is_superuser', False)
+    is_admin = user_role == 'admin' or getattr(user, 'is_superuser', False)
     sub_owner = submission.user
     sub_class = sub_owner.class_name if sub_owner else None
 
     # 2. Terminal Lock Protection
     if current_norm == WorkflowState.LOCKED:
         # Locked submissions are immutable against modifications while locked.
-        # Only an authorized admin/IQAC explicit transition out of Locked is permitted.
+        # Only an authorized admin explicit transition out of Locked is permitted.
         if target_norm == WorkflowState.LOCKED:
             return False, "This submission record has been locked and cannot be modified.", stage_num, stage_name
         if not is_admin:
-            return False, "This submission record has been locked by IQAC/Admin and cannot be modified.", stage_num, stage_name
+            return False, "This submission record has been locked by Admin and cannot be modified.", stage_num, stage_name
 
     # Same-state update: check evidence editing restrictions
     if current_norm == target_norm:
@@ -307,7 +307,7 @@ def validate_workflow_transition(
             if not is_eval:
                 return False, "Unauthorized: Evaluator is not assigned to evaluate this criteria category.", stage_num, stage_name
             if target_norm == WorkflowState.LOCKED:
-                return False, "Unauthorized: Only administrators and IQAC coordinators can lock submissions.", stage_num, stage_name
+                return False, "Unauthorized: Only administrators can lock submissions.", stage_num, stage_name
 
         return False, f"Unauthorized: Role '{user_role}' cannot transition submission from '{current_status}' to '{target_status}'.", stage_num, stage_name
 
@@ -381,7 +381,7 @@ def execute_workflow_transition(
                 sub.evaluator_remarks = remarks
             sub.verified_by_name = actor_name
 
-        elif user_role in ('admin', 'iqac') or getattr(user, 'is_superuser', False):
+        elif user_role == 'admin' or getattr(user, 'is_superuser', False):
             sub.verified_by_name = actor_name
             if marks is not None:
                 sub.marks = int(round(float(marks)))

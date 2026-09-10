@@ -29,12 +29,12 @@ class SubmissionEvidenceView(APIView):
 
     def _check_access_permission(self, user, submission, action="view"):
         user_role = getattr(user, 'role', None)
-        # Superuser, admin, iqac always have access
-        if user.is_superuser or user_role in ('admin', 'iqac'):
+        # Superuser and admin always have access
+        if user.is_superuser or user_role == 'admin':
             return True, None
 
         if action in ("upload", "delete"):
-            # Only student owner (or admin/iqac) can upload/delete evidence
+            # Only student owner (or admin) can upload/delete evidence
             if user_role == 'student':
                 if submission.user_id != user.id:
                     return False, "You cannot modify evidence for another student's submission."

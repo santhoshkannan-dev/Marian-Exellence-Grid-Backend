@@ -16,27 +16,27 @@ class IsAdminRole(BasePermission):
 
 class IsAdminOrIQAC(BasePermission):
     """
-    Grants permission to admin, iqac, or Django is_staff/is_superuser.
+    Grants permission to admin or Django is_staff/is_superuser.
     """
     def has_permission(self, request, view):
         user = request.user
         return bool(
             user and
             user.is_authenticated and
-            (getattr(user, 'role', None) in ('admin', 'iqac') or user.is_staff or user.is_superuser)
+            (getattr(user, 'role', None) == 'admin' or user.is_staff or user.is_superuser)
         )
 
 
 class IsStaffOrAdmin(BasePermission):
     """
-    Grants permission to faculty, evaluation, iqac, admin, or is_staff/is_superuser.
+    Grants permission to faculty, evaluation, admin, or is_staff/is_superuser.
     """
     def has_permission(self, request, view):
         user = request.user
         return bool(
             user and
             user.is_authenticated and
-            (getattr(user, 'role', None) in ('admin', 'faculty', 'evaluation', 'iqac') or user.is_staff or user.is_superuser)
+            (getattr(user, 'role', None) in ('admin', 'faculty', 'evaluation') or user.is_staff or user.is_superuser)
         )
 
 
@@ -82,5 +82,5 @@ class IsAdminOrStaffOrReadOnly(BasePermission):
         return bool(
             user and
             user.is_authenticated and
-            (getattr(user, 'role', None) in ('admin', 'faculty', 'evaluation', 'iqac') or user.is_staff or user.is_superuser)
+            (getattr(user, 'role', None) in ('admin', 'faculty', 'evaluation') or user.is_staff or user.is_superuser)
         )

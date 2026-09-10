@@ -121,7 +121,7 @@ class SubmissionService:
     def serialize_submission_for_user(s, user):
         is_staff_or_eval = bool(
             user and getattr(user, 'is_authenticated', False) and (
-                getattr(user, 'role', '') in ('admin', 'iqac', 'faculty', 'evaluation') or
+                getattr(user, 'role', '') in ('admin', 'faculty', 'evaluation') or
                 getattr(user, 'is_staff', False) or
                 getattr(user, 'is_superuser', False)
             )

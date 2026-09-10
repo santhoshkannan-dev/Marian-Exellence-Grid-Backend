@@ -29,11 +29,11 @@ class ClassIndexView(APIView):
         return Response(data, status=status.HTTP_200_OK)
 
     def post(self, request):
-        """Allow IQAC or Admin to snapshot official class index results for an academic year."""
+        """Allow Admin to snapshot official class index results for an academic year."""
         user = request.user
         user_role = getattr(user, 'role', None)
-        if not (user.is_superuser or user_role in ('admin', 'iqac')):
-            return Response({"error": "Only IQAC and Administrators can snapshot official rankings."}, status=status.HTTP_403_FORBIDDEN)
+        if not (user.is_superuser or user_role == 'admin'):
+            return Response({"error": "Only Administrators can snapshot official rankings."}, status=status.HTTP_403_FORBIDDEN)
 
         year = request.data.get('year')
         if not year:

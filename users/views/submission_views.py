@@ -396,7 +396,7 @@ class SubmissionDetailView(APIView):
         user_role = getattr(user, 'role', None)
 
         # Object-level authorization for reading submissions
-        if user.is_superuser or user_role in ('admin', 'iqac', 'evaluation'):
+        if user.is_superuser or user_role in ('admin', 'evaluation'):
             pass
         elif user_role == 'faculty':
             advised_classes = Class.objects.filter(class_teacher=user)
@@ -421,7 +421,7 @@ class SubmissionDetailView(APIView):
         is_owner = bool(user and getattr(user, 'is_authenticated', False) and submission.user_id == user.id)
         is_staff_or_eval = bool(
             user and getattr(user, 'is_authenticated', False) and (
-                getattr(user, 'role', '') in ('admin', 'iqac', 'faculty', 'evaluation') or
+                getattr(user, 'role', '') in ('admin', 'faculty', 'evaluation') or
                 getattr(user, 'is_staff', False) or
                 getattr(user, 'is_superuser', False)
             )
@@ -526,7 +526,7 @@ class SubmissionDetailView(APIView):
                         {"error": "Unauthorized: Evaluator is not assigned to evaluate this criteria category."},
                         status=status.HTTP_403_FORBIDDEN
                     )
-        elif user.is_superuser or user_role in ('admin', 'iqac'):
+        elif user.is_superuser or user_role == 'admin':
             pass
         else:
             return Response(
@@ -748,7 +748,7 @@ class SubmissionDetailView(APIView):
         try:
             with transaction.atomic():
                 submission = Submission.objects.select_for_update().get(pk=pk)
-                if submission.status == 'Locked' and not (user_role in ('admin', 'iqac') or getattr(user, 'is_superuser', False)):
+                if submission.status == 'Locked' and not (user_role == 'admin' or getattr(user, 'is_superuser', False)):
                     return Response(
                         {"error": "This submission record has been locked and cannot be modified."},
                         status=status.HTTP_403_FORBIDDEN
