@@ -123,7 +123,7 @@ class CriteriaItemSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = CriteriaItem
-        fields = ['id', 'category', 'version', 'title', 'access_level', 'type', 'marks', 'rules_json', 'rules', 'created_at', 'updated_at']
+        fields = ['id', 'category', 'version', 'title', 'type', 'marks', 'rules_json', 'rules', 'created_at', 'updated_at']
 
 
 class CriteriaCategorySerializer(serializers.ModelSerializer):

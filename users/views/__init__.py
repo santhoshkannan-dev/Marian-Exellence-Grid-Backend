@@ -22,10 +22,6 @@ from .base import (
     allocate_student_from_email,
     get_tokens_for_user,
     is_user_student_rep,
-    is_staff_email,
-    is_student_email,
-    is_user_dqc_rep,
-    get_student_rep_classes,
     check_duplicate_submission,
     get_online_courses_item_ids,
     get_upsc_psc_item_ids,
@@ -90,11 +86,6 @@ from .health_views import (
     HealthCheckView,
 )
 
-from .evaluator_views import (
-    EvaluatorManagementView,
-    EvaluatorDetailView,
-)
-
 __all__ = [
     # Health Check
     "HealthCheckView",
@@ -156,12 +147,4 @@ __all__ = [
     "BugReportView",
     "SystemAuditLogView",
     "SubmissionAuditTrailView",
-    # Evaluator Views
-    "EvaluatorManagementView",
-    "EvaluatorDetailView",
-    # Additional helpers
-    "is_staff_email",
-    "is_student_email",
-    "is_user_dqc_rep",
-    "get_student_rep_classes",
 ]

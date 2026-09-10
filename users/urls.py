@@ -33,8 +33,6 @@ from .views import (
     SystemAuditLogView,
     SubmissionAuditTrailView,
     HealthCheckView,
-    EvaluatorManagementView,
-    EvaluatorDetailView,
 )
 
 urlpatterns = [
@@ -68,10 +66,7 @@ urlpatterns = [
     path('criteria-items/<int:pk>/', CriteriaItemDetailView.as_view(), name='criteria-item-detail'),
     path('champions/', ChampionListView.as_view(), name='champions-list'),
     path('champions/<int:pk>/', ChampionDetailView.as_view(), name='champions-detail'),
-    path('evaluators/', EvaluatorManagementView.as_view(), name='evaluator-management'),
-    path('evaluators/<path:email>/', EvaluatorDetailView.as_view(), name='evaluator-detail'),
     path('bug-reports/', BugReportView.as_view(), name='bug-reports'),
     path('auth/bypass/', DevBypassLoginView.as_view(), name='dev-bypass-login'),
 ]
-
 

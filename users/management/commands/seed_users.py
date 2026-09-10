@@ -158,6 +158,7 @@ class Command(BaseCommand):
         users_data = [
             ("santhosh.25pmc152@mariancollege.org", "student", "DCA", "II MCA", False, False, "Santhosh", "Kannan"),
             ("amal.25pmc114@mariancollege.org", "student", "DCA", "II MCA", False, False, "Amal", "Thomas"),
+            ("santhosh.25ubc154@mariancollege.org", "student", "DCA", "II BCA A", False, False, "Santhosh", "Kannan"),
             ("kochumol.abraham@mariancollege.org", "faculty", "DCA", None, True, False, "Kochumol", "Abraham"),
             ("allen.george@mariancollege.org", "evaluation", "DCA", None, True, False, "Allen", "George"),
             ("iqac@mariancollege.org", "iqac", "IQAC", None, True, False, "IQAC", "Coordinator"),
