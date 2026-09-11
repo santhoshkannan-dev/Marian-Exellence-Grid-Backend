@@ -84,15 +84,28 @@ def is_user_student_rep_for_class(user: User, class_obj: Optional[Class]) -> boo
     if not class_obj:
         return getattr(user, 'is_student_rep', False) or getattr(user, 'is_dqc_member', False)
 
+    user_email = (user.email or '').strip().lower()
+
     # 1. Direct DQC assignment on the class
     if class_obj.dqc_member_id == user.id:
         return True
-    # 2. Flag on user matching class
-    if (getattr(user, 'is_student_rep', False) or getattr(user, 'is_dqc_member', False)) and user.class_name_id == class_obj.id:
+    if user_email and class_obj.dqc_member and class_obj.dqc_member.email and class_obj.dqc_member.email.strip().lower() == user_email:
         return True
+    if user_email and Class.objects.filter(id=class_obj.id, dqc_member__email__iexact=user_email).exists():
+        return True
+
+    # 2. General rep flag on user matching class
+    from users.services.user_service import UserService
+    is_general_rep = (
+        getattr(user, 'is_student_rep', False) or
+        getattr(user, 'is_dqc_member', False) or
+        UserService.is_user_student_rep(user)
+    )
+    if is_general_rep and user.class_name_id == class_obj.id:
+        return True
+
     # 3. Check UserGroupMember table
     from users.models import UserGroupMember
-    user_email = (user.email or '').strip().lower()
     if user_email:
         members = UserGroupMember.objects.filter(
             group__group_id__in=['grp-student-reps', 'grp-dqc-student-rep'],

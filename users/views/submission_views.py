@@ -406,12 +406,9 @@ class SubmissionDetailView(APIView):
                 return Response({"error": "You do not have permission to view this submission."}, status=status.HTTP_403_FORBIDDEN)
         elif user_role == 'student':
             if submission.user_id != user.id:
-                if not is_user_student_rep(user):
-                    return Response({"error": "You do not have permission to view this submission."}, status=status.HTTP_403_FORBIDDEN)
-                rep_classes = Class.objects.filter(
-                    Q(dqc_member=user) | Q(dqc_member__email__iexact=user.email)
-                )
-                if not (submission.user and submission.user.class_name in rep_classes):
+                sub_class = submission.user.class_name if submission.user else None
+                from users.workflow import is_user_student_rep_for_class
+                if not is_user_student_rep_for_class(user, sub_class):
                     return Response({"error": "You do not have permission to view this submission."}, status=status.HTTP_403_FORBIDDEN)
         else:
             return Response({"error": "You do not have permission to view this submission."}, status=status.HTTP_403_FORBIDDEN)
@@ -443,43 +440,45 @@ class SubmissionDetailView(APIView):
 
         is_owner = (submission.user_id == user.id)
         user_role = getattr(user, 'role', None)
-        is_rep = is_user_student_rep(user)
+        sub_class = submission.user.class_name if submission.user else None
+        from users.workflow import is_user_student_rep_for_class
+        is_rep_for_class = is_user_student_rep_for_class(user, sub_class)
 
         if user_role == 'student':
-            if is_owner:
+            req_status = request.data.get('status')
+
+            # Students can never assign evaluation marks
+            if request.data.get('marks') is not None and request.data.get('marks') != submission.marks:
+                return Response(
+                    {"error": "Unauthorized: Students cannot assign evaluation marks."},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+
+            # 1. Check if the user is an authorized Student Representative verifying/reviewing for this class
+            if is_rep_for_class and req_status and req_status != submission.status:
+                allowed_rep_statuses = {'Student Rep Verified', 'Correction Requested', 'Rejected', 'Pending Rep Verification', 'Pending', 'Submitted'}
+                if req_status not in allowed_rep_statuses:
+                    return Response(
+                        {"error": f"Student representatives cannot transition submission to '{req_status}'."},
+                        status=status.HTTP_403_FORBIDDEN
+                    )
+                # Authorized student representative verification permitted (even if self-submitted)
+            # 2. Check regular student owner edit/submission rules
+            elif is_owner:
                 if submission.status in UNEDITABLE_BY_STUDENT_STATES:
                     return Response(
                         {"error": f"Submission cannot be edited in '{submission.status}' status."},
                         status=status.HTTP_403_FORBIDDEN
                     )
-                req_status = request.data.get('status')
                 if req_status and req_status != submission.status:
                     if req_status in ('Approved', 'Verified', 'Teacher Verified', 'Student Rep Verified', 'Evaluated', 'Locked'):
                         return Response(
                             {"error": "Unauthorized: Students cannot alter verification or evaluation status."},
                             status=status.HTTP_403_FORBIDDEN
                         )
-                if request.data.get('marks') is not None and request.data.get('marks') != submission.marks:
-                    return Response(
-                        {"error": "Unauthorized: Students cannot assign evaluation marks."},
-                        status=status.HTTP_403_FORBIDDEN
-                    )
-            elif is_rep:
-                rep_classes = Class.objects.filter(
-                    Q(dqc_member=user) | Q(dqc_member__email__iexact=user.email)
-                )
-                if not (submission.user and submission.user.class_name in rep_classes):
-                    return Response(
-                        {"error": "Student representative is not assigned to this student's class."},
-                        status=status.HTTP_403_FORBIDDEN
-                    )
-                allowed_rep_statuses = {'Student Rep Verified', 'Correction Requested', 'Rejected', 'Pending Rep Verification', 'Pending', 'Submitted'}
-                req_status = request.data.get('status')
-                if req_status and req_status not in allowed_rep_statuses:
-                    return Response(
-                        {"error": f"Student representatives cannot transition submission to '{req_status}'."},
-                        status=status.HTTP_403_FORBIDDEN
-                    )
+            # 3. Student rep updating remarks or metadata without status change
+            elif is_rep_for_class:
+                pass
             else:
                 return Response(
                     {"error": "You do not have permission to modify this submission."},
