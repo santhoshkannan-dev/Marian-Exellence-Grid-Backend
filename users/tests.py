@@ -4762,4 +4762,53 @@ class OfficialUserGroupsAndAccessManagementRegressionTest(APITestCase):
         self.assertEqual(get_user_badge(self.dqc_student), 'DQC member')
         self.assertEqual(get_user_badge(self.student_rep), 'Student Rep')
 
+    def test_student_representative_limited_submission_categories(self):
+        """
+        Student Representatives user group members must ONLY have access to limited individual
+        categories like normal students, whereas DQC Student Rep members can submit to class-level categories.
+        """
+        from users.models import UserGroupModel, UserGroupMember, CriteriaCategory, CriteriaItem
+
+        ay, _ = AcademicYear.objects.get_or_create(year='2025-2026', defaults={'is_active': True})
+        cat_acad, _ = CriteriaCategory.objects.get_or_create(category='Academics', code='cat-academics')
+        item_acad, _ = CriteriaItem.objects.get_or_create(category=cat_acad, title='Semester Exam Results', defaults={'type': 'fixed', 'marks': 10.0})
+        item_research, _ = CriteriaItem.objects.get_or_create(category=self.cat, title='Conference Paper', defaults={'type': 'fixed', 'marks': 5.0})
+
+        dqc_grp = UserGroupModel.objects.get(group_id='grp-dqc-student-rep')
+        rep_grp = UserGroupModel.objects.get(group_id='grp-student-reps')
+
+        UserGroupMember.objects.create(group=rep_grp, email=self.student_rep.email, badge='Student Rep')
+        UserGroupMember.objects.create(group=dqc_grp, email=self.dqc_student.email, badge='DQC member')
+
+        # 1. Student Rep member attempting to submit in restricted Academics category -> 403 Forbidden
+        self.client.force_authenticate(user=self.student_rep)
+        res_rep_acad = self.client.post('/api/submissions/', {
+            'criteriaId': item_acad.id,
+            'academicYear': '2025-2026',
+            'description': 'Student rep trying to submit class academics',
+            'status': 'Draft'
+        }, format='json')
+        self.assertEqual(res_rep_acad.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertIn("restricted to DQC members only", res_rep_acad.data['error'])
+
+        # 2. Student Rep member submitting standard individual activity category -> 201 Created
+        res_rep_res = self.client.post('/api/submissions/', {
+            'criteriaId': item_research.id,
+            'academicYear': '2025-2026',
+            'description': 'Student rep publishing conference paper',
+            'status': 'Draft'
+        }, format='json')
+        self.assertEqual(res_rep_res.status_code, status.HTTP_201_CREATED)
+
+        # 3. DQC member submitting in Academics category -> 201 Created
+        self.client.force_authenticate(user=self.dqc_student)
+        res_dqc_acad = self.client.post('/api/submissions/', {
+            'criteriaId': item_acad.id,
+            'academicYear': '2025-2026',
+            'description': 'DQC member updating class semester results',
+            'status': 'Draft'
+        }, format='json')
+        self.assertEqual(res_dqc_acad.status_code, status.HTTP_201_CREATED)
+
+
 

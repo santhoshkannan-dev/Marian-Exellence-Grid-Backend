@@ -186,6 +186,24 @@ class SubmissionListView(APIView):
             except (ValueError, TypeError):
                 return Response({"error": "Invalid marks value provided."}, status=status.HTTP_400_BAD_REQUEST)
 
+        # Check restricted categories for students:
+        # Only DQC members or faculty/admin can submit class-level categories (Academics, Documentation, Programs Organized).
+        # Student Representatives and normal students can only submit individual activity categories.
+        if user_role == 'student' and criteria_item and criteria_item.category:
+            cat_code = (criteria_item.category.code or '').lower()
+            cat_name = (criteria_item.category.category or '').lower()
+            is_class_level_cat = (
+                cat_code in ('cat-academics', 'cat-documentation', 'cat-programs-organized') or
+                cat_name in ('academics', 'documentation', 'programs organized')
+            )
+            if is_class_level_cat:
+                is_dqc = UserService.is_user_dqc_rep(user)
+                if not is_dqc:
+                    return Response(
+                        {"error": f"Submission to category '{criteria_item.category.category}' is restricted to DQC members only. Student Representatives and normal students can only submit individual activity categories."},
+                        status=status.HTTP_403_FORBIDDEN
+                    )
+
         # Check submission limits for Online Courses and UPSC/PSC Exams
         try:
             criteria_id_int = int(criteria_id)
@@ -539,9 +557,21 @@ class SubmissionDetailView(APIView):
                 target_criteria_id = int(request.data['criteriaId'])
             except (ValueError, TypeError):
                 return Response({"error": "criteriaId must be a valid integer ID."}, status=status.HTTP_400_BAD_REQUEST)
-            c_check = CriteriaItem.objects.filter(pk=target_criteria_id).first()
+            c_check = CriteriaItem.objects.filter(pk=target_criteria_id).select_related('category').first()
             if not c_check:
                 return Response({"error": f"Criteria item with id '{target_criteria_id}' does not exist."}, status=status.HTTP_404_NOT_FOUND)
+            if user_role == 'student' and c_check.category:
+                cat_code = (c_check.category.code or '').lower()
+                cat_name = (c_check.category.category or '').lower()
+                is_class_level_cat = (
+                    cat_code in ('cat-academics', 'cat-documentation', 'cat-programs-organized') or
+                    cat_name in ('academics', 'documentation', 'programs organized')
+                )
+                if is_class_level_cat and not UserService.is_user_dqc_rep(user):
+                    return Response(
+                        {"error": f"Submission to category '{c_check.category.category}' is restricted to DQC members only."},
+                        status=status.HTTP_403_FORBIDDEN
+                    )
         else:
             target_criteria_id = int(submission.criteria_id)
 
