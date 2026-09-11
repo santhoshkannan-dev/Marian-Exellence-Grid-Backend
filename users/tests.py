@@ -2439,7 +2439,7 @@ class Phase5WorkflowIntegrityRegressionTest(TestCase):
         }, format='json')
         self.assertEqual(res_submit.status_code, status.HTTP_200_OK)
 
-        # Step 3: DQAC Student Rep verifies Submitted -> Student Rep Verified
+        # Step 3: DQC Student Rep verifies Submitted -> Student Rep Verified
         self.client.force_authenticate(user=self.rep_mca)
         res_rep = self.client.put(f'/api/submissions/{sub_id}/', {
             'status': 'Student Rep Verified',

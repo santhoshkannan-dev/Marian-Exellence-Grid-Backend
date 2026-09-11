@@ -174,7 +174,7 @@ def determine_stage(target_status: str, actor: Optional[User]) -> Tuple[int, str
     if norm in (WorkflowState.DRAFT, WorkflowState.SUBMITTED, WorkflowState.PENDING_REP_VERIFICATION):
         return 1, "Student Claims"
     elif norm == WorkflowState.STUDENT_REP_VERIFIED:
-        return 2, "DQAC Member Verification"
+        return 2, "DQC Member Verification"
     elif norm in (WorkflowState.TEACHER_VERIFIED, WorkflowState.APPROVED, WorkflowState.VERIFIED):
         return 3, "Class Teacher Verification"
     elif norm == WorkflowState.EVALUATED:
@@ -184,7 +184,7 @@ def determine_stage(target_status: str, actor: Optional[User]) -> Tuple[int, str
     elif norm in (WorkflowState.CORRECTION_REQUESTED, WorkflowState.REJECTED):
         # Stage corresponds to the reviewing actor requesting correction / rejecting
         if actor_role == 'student':
-            return 2, "DQAC Member Verification"
+            return 2, "DQC Member Verification"
         elif actor_role == 'faculty':
             return 3, "Class Teacher Verification"
         elif actor_role == 'evaluation':
