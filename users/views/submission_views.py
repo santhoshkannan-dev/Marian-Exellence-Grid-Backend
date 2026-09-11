@@ -11,7 +11,8 @@ from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 
-from users.models import Submission, Class, AcademicYear, CriteriaItem, CriteriaVersion, AcademicGradeBreakdown
+from django.utils import timezone
+from users.models import Submission, Class, AcademicYear, CriteriaItem, CriteriaVersion, AcademicGradeBreakdown, CriteriaCategory
 from users.serializers import SubmissionSerializer
 from users.file_security import save_private_evidence_file, resolve_safe_private_path
 from users.scoring_engine import calculate_submission_score
@@ -42,9 +43,24 @@ class SubmissionListView(APIView):
         limit_param = request.query_params.get('limit')
         offset_param = request.query_params.get('offset', 0)
 
+        queue_param = request.query_params.get('queue')
+        status_param = request.query_params.get('status')
+        role_context = (
+            request.headers.get('X-Role-Context') or
+            request.query_params.get('role_context') or
+            request.query_params.get('role') or
+            (request.session.get('active_role') if hasattr(request, 'session') and request.session else None)
+        )
+        if not role_context and user and getattr(user, 'id', None):
+            from django.core.cache import cache
+            role_context = cache.get(f"user_active_role_{user.id}")
+
         queryset = SubmissionService.filter_submissions_for_user(
             user=user,
-            academic_year=academic_year
+            academic_year=academic_year,
+            queue=queue_param,
+            status_filter=status_param,
+            role_context=role_context
         )
 
         total_count = None
@@ -186,52 +202,98 @@ class SubmissionListView(APIView):
             except (ValueError, TypeError):
                 return Response({"error": "Invalid marks value provided."}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Check restricted categories for students:
-        # Only DQC members or faculty/admin can submit class-level categories (Academics, Documentation, Programs Organized).
-        # Student Representatives and normal students can only submit individual activity categories.
-        if user_role == 'student' and criteria_item and criteria_item.category:
-            cat_code = (criteria_item.category.code or '').lower()
-            cat_name = (criteria_item.category.category or '').lower()
-            is_class_level_cat = (
-                cat_code in ('cat-academics', 'cat-documentation', 'cat-programs-organized') or
-                cat_name in ('academics', 'documentation', 'programs organized')
-            )
-            if is_class_level_cat:
-                is_dqc = UserService.is_user_dqc_rep(user)
-                if not is_dqc:
-                    return Response(
-                        {"error": f"Submission to category '{criteria_item.category.category}' is restricted to DQC members only. Student Representatives and normal students can only submit individual activity categories."},
-                        status=status.HTTP_403_FORBIDDEN
-                    )
+        # --- 12-Category Subcategory-Level Access Control & Submit Limit Enforcement ---
+        # Delegate to access_rules — the single source of truth for all 12 categories.
+        from users.access_rules import validate_subcategory_access, get_submission_cycle_limit
 
-        # Check submission limits for Online Courses and UPSC/PSC Exams
-        try:
-            criteria_id_int = int(criteria_id)
-            online_item_ids = SubmissionService.get_online_courses_item_ids()
-            if criteria_id_int in online_item_ids:
-                existing_count = Submission.objects.filter(
-                    user=user,
-                    criteria_id__in=online_item_ids
-                ).exclude(status='Rejected').count()
-                if existing_count >= 3:
-                    return Response(
-                        {"error": "Maximum 3 online courses can be submitted per student. Limit of 3 reached."},
-                        status=status.HTTP_400_BAD_REQUEST
-                    )
+        evidence_dict = evidence if isinstance(evidence, dict) else {}
 
-            upsc_item_ids = SubmissionService.get_upsc_psc_item_ids()
-            if criteria_id_int in upsc_item_ids:
-                existing_count = Submission.objects.filter(
+        # 1. Access Control (DQC-only categories + hybrid subcategory rules)
+        access_allowed, access_error = validate_subcategory_access(user, criteria_item, evidence_dict)
+        if not access_allowed:
+            return Response({"error": access_error}, status=status.HTTP_403_FORBIDDEN)
+
+        # 2. Cycle Submission Limit Enforcement
+        cycle_max, cycle_label = get_submission_cycle_limit(criteria_item, evidence_dict)
+        if cycle_max is not None:
+            cat_code_raw = (criteria_item.category.code or '') if (criteria_item and criteria_item.category) else ''
+            cat_code_norm = cat_code_raw.lower()
+
+            if 'academics' in cat_code_norm or cat_code_norm == 'cat-academics':
+                # Academics: limit is per class (DQC submits on behalf of class)
+                user_cls = user.class_name
+                cycle_count = Submission.objects.filter(
+                    Q(user=user) | Q(user__class_name=user_cls, class_obj=user_cls),
+                    academic_year=academic_year,
+                    criteria_id=criteria_id_int
+                ).exclude(status__in=['Rejected', 'REJECTED']).count()
+            else:
+                # All other categories: limit is per student, per criteria_id
+                cycle_count = Submission.objects.filter(
                     user=user,
-                    criteria_id__in=upsc_item_ids
-                ).exclude(status='Rejected').count()
-                if existing_count >= 3:
-                    return Response(
-                        {"error": "Maximum 3 submissions allowed for UPSC/PSC Exam Participation. Limit of 3 reached."},
-                        status=status.HTTP_400_BAD_REQUEST
-                    )
-        except (ValueError, TypeError):
-            pass
+                    criteria_id=criteria_id_int,
+                    academic_year=academic_year
+                ).exclude(status__in=['Rejected', 'REJECTED']).count()
+
+            if cycle_count >= cycle_max:
+                return Response(
+                    {"error": f"Maximum {cycle_max} '{cycle_label}' submission(s) allowed per evaluation cycle. Limit reached."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+        # 3. Category Specific Field Validations
+        # Resolve category identifiers needed by the field validation checks below.
+        cat_code = (criteria_item.category.code or '').lower() if (criteria_item and criteria_item.category) else ''
+        cat_name = (criteria_item.category.category or '').lower() if (criteria_item and criteria_item.category) else ''
+
+        # A. Startups: Requires Startup Name, Registration Date, Govt ID
+        if 'startup' in cat_code or 'startup' in cat_name:
+            ev_dict = evidence if isinstance(evidence, dict) else {}
+            startup_name = ev_dict.get('startupName') or ev_dict.get('companyName') or request.data.get('startupName') or clean_desc
+            startup_reg_date = ev_dict.get('regDate') or ev_dict.get('registrationDate') or start_date
+            startup_govt_id = ev_dict.get('govtId') or ev_dict.get('startupGovtId') or request.data.get('govtId') or request.data.get('certificateId') or request.data.get('certificate_id')
+
+            if not startup_name:
+                return Response({"error": "Startup Name is required for Startup submissions."}, status=status.HTTP_400_BAD_REQUEST)
+            if not startup_reg_date:
+                return Response({"error": "Registration Date is required for Startup submissions."}, status=status.HTTP_400_BAD_REQUEST)
+            if not startup_govt_id:
+                return Response({"error": "Govt Registration ID is required for Startup submissions."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # B. Programs Organized: Requires Event Name & Official Event ID
+        if 'program' in cat_code or 'program' in cat_name:
+            ev_dict = evidence if isinstance(evidence, dict) else {}
+            prog_name = ev_dict.get('eventName') or request.data.get('eventName') or clean_desc
+            prog_event_id = event_id or ev_dict.get('eventId') or ev_dict.get('officialEventId') or request.data.get('eventId')
+
+            if not prog_name:
+                return Response({"error": "Event Name is required for Programs Organized submissions."}, status=status.HTTP_400_BAD_REQUEST)
+            if not prog_event_id:
+                return Response({"error": "Official Event ID is required for Programs Organized submissions."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # C. Internships: Date window constraint (June 01 - March 30)
+        if 'internship' in cat_code or 'internship' in cat_name:
+            check_date_str = start_date or request.data.get('startDate') or ''
+            if check_date_str:
+                import datetime as dt_mod
+                try:
+                    # Support YYYY-MM-DD or DD/MM/YYYY
+                    if '-' in check_date_str:
+                        parts = check_date_str.split('-')
+                        check_month = int(parts[1])
+                    elif '/' in check_date_str:
+                        parts = check_date_str.split('/')
+                        check_month = int(parts[1])
+                    else:
+                        check_month = None
+
+                    if check_month in (4, 5):
+                        return Response(
+                            {"error": "Internships must fall within the institutional window (June 01 - March 30). April and May dates are not eligible."},
+                            status=status.HTTP_400_BAD_REQUEST
+                        )
+                except (ValueError, IndexError):
+                    pass
 
         # Academic Grade Breakdown Validation & Auto-Calculation
         if isinstance(evidence, dict) and "grades" in evidence:
@@ -315,27 +377,73 @@ class SubmissionListView(APIView):
         clean_evidence.pop("totalStudents", None)
         clean_evidence.pop("passCount", None)
 
-        if marks is None:
-            c_item = CriteriaItem.objects.filter(pk=criteria_id_int).first()
-            if c_item:
-                marks = calculate_submission_score(c_item, evidence)
+        # Resolve SubCategory for categories containing subcategories
+        c_item = CriteriaItem.objects.filter(pk=criteria_id_int).select_related('category').first()
+        c_category = c_item.category if c_item else None
+        is_man_eval = getattr(c_item, 'is_manual_eval', False) or (c_category and getattr(c_category, 'is_manual_eval', False))
+
+        raw_sub_id = request.data.get('subcategoryId') or request.data.get('subcategory_id')
+        from users.models import SubCategory
+        subcat = None
+        if raw_sub_id:
+            try:
+                subcat = SubCategory.objects.filter(pk=int(raw_sub_id)).first()
+            except (ValueError, TypeError):
+                pass
+
+        if not subcat:
+            subcat = SubCategory.find_subcategory(
+                subcategory_id=raw_sub_id,
+                category_id=getattr(c_category, 'id', None),
+                category_code=getattr(c_category, 'code', None),
+                criteria_item=c_item,
+                evidence=evidence
+            )
+
+        if subcat:
+            # Strictly driven by subcategory.default_marks
+            count_val = 1
+            if (c_item and c_item.type == 'count') or (isinstance(evidence, dict) and 'count' in evidence):
+                try:
+                    count_val = max(1, int(evidence.get('count', 1)))
+                except (ValueError, TypeError):
+                    count_val = 1
+            calculated_marks = float(subcat.default_marks) * count_val
+            marks = int(round(calculated_marks))
+            subcat_id_to_store = subcat.id
+        else:
+            subcat_id_to_store = None
+            if marks is None:
+                if c_item:
+                    marks = calculate_submission_score(c_item, evidence)
+                calculated_marks = float(marks) if marks is not None else None
+            else:
+                calculated_marks = float(marks)
 
         try:
             with transaction.atomic():
                 submission = Submission.objects.create(
                     user=user,
+                    class_obj=user.class_name,
+                    category=c_category,
                     criteria_id=criteria_id_int,
+                    subcategory_id=subcat_id_to_store,
                     criteria_version=active_cv,
                     academic_year=academic_year,
+                    submission_date=timezone.now(),
                     description=description,
                     status=status_val,
                     remarks=remarks,
                     marks=marks,
+                    calculated_marks=calculated_marks,
+                    is_manual_eval=is_man_eval,
                     proof=proof,
+                    proof_url=proof,
                     proof_hash=proof_h,
                     certificate_id=cert_id,
                     event_id=event_id,
                     evidence=clean_evidence,
+                    submission_metadata=clean_evidence,
                     start_date=start_date,
                     end_date=end_date
                 )
@@ -459,8 +567,39 @@ class SubmissionDetailView(APIView):
         is_owner = (submission.user_id == user.id)
         user_role = getattr(user, 'role', None)
         sub_class = submission.user.class_name if submission.user else None
-        from users.workflow import is_user_student_rep_for_class
+        from users.workflow import is_user_student_rep_for_class, is_user_class_advisor, is_evaluator_assigned_to_item
         is_rep_for_class = is_user_student_rep_for_class(user, sub_class)
+
+        req_role_context = (
+            request.data.get('role_context') or
+            request.data.get('role') or
+            request.headers.get('X-Role-Context') or
+            request.query_params.get('role_context') or
+            (request.session.get('active_role') if hasattr(request, 'session') and request.session else None)
+        )
+        if not req_role_context and user and getattr(user, 'id', None):
+            from django.core.cache import cache
+            req_role_context = cache.get(f"user_active_role_{user.id}")
+        if req_role_context:
+            req_role_context = str(req_role_context).strip().lower()
+
+        # Determine effective role for workflow execution
+        effective_role = user_role
+        is_eval_assigned = is_evaluator_assigned_to_item(user, submission.criteria_id)
+        if req_role_context in ('evaluator', 'evaluation'):
+            effective_role = 'evaluation'
+        elif req_role_context in ('teacher', 'faculty'):
+            effective_role = 'faculty'
+        elif user_role == 'faculty' and is_eval_assigned:
+            is_eval_action = (
+                request.data.get('status') in ('Evaluated', 'Approved') or
+                request.data.get('evaluatorVerified') is True or
+                request.data.get('actionType') == 'APPROVE_AND_CREDIT' or
+                'evaluatorRemarks' in request.data or
+                submission.status in ('Teacher Verified', 'EVALUATOR_PENDING')
+            )
+            if is_eval_action or not is_user_class_advisor(user, sub_class):
+                effective_role = 'evaluation'
 
         if user_role == 'student':
             req_status = request.data.get('status')
@@ -474,7 +613,13 @@ class SubmissionDetailView(APIView):
 
             # 1. Check if the user is an authorized Student Representative verifying/reviewing for this class
             if is_rep_for_class and req_status and req_status != submission.status:
-                allowed_rep_statuses = {'Student Rep Verified', 'Correction Requested', 'Rejected', 'Pending Rep Verification', 'Pending', 'Submitted'}
+                allowed_rep_statuses = {
+                    'Student Rep Verified', 'TEACHER_PENDING',
+                    'Correction Requested', 'SENT_BACK',
+                    'Rejected', 'REJECTED',
+                    'Pending Rep Verification', 'DQC_PENDING',
+                    'Pending', 'Submitted'
+                }
                 if req_status not in allowed_rep_statuses:
                     return Response(
                         {"error": f"Student representatives cannot transition submission to '{req_status}'."},
@@ -502,9 +647,8 @@ class SubmissionDetailView(APIView):
                     {"error": "You do not have permission to modify this submission."},
                     status=status.HTTP_403_FORBIDDEN
                 )
-        elif user_role == 'faculty':
-            advised_classes = Class.objects.filter(class_teacher=user)
-            is_class_teacher = bool(submission.user and submission.user.class_name in advised_classes)
+        elif effective_role == 'faculty':
+            is_class_teacher = is_user_class_advisor(user, sub_class)
             is_same_dept = bool(submission.user and user.department_id and (submission.user.department_id == user.department_id))
             if not (is_class_teacher or is_same_dept):
                 return Response(
@@ -526,7 +670,7 @@ class SubmissionDetailView(APIView):
                     {"error": "Unauthorized: Faculty cannot alter evaluator verification status."},
                     status=status.HTTP_403_FORBIDDEN
                 )
-        elif user_role == 'evaluation':
+        elif effective_role == 'evaluation':
             req_c_val = request.data.get('criteriaId', submission.criteria_id)
             try:
                 req_criteria_id = int(req_c_val)
@@ -535,14 +679,11 @@ class SubmissionDetailView(APIView):
             criteria_item = CriteriaItem.objects.filter(pk=req_criteria_id).select_related('category').first()
             if not criteria_item:
                 return Response({"error": f"Criteria item with id '{req_criteria_id}' does not exist."}, status=status.HTTP_404_NOT_FOUND)
-            if criteria_item and criteria_item.category and criteria_item.category.evaluators:
-                cat_evaluators = [str(e).strip().lower() for e in criteria_item.category.evaluators if e]
-                user_email = (user.email or '').strip().lower()
-                if cat_evaluators and user_email not in cat_evaluators:
-                    return Response(
-                        {"error": "Unauthorized: Evaluator is not assigned to evaluate this criteria category."},
-                        status=status.HTTP_403_FORBIDDEN
-                    )
+            if not is_evaluator_assigned_to_item(user, req_criteria_id):
+                return Response(
+                    {"error": "Unauthorized: Evaluator is not assigned to evaluate this criteria category."},
+                    status=status.HTTP_403_FORBIDDEN
+                )
         elif user.is_superuser or user_role == 'admin':
             pass
         else:
@@ -560,20 +701,26 @@ class SubmissionDetailView(APIView):
             c_check = CriteriaItem.objects.filter(pk=target_criteria_id).select_related('category').first()
             if not c_check:
                 return Response({"error": f"Criteria item with id '{target_criteria_id}' does not exist."}, status=status.HTTP_404_NOT_FOUND)
-            if user_role == 'student' and c_check.category:
-                cat_code = (c_check.category.code or '').lower()
-                cat_name = (c_check.category.category or '').lower()
-                is_class_level_cat = (
-                    cat_code in ('cat-academics', 'cat-documentation', 'cat-programs-organized') or
-                    cat_name in ('academics', 'documentation', 'programs organized')
-                )
-                if is_class_level_cat and not UserService.is_user_dqc_rep(user):
-                    return Response(
-                        {"error": f"Submission to category '{c_check.category.category}' is restricted to DQC members only."},
-                        status=status.HTTP_403_FORBIDDEN
-                    )
         else:
             target_criteria_id = int(submission.criteria_id)
+            c_check = CriteriaItem.objects.filter(pk=target_criteria_id).select_related('category').first()
+
+        # Subcategory-Level Access Control on update — delegate to access_rules
+        # Class representatives have full verification authority over all 12 categories for their class.
+        # Subcategory submission constraints only apply to student authors modifying evidence.
+        if user_role == 'student' and c_check and not is_rep_for_class:
+            from users.access_rules import validate_subcategory_access
+            ev_to_check = request.data.get('evidence', submission.evidence)
+            if isinstance(ev_to_check, str):
+                import json as _json
+                try:
+                    ev_to_check = _json.loads(ev_to_check)
+                except Exception:
+                    ev_to_check = {}
+            ev_to_check = ev_to_check if isinstance(ev_to_check, dict) else {}
+            upd_access_allowed, upd_access_error = validate_subcategory_access(user, c_check, ev_to_check)
+            if not upd_access_allowed:
+                return Response({"error": upd_access_error}, status=status.HTTP_403_FORBIDDEN)
 
         # Validate academicYear on update
         if 'academicYear' in request.data and request.data.get('academicYear') is not None:
@@ -723,7 +870,8 @@ class SubmissionDetailView(APIView):
             submission=submission,
             target_status_input=req_status,
             user=user,
-            data=request.data
+            data=request.data,
+            role_context=req_role_context
         )
         if not is_valid:
             if err_msg.startswith("Invalid workflow state transition"):
@@ -751,27 +899,35 @@ class SubmissionDetailView(APIView):
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
-            criteria_item = CriteriaItem.objects.filter(pk=target_criteria_id).first()
+            criteria_item = CriteriaItem.objects.filter(pk=target_criteria_id).select_related('category').first()
             if criteria_item:
                 target_ev = request.data.get('evidence', submission.evidence)
-                allowed_min, allowed_max, details = SubmissionService.get_criteria_allowed_bounds(criteria_item, target_ev)
+                is_manual = getattr(criteria_item, 'is_manual_eval', False) or (criteria_item.category and getattr(criteria_item.category, 'is_manual_eval', False))
+                if is_manual:
+                    if req_marks < 0 or req_marks > 500:
+                        return Response(
+                            {"error": "Manual evaluation score must be between 0 and 500."},
+                            status=status.HTTP_400_BAD_REQUEST
+                        )
+                else:
+                    allowed_min, allowed_max, details = SubmissionService.get_criteria_allowed_bounds(criteria_item, target_ev)
 
-                is_negative = (criteria_item.type in ('negative', 'academic_grades')) or (allowed_min < 0)
-                if req_marks < 0 and not is_negative:
-                    return Response(
-                        {"error": f"Score ({req_marks}) cannot be negative for non-penalty criteria."},
-                        status=status.HTTP_400_BAD_REQUEST
-                    )
-                if req_marks > (allowed_max + 1e-5):
-                    return Response(
-                        {"error": f"Requested score ({req_marks}) exceeds the maximum allowed limit ({allowed_max}) for criteria '{criteria_item.title}'{details}."},
-                        status=status.HTTP_400_BAD_REQUEST
-                    )
-                if allowed_min is not None and req_marks < (allowed_min - 1e-5):
-                    return Response(
-                        {"error": f"Requested score ({req_marks}) is below the minimum allowed limit ({allowed_min}) for criteria '{criteria_item.title}'."},
-                        status=status.HTTP_400_BAD_REQUEST
-                    )
+                    is_negative = (criteria_item.type in ('negative', 'academic_grades')) or (allowed_min < 0)
+                    if req_marks < 0 and not is_negative:
+                        return Response(
+                            {"error": f"Score ({req_marks}) cannot be negative for non-penalty criteria."},
+                            status=status.HTTP_400_BAD_REQUEST
+                        )
+                    if req_marks > (allowed_max + 1e-5):
+                        return Response(
+                            {"error": f"Requested score ({req_marks}) exceeds the maximum allowed limit ({allowed_max}) for criteria '{criteria_item.title}'{details}."},
+                            status=status.HTTP_400_BAD_REQUEST
+                        )
+                    if allowed_min is not None and req_marks < (allowed_min - 1e-5):
+                        return Response(
+                            {"error": f"Requested score ({req_marks}) is below the minimum allowed limit ({allowed_min}) for criteria '{criteria_item.title}'."},
+                            status=status.HTTP_400_BAD_REQUEST
+                        )
 
         # 4. Save updates and record audit log inside atomic transaction
         try:
@@ -827,6 +983,41 @@ class SubmissionDetailView(APIView):
                 )
                 marks_val = request.data.get('marks')
 
+                if 'subcategoryId' in request.data or 'subcategory_id' in request.data:
+                    raw_sub = request.data.get('subcategoryId') or request.data.get('subcategory_id')
+                    try:
+                        extra_updates['subcategory_id'] = int(raw_sub)
+                    except (ValueError, TypeError):
+                        pass
+
+                crit_to_check = CriteriaItem.objects.filter(pk=extra_updates.get('criteria_id', submission.criteria_id)).select_related('category').first()
+                if crit_to_check and crit_to_check.category:
+                    cat_code_check = (crit_to_check.category.code or '').strip().lower()
+                    if cat_code_check not in ('cat-academics', 'cat-career-advancement', 'cat-documentation'):
+                        from users.models import SubCategory
+                        sub_to_find = extra_updates.get('subcategory_id', submission.subcategory_id)
+                        matched_sub = SubCategory.find_subcategory(
+                            subcategory_id=sub_to_find,
+                            category_id=getattr(crit_to_check.category, 'id', None),
+                            category_code=cat_code_check,
+                            criteria_item=crit_to_check,
+                            evidence=upd_ev
+                        )
+                        if matched_sub:
+                            extra_updates['subcategory_id'] = matched_sub.id
+                            count_val = 1
+                            if crit_to_check.type == 'count' or 'count' in upd_ev:
+                                try:
+                                    count_val = max(1, int(upd_ev.get('count', 1)))
+                                except (ValueError, TypeError):
+                                    count_val = 1
+                            calculated_val = float(matched_sub.default_marks) * count_val
+                            extra_updates['calculated_marks'] = calculated_val
+                            if marks_val is None or user_role == 'student':
+                                marks_val = calculated_val
+
+                action_type = request.data.get('actionType') or request.data.get('action')
+
                 submission = execute_workflow_transition(
                     submission=submission,
                     target_status=target_status,
@@ -834,6 +1025,8 @@ class SubmissionDetailView(APIView):
                     remarks=remarks_val,
                     marks=marks_val,
                     request=request,
+                    role_context=req_role_context,
+                    actionType=action_type,
                     **extra_updates
                 )
         except IntegrityError as e:

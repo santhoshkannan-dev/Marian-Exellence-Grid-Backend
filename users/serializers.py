@@ -3,8 +3,19 @@ from .models import (
     Department, Course, AcademicYear, Class, User,
     CriteriaCategory, CriteriaItem, CriteriaRule, CriteriaVersion, Submission,
     AcademicGradeBreakdown, WorkflowAuditTrail, ClassIndexResult,
-    Champion, BugReport, SystemAuditLog
+    Champion, BugReport, SystemAuditLog, VerificationLog,
+    TeacherClassAssignment, EvaluatorCategoryAssignment, StaffProfile,
+    Category, SubCategory
 )
+
+
+class StaffProfileSerializer(serializers.ModelSerializer):
+    department_name = serializers.CharField(source='department.name', read_only=True)
+    department_code = serializers.CharField(source='department.code', read_only=True)
+
+    class Meta:
+        model = StaffProfile
+        fields = ['id', 'user', 'department', 'department_name', 'department_code', 'designation']
 
 
 class AcademicYearSerializer(serializers.ModelSerializer):
@@ -60,7 +71,8 @@ class ClassSerializer(serializers.ModelSerializer):
     class Meta:
         model = Class
         fields = [
-            'id', 'name', 'department', 'department_name',
+            'id', 'name', 'class_code', 'batch_year', 'academic_year',
+            'department', 'department_name',
             'course', 'course_name', 'course_abbreviation',
             'year_number', 'section', 'batch_start_year',
             'class_teacher', 'class_teacher_name', 'class_teacher_email',
@@ -85,6 +97,61 @@ class ClassSerializer(serializers.ModelSerializer):
         return value
 
 
+class VerificationLogSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = VerificationLog
+        fields = [
+            'id', 'submission', 'verification_level', 'verifier_id',
+            'verifier_name', 'action', 'remarks', 'timestamp', 'action_timestamp'
+        ]
+        read_only_fields = '__all__'
+
+
+class TeacherClassAssignmentSerializer(serializers.ModelSerializer):
+    teacher_email = serializers.CharField(source='teacher.email', read_only=True)
+    teacher_name = serializers.CharField(source='teacher.get_full_name', read_only=True)
+    class_name = serializers.CharField(source='class_obj.name', read_only=True)
+    assigned_by_email = serializers.CharField(source='assigned_by.email', read_only=True)
+
+    class Meta:
+        model = TeacherClassAssignment
+        fields = [
+            'id', 'teacher', 'teacher_email', 'teacher_name',
+            'class_obj', 'class_name', 'academic_year',
+            'assigned_by', 'assigned_by_email', 'assigned_at', 'created_at', 'is_active'
+        ]
+
+
+class EvaluatorCategoryAssignmentSerializer(serializers.ModelSerializer):
+    category_name = serializers.CharField(source='category.category', read_only=True)
+    category_code = serializers.CharField(source='category.code', read_only=True)
+    evaluator_email = serializers.SerializerMethodField()
+    evaluator_name = serializers.SerializerMethodField()
+    assigned_by_email = serializers.CharField(source='assigned_by.email', read_only=True)
+
+    def get_evaluator_email(self, obj):
+        if obj.evaluator:
+            return obj.evaluator.email
+        if obj.member:
+            return obj.member.email
+        return None
+
+    def get_evaluator_name(self, obj):
+        if obj.evaluator:
+            return obj.evaluator.get_full_name() or obj.evaluator.username
+        if obj.member:
+            return obj.member.name or obj.member.email
+        return None
+
+    class Meta:
+        model = EvaluatorCategoryAssignment
+        fields = [
+            'id', 'member', 'evaluator', 'evaluator_email', 'evaluator_name',
+            'category', 'category_name', 'category_code', 'academic_year',
+            'assigned_by', 'assigned_by_email', 'assigned_at', 'created_at'
+        ]
+
+
 class DepartmentSerializer(serializers.ModelSerializer):
     courses = CourseSerializer(many=True, read_only=True)
     classes = ClassSerializer(many=True, read_only=True)
@@ -98,9 +165,8 @@ class DepartmentSerializer(serializers.ModelSerializer):
         ]
 
     def validate_level(self, value):
-        allowed = [c[0] for c in Department.LEVEL_CHOICES]
-        if value not in allowed:
-            raise serializers.ValidationError(f"Invalid level '{value}'. Allowed: {', '.join(allowed)}.")
+        if value not in ['UG', 'PG', 'Professional', 'Other']:
+            raise serializers.ValidationError("Level must be one of: UG, PG, Professional, Other.")
         return value
 
 
@@ -134,6 +200,24 @@ class CriteriaCategorySerializer(serializers.ModelSerializer):
         fields = ['id', 'code', 'category', 'access_level', 'evaluators', 'items', 'created_at']
 
 
+class CategorySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Category
+        fields = ['id', 'name', 'code']
+
+
+class SubCategorySerializer(serializers.ModelSerializer):
+    category_name = serializers.CharField(source='category.name', read_only=True)
+    category_code = serializers.CharField(source='category.code', read_only=True)
+
+    class Meta:
+        model = SubCategory
+        fields = [
+            'id', 'category', 'category_id', 'category_name', 'category_code',
+            'subcategory_name', 'default_marks', 'requires_dqc', 'max_per_cycle'
+        ]
+
+
 class UserSerializer(serializers.ModelSerializer):
     department_name = serializers.CharField(source='department.name', read_only=True)
     class_name_display = serializers.CharField(source='class_name.name', read_only=True)
@@ -158,20 +242,36 @@ class AcademicGradeBreakdownSerializer(serializers.ModelSerializer):
 class SubmissionSerializer(serializers.ModelSerializer):
     user_email = serializers.CharField(source='user.email', read_only=True)
     user_name = serializers.CharField(source='user.get_full_name', read_only=True)
+    student_id = serializers.IntegerField(source='user.id', read_only=True)
+    class_id = serializers.SerializerMethodField()
+    class_name = serializers.SerializerMethodField()
+    category_id = serializers.SerializerMethodField()
+    verification_logs = VerificationLogSerializer(many=True, read_only=True)
     grade_breakdown = AcademicGradeBreakdownSerializer(read_only=True)
+
+    def get_class_id(self, obj):
+        return obj.class_obj_id or (obj.user.class_name_id if obj.user else None)
+
+    def get_class_name(self, obj):
+        return obj.class_obj.name if obj.class_obj else (obj.user.class_name.name if obj.user and obj.user.class_name else None)
+
+    def get_category_id(self, obj):
+        return obj.category_id or (obj.criteria_item.category_id if getattr(obj, 'criteria_item', None) else None)
 
     class Meta:
         model = Submission
         fields = [
-            'id', 'user', 'user_email', 'user_name', 'criteria_id', 'criteria_version',
-            'academic_year', 'submission_type', 'description', 'status',
-            'remarks', 'marks', 'proof', 'proof_hash', 'certificate_id', 'event_id', 'start_date', 'end_date', 'evaluator_verified',
-            'evidence', 'verified_by_name', 'rep_verified_by_name', 'rep_remarks',
+            'id', 'user', 'student_id', 'user_email', 'user_name', 'class_obj', 'class_id', 'class_name',
+            'category', 'category_id', 'criteria_id', 'subcategory_id', 'criteria_version',
+            'academic_year', 'submission_date', 'submission_type', 'description', 'status',
+            'remarks', 'marks', 'calculated_marks', 'is_manual_eval', 'proof', 'proof_url',
+            'proof_hash', 'certificate_id', 'event_id', 'start_date', 'end_date', 'evaluator_verified',
+            'evidence', 'submission_metadata', 'verified_by_name', 'rep_verified_by_name', 'rep_remarks',
             'teacher_verified_by_name', 'teacher_remarks', 'evaluator_verified_by_name',
-            'evaluator_remarks', 'grade_breakdown', 'created_at', 'updated_at'
+            'evaluator_remarks', 'verification_logs', 'grade_breakdown', 'created_at', 'updated_at'
         ]
         read_only_fields = [
-            'user', 'verified_by_name', 'rep_verified_by_name',
+            'user', 'student_id', 'class_id', 'class_name', 'category_id', 'verified_by_name', 'rep_verified_by_name',
             'teacher_verified_by_name', 'evaluator_verified_by_name',
             'evaluator_verified', 'created_at', 'updated_at'
         ]

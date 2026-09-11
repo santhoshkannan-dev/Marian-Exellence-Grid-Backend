@@ -37,6 +37,7 @@ from .auth_views import (
     DevBypassLoginView,
     UserProfileView,
     UserManagementView,
+    SwitchRoleView,
 )
 
 from .academic_views import (
@@ -56,6 +57,8 @@ from .criteria_views import (
     CriteriaCategoryDetailView,
     CriteriaItemListView,
     CriteriaItemDetailView,
+    SubCategoryListView,
+    SubCategoryDetailView,
 )
 
 from .submission_views import (
@@ -87,9 +90,19 @@ from .health_views import (
     HealthCheckView,
 )
 
+from .verification_views import (
+    DQCVerificationView,
+    TeacherVerificationView,
+    EvaluatorVerificationView,
+)
+
 __all__ = [
     # Health Check
     "HealthCheckView",
+    # Verification Views
+    "DQCVerificationView",
+    "TeacherVerificationView",
+    "EvaluatorVerificationView",
     # Domain helper functions & constants
     "get_client_ip",
     "create_audit_entry",
@@ -132,6 +145,8 @@ __all__ = [
     "CriteriaCategoryDetailView",
     "CriteriaItemListView",
     "CriteriaItemDetailView",
+    "SubCategoryListView",
+    "SubCategoryDetailView",
     # Submission Views
     "SubmissionListView",
     "SubmissionDetailView",

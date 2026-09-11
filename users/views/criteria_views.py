@@ -9,6 +9,7 @@ from users.serializers import (
     CriteriaCategorySerializer,
     CriteriaItemSerializer,
     CriteriaVersionSerializer,
+    SubCategorySerializer,
 )
 from users.permissions import IsAdminRole, IsAdminOrReadOnly
 from users.audit import record_system_audit_event
@@ -151,13 +152,25 @@ class CriteriaCategoryDetailView(APIView):
         if serializer.is_valid():
             cat = serializer.save()
             if 'evaluators' in request.data:
-                from users.models import UserGroupModel, UserGroupMember, EvaluatorCategoryAssignment, User
+                from django.db.models import Q
+                from users.models import UserGroupModel, UserGroupMember, EvaluatorCategoryAssignment, User, StaffProfile, AcademicYear
                 ec_group, _ = UserGroupModel.objects.get_or_create(
                     group_id='grp-evaluation-committee',
                     defaults={'name': 'Evaluation Committee', 'description': 'Evaluator members assigned to review activity submissions'}
                 )
                 current_emails = [str(e).strip().lower() for e in (cat.evaluators or []) if e and isinstance(e, str)]
-                EvaluatorCategoryAssignment.objects.filter(category=cat).exclude(member__email__in=current_emails).delete()
+                active_ay = AcademicYear.objects.filter(is_active=True).first()
+                ay_int = 2025
+                if active_ay and active_ay.year:
+                    try:
+                        ay_int = int(active_ay.year.split('-')[0])
+                    except (ValueError, IndexError):
+                        pass
+
+                EvaluatorCategoryAssignment.objects.filter(category=cat).exclude(
+                    Q(evaluator__email__in=current_emails) | Q(member__email__in=current_emails)
+                ).delete()
+
                 for em in current_emails:
                     u = User.objects.filter(email__iexact=em).first()
                     member, _ = UserGroupMember.objects.get_or_create(
@@ -166,13 +179,55 @@ class CriteriaCategoryDetailView(APIView):
                         defaults={
                             'user': u,
                             'name': u.get_full_name() if u else em.split('@')[0].capitalize(),
-                            'department': u.department.name if u and u.department else None
+                            'department': u.department if u else None
                         }
                     )
                     if u and not member.user:
                         member.user = u
                         member.save(update_fields=['user'])
-                    EvaluatorCategoryAssignment.objects.get_or_create(member=member, category=cat)
+                    if u:
+                        StaffProfile.objects.update_or_create(
+                            user=u,
+                            defaults={
+                                'department': u.department,
+                                'designation': 'Evaluator'
+                            }
+                        )
+                    eval_assignment = EvaluatorCategoryAssignment.objects.filter(
+                        category=cat,
+                        member=member
+                    ).first()
+
+                    if not eval_assignment and u:
+                        eval_assignment = EvaluatorCategoryAssignment.objects.filter(
+                            category=cat,
+                            evaluator=u
+                        ).first()
+
+                    if eval_assignment:
+                        updated_f = []
+                        if eval_assignment.member != member:
+                            eval_assignment.member = member
+                            updated_f.append('member')
+                        if u and eval_assignment.evaluator != u:
+                            eval_assignment.evaluator = u
+                            updated_f.append('evaluator')
+                        if eval_assignment.academic_year != ay_int:
+                            eval_assignment.academic_year = ay_int
+                            updated_f.append('academic_year')
+                        if getattr(request.user, 'is_authenticated', False) and not eval_assignment.assigned_by:
+                            eval_assignment.assigned_by = request.user
+                            updated_f.append('assigned_by')
+                        if updated_f:
+                            eval_assignment.save(update_fields=updated_f)
+                    else:
+                        EvaluatorCategoryAssignment.objects.create(
+                            category=cat,
+                            member=member,
+                            evaluator=u,
+                            academic_year=ay_int,
+                            assigned_by=request.user if getattr(request.user, 'is_authenticated', False) else None
+                        )
                 ec_group.sync_json_members()
 
             record_system_audit_event(
@@ -180,7 +235,7 @@ class CriteriaCategoryDetailView(APIView):
                 object_type='CriteriaCategory',
                 object_id=category.code or category.id,
                 actor=request.user,
-                object_repr=f"CriteriaCategory '{category.name}'",
+                object_repr=f"CriteriaCategory '{category.category}'",
                 old_value=None,
                 new_value=serializer.data,
                 reason=f"Criteria category updated by {getattr(request.user, 'email', '')}",
@@ -195,7 +250,7 @@ class CriteriaCategoryDetailView(APIView):
                 category = CriteriaCategory.objects.get(pk=int(pk))
             else:
                 category = CriteriaCategory.objects.get(code=pk)
-            cat_name = category.name
+            cat_name = category.category
             category.delete()
             record_system_audit_event(
                 action='CRITERIA_CHANGE',
@@ -203,7 +258,7 @@ class CriteriaCategoryDetailView(APIView):
                 object_id=pk,
                 actor=request.user,
                 object_repr=f"CriteriaCategory '{cat_name}' deleted",
-                old_value={'name': cat_name},
+                old_value={'category': cat_name},
                 new_value=None,
                 reason=f"Criteria category deleted by {getattr(request.user, 'email', '')}",
                 request=request
@@ -277,5 +332,71 @@ class CriteriaItemDetailView(APIView):
                 request=request
             )
         except CriteriaItem.DoesNotExist:
+            pass
+        return Response({"success": True}, status=status.HTTP_200_OK)
+
+
+class SubCategoryListView(APIView):
+    permission_classes = [IsAdminOrReadOnly]
+
+    def get(self, request):
+        category_id = request.query_params.get('category_id') or request.query_params.get('categoryId')
+        category_code = request.query_params.get('category_code') or request.query_params.get('categoryCode')
+
+        from users.models import SubCategory
+        qs = SubCategory.objects.select_related('category').all()
+
+        if category_id:
+            try:
+                cid = int(category_id)
+                if 106 <= cid <= 118:
+                    cid = cid - 105
+                qs = qs.filter(category_id=cid)
+            except (ValueError, TypeError):
+                pass
+        elif category_code:
+            qs = qs.filter(category__code__iexact=str(category_code).strip())
+
+        serializer = SubCategorySerializer(qs, many=True)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    def post(self, request):
+        serializer = SubCategorySerializer(data=request.data)
+        if serializer.is_valid():
+            serializer.save()
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+class SubCategoryDetailView(APIView):
+    permission_classes = [IsAdminOrReadOnly]
+
+    def get(self, request, pk):
+        from users.models import SubCategory
+        try:
+            sub = SubCategory.objects.select_related('category').get(pk=pk)
+        except SubCategory.DoesNotExist:
+            return Response({"error": "Subcategory not found"}, status=status.HTTP_404_NOT_FOUND)
+        serializer = SubCategorySerializer(sub)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    def put(self, request, pk):
+        from users.models import SubCategory
+        try:
+            sub = SubCategory.objects.get(pk=pk)
+        except SubCategory.DoesNotExist:
+            return Response({"error": "Subcategory not found"}, status=status.HTTP_404_NOT_FOUND)
+        serializer = SubCategorySerializer(sub, data=request.data, partial=True)
+        if serializer.is_valid():
+            serializer.save()
+            return Response(serializer.data, status=status.HTTP_200_OK)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    def delete(self, request, pk):
+        from users.models import SubCategory
+        try:
+            sub = SubCategory.objects.get(pk=pk)
+            sub.delete()
+        except SubCategory.DoesNotExist:
             pass
         return Response({"success": True}, status=status.HTTP_200_OK)

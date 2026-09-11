@@ -4,7 +4,10 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
 
-from users.models import AcademicYear, Department, Course, Class, User, UserGroupModel, UserGroupMember
+from users.models import (
+    AcademicYear, Department, Course, Class, User, UserGroupModel, UserGroupMember,
+    TeacherClassAssignment, StaffProfile
+)
 from users.serializers import DepartmentSerializer, CourseSerializer
 from users.permissions import (
     IsAdminOrPublicReadOnly,
@@ -63,32 +66,116 @@ OFFICIAL_CLASS_ORDER = [
 ]
 
 
-def sync_class_teacher_group_assignment(cls, new_teacher, old_teacher=None):
+ALL_PREDEFINED_CLASSES = [
+    # 1. Department of English / Languages
+    "I BACE", "II BACE", "III BACE",
+    # 2. School of Commerce and Professional Studies
+    "I BCOM A", "I BCOM B", "I BCOM C", "II BCOM A", "II BCOM B", "II BCOM C", "III BCOM A", "III BCOM B", "III BCOM C",
+    "I MCOM A", "I MCOM B", "II MCOM A", "II MCOM B",
+    "I BCOM (FINTECH)", "II BCOM (FINTECH)", "III BCOM (FINTECH)",
+    # 3. UG Department of Business Administration
+    "I BBA A", "I BBA B", "II BBA A", "II BBA B", "III BBA A", "III BBA B",
+    # 4. UG Department of Computer Applications
+    "I BCA A", "I BCA B", "II BCA A", "II BCA B", "III BCA A", "III BCA B",
+    # 5. School of Social Work
+    "I BSW A", "I BSW B", "II BSW A", "II BSW B", "III BSW A", "III BSW B",
+    "I MSW", "II MSW",
+    # 6. Department of Mathematics
+    "I MATHS", "II MATHS", "III MATHS",
+    # 7. Department of Communication and Media Studies
+    "I MCMS", "II MCMS",
+    # 8. Department of Hospitality and Tourism Management
+    "I MHTM", "II MHTM",
+    # 9. Department of Physics
+    "I MSC PHYSICS", "II MSC PHYSICS", "III MSC PHYSICS", "IV MSC PHYSICS", "V MSC PHYSICS",
+    # 10. Department of Economics
+    "I ECONOMICS", "II ECONOMICS", "III ECONOMICS",
+    # 11. Department of Psychology
+    "I PSYCHOLOGY", "II PSYCHOLOGY", "III PSYCHOLOGY",
+    # 12. Masters of Business Administration
+    "I MBA A", "I MBA B", "I MBA C", "II MBA A", "II MBA B", "II MBA C",
+    # 13. PG Department of Computer Applications
+    "I MCA", "II MCA",
+]
+
+
+def resolve_academic_year_int(academic_year_str=None, class_obj=None) -> int:
+    if academic_year_str:
+        try:
+            return int(str(academic_year_str).strip().split('-')[0])
+        except (ValueError, IndexError):
+            pass
+    if class_obj and getattr(class_obj, 'academic_year', None):
+        try:
+            return int(str(class_obj.academic_year).strip().split('-')[0])
+        except (ValueError, IndexError):
+            pass
+    if class_obj and getattr(class_obj, 'batch_start_year', None):
+        return int(class_obj.batch_start_year)
+    active = AcademicYear.objects.filter(is_active=True).first()
+    if active and active.year:
+        try:
+            return int(active.year.split('-')[0])
+        except (ValueError, IndexError):
+            pass
+    return 2025
+
+
+def sync_class_teacher_group_assignment(cls, new_teacher, old_teacher=None, assigned_by=None, academic_year_int=None):
     ct_group = UserGroupModel.objects.filter(group_id='grp-class-teachers').first()
-    if not ct_group:
-        return
+    year = academic_year_int or resolve_academic_year_int(cls.academic_year, cls)
+
     if old_teacher and old_teacher != new_teacher:
+        TeacherClassAssignment.objects.filter(class_obj=cls, teacher=old_teacher).delete()
         has_other = Class.objects.filter(class_teacher=old_teacher).exclude(id=cls.id).exists()
         if not has_other:
-            UserGroupMember.objects.filter(group=ct_group, email__iexact=old_teacher.email).update(assigned_class=None)
+            if ct_group:
+                UserGroupMember.objects.filter(group=ct_group, email__iexact=old_teacher.email).update(assigned_class=None)
+
     if new_teacher:
-        member, _ = UserGroupMember.objects.get_or_create(
-            group=ct_group,
-            email=new_teacher.email.lower().strip(),
+        # Clear any other teacher assigned to this class
+        TeacherClassAssignment.objects.filter(class_obj=cls).exclude(teacher=new_teacher).delete()
+
+        TeacherClassAssignment.objects.update_or_create(
+            class_obj=cls,
             defaults={
-                'user': new_teacher,
-                'name': new_teacher.get_full_name() or new_teacher.username,
-                'department': cls.department.name if cls.department else None,
-                'assigned_class': cls.name
+                'teacher': new_teacher,
+                'academic_year': year,
+                'assigned_by': assigned_by,
+                'is_active': True,
             }
         )
-        member.user = new_teacher
-        member.name = new_teacher.get_full_name() or new_teacher.username
-        if cls.department:
-            member.department = cls.department.name
-        member.assigned_class = cls.name
-        member.save()
-    ct_group.sync_json_members()
+
+        StaffProfile.objects.update_or_create(
+            user=new_teacher,
+            defaults={
+                'department': cls.department,
+                'designation': 'Class Teacher'
+            }
+        )
+
+        if ct_group:
+            member, _ = UserGroupMember.objects.get_or_create(
+                group=ct_group,
+                email=new_teacher.email.lower().strip(),
+                defaults={
+                    'user': new_teacher,
+                    'name': new_teacher.get_full_name() or new_teacher.username,
+                    'department': cls.department,
+                    'assigned_class': cls
+                }
+            )
+            member.user = new_teacher
+            member.name = new_teacher.get_full_name() or new_teacher.username
+            if cls.department:
+                member.department = cls.department
+            member.assigned_class = cls
+            member.save()
+    elif not new_teacher and old_teacher:
+        TeacherClassAssignment.objects.filter(class_obj=cls).delete()
+
+    if ct_group:
+        ct_group.sync_json_members()
 
 
 def sync_dqc_member_group_assignment(cls, new_student, old_student=None):
@@ -106,16 +193,16 @@ def sync_dqc_member_group_assignment(cls, new_student, old_student=None):
             defaults={
                 'user': new_student,
                 'name': new_student.get_full_name() or new_student.username,
-                'department': cls.department.name if cls.department else None,
-                'assigned_class': cls.name,
+                'department': cls.department,
+                'assigned_class': cls,
                 'badge': 'DQC member'
             }
         )
         member.user = new_student
         member.name = new_student.get_full_name() or new_student.username
         if cls.department:
-            member.department = cls.department.name
-        member.assigned_class = cls.name
+            member.department = cls.department
+        member.assigned_class = cls
         member.badge = 'DQC member'
         member.save()
     dqc_group.sync_json_members()
@@ -414,7 +501,7 @@ class ClassListView(APIView):
     def get(self, request):
         dept_id = request.query_params.get('department')
         course_id = request.query_params.get('course')
-        qs = Class.objects.select_related('department', 'course', 'class_teacher', 'dqc_member').all()
+        qs = Class.objects.select_related('department', 'course', 'class_teacher', 'dqc_member').prefetch_related('teacher_assignments__teacher').all()
         if dept_id:
             qs = qs.filter(department_id=dept_id)
         if course_id:
@@ -431,35 +518,39 @@ class ClassListView(APIView):
             return (dept_idx, class_idx)
 
         classes.sort(key=class_sort_key)
-        user = request.user
-        is_staff_or_admin = bool(
-            user and getattr(user, 'is_authenticated', False) and (
-                getattr(user, 'role', '') in ('admin', 'faculty') or
-                getattr(user, 'is_staff', False) or
-                getattr(user, 'is_superuser', False)
-            )
-        )
-        return Response([
-            {
+        
+        classes_data = []
+        for c in classes:
+            teacher = c.class_teacher
+            if not teacher:
+                ta = c.teacher_assignments.filter(is_active=True).first()
+                if ta:
+                    teacher = ta.teacher
+
+            teacher_email = teacher.email if teacher else None
+            teacher_name = teacher.get_full_name() or teacher.username if teacher else None
+
+            classes_data.append({
                 "id": c.id,
                 "name": c.name,
-                "department": c.department.name,
-                "department_code": c.department.code,
+                "department": c.department.name if c.department else None,
+                "department_code": c.department.code if c.department else None,
                 "course": c.course.id if c.course else None,
                 "course_name": c.course.name if c.course else None,
                 "course_abbreviation": c.course.abbreviation if c.course else None,
                 "year_number": c.year_number,
                 "section": c.section,
                 "batch_start_year": c.batch_start_year,
-                "classTeacher": (c.class_teacher.email if is_staff_or_admin else None) if c.class_teacher else None,
-                "classTeacherName": c.class_teacher.get_full_name() or c.class_teacher.username if c.class_teacher else None,
-                "dqcMember": (c.dqc_member.email if is_staff_or_admin else None) if c.dqc_member else None,
+                "classTeacher": teacher_email,
+                "classTeacherEmail": teacher_email,
+                "classTeacherName": teacher_name,
+                "dqcMember": c.dqc_member.email if c.dqc_member else None,
                 "dqcMemberName": c.dqc_member.get_full_name() or c.dqc_member.username if c.dqc_member else None,
                 "num_students": c.num_students,
                 "negative_points": c.negative_points,
-            }
-            for c in classes
-        ])
+            })
+
+        return Response(classes_data)
 
     def post(self, request):
         user = request.user
@@ -572,10 +663,17 @@ class ClassListView(APIView):
             else:
                 try:
                     teacher = User.objects.get(email=teacher_email)
+                    year = resolve_academic_year_int(cls.academic_year, cls)
                     other_class = Class.objects.filter(class_teacher=teacher).exclude(id=cls.id).first()
+                    if not other_class:
+                        other_assignment = TeacherClassAssignment.objects.filter(
+                            teacher=teacher, academic_year=year, is_active=True
+                        ).exclude(class_obj=cls).first()
+                        if other_assignment:
+                            other_class = other_assignment.class_obj
                     if other_class:
                         return Response({
-                            "error": f"Faculty '{teacher.get_full_name() or teacher_email}' is already assigned as Class Advisor to '{other_class.name}'."
+                            "error": f"Faculty '{teacher.get_full_name() or teacher_email}' is already assigned to '{other_class.name}' for academic year {year}. A teacher cannot be assigned to more than one class per academic year."
                         }, status=status.HTTP_400_BAD_REQUEST)
 
                     old_teacher = cls.class_teacher if cls.class_teacher and cls.class_teacher != teacher else None
@@ -588,7 +686,7 @@ class ClassListView(APIView):
                     teacher.class_name = cls
                     teacher.department = cls.department
                     teacher.save(update_fields=['class_name', 'department'])
-                    sync_class_teacher_group_assignment(cls, teacher, old_teacher)
+                    sync_class_teacher_group_assignment(cls, teacher, old_teacher, assigned_by=user, academic_year_int=year)
                 except User.DoesNotExist:
                     return Response({"error": f"Teacher with email '{teacher_email}' not found"}, status=status.HTTP_404_NOT_FOUND)
 
@@ -800,10 +898,17 @@ class ClassDetailView(APIView):
             else:
                 try:
                     teacher = User.objects.get(email=teacher_email)
+                    year = resolve_academic_year_int(cls.academic_year, cls)
                     other_class = Class.objects.filter(class_teacher=teacher).exclude(id=cls.id).first()
+                    if not other_class:
+                        other_assignment = TeacherClassAssignment.objects.filter(
+                            teacher=teacher, academic_year=year, is_active=True
+                        ).exclude(class_obj=cls).first()
+                        if other_assignment:
+                            other_class = other_assignment.class_obj
                     if other_class:
                         return Response(
-                            {"error": f"Faculty '{teacher.get_full_name() or teacher_email}' is already assigned as Class Advisor to '{other_class.name}'."},
+                            {"error": f"Faculty '{teacher.get_full_name() or teacher_email}' is already assigned to '{other_class.name}' for academic year {year}. A teacher cannot be assigned to more than one class per academic year."},
                             status=status.HTTP_400_BAD_REQUEST
                         )
                     old_teacher = cls.class_teacher if cls.class_teacher and cls.class_teacher != teacher else None
@@ -815,7 +920,7 @@ class ClassDetailView(APIView):
                     teacher.class_name = cls
                     teacher.department = cls.department
                     teacher.save(update_fields=['class_name', 'department'])
-                    sync_class_teacher_group_assignment(cls, teacher, old_teacher)
+                    sync_class_teacher_group_assignment(cls, teacher, old_teacher, assigned_by=user, academic_year_int=year)
                 except User.DoesNotExist:
                     return Response({"error": f"Teacher with email '{teacher_email}' not found"}, status=status.HTTP_404_NOT_FOUND)
 

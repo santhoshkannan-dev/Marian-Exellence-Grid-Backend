@@ -4,7 +4,8 @@ from rest_framework import status
 from .models import (
     Department, Course, Class, User, AcademicYear,
     CriteriaCategory, CriteriaItem, CriteriaRule, CriteriaVersion,
-    Submission, AcademicGradeBreakdown, ClassIndexResult, SystemSetting
+    Submission, AcademicGradeBreakdown, ClassIndexResult, SystemSetting,
+    UserGroupModel, StaffProfile, TeacherClassAssignment, EvaluatorCategoryAssignment, VerificationLog
 )
 from .views import parse_student_email, allocate_student_from_email, calculate_submission_score
 
@@ -270,7 +271,8 @@ class CriteriaSubcategoryScoreValidationTest(TestCase):
         self.client.force_authenticate(user=self.evaluator)
         self.category = CriteriaCategory.objects.create(
             code='cat-research',
-            category='Research'
+            category='Research',
+            evaluators=[self.evaluator.email]
         )
         # Publications item: marks = 0.0, rules_json defines subItems
         self.pub_item = CriteriaItem.objects.create(
@@ -1153,7 +1155,14 @@ class Phase1SecurityRemediationRegressionTest(TestCase):
         self.sub_b.refresh_from_db()
         self.assertEqual(self.sub_b.status, 'Submitted')
 
-        # 3. Faculty Dept 1 transitions Submitted -> Teacher Verified (allowed)
+        # 3. Student Rep performs Round 1: Submitted -> Student Rep Verified
+        self.client.force_authenticate(user=self.student_rep1)
+        res_rep = self.client.put(f'/api/submissions/{self.sub_b.id}/', {
+            'status': 'Student Rep Verified'
+        }, format='json')
+        self.assertEqual(res_rep.status_code, status.HTTP_200_OK)
+
+        # 3b. Faculty Dept 1 transitions Student Rep Verified -> Teacher Verified (allowed)
         self.client.force_authenticate(user=self.faculty_dept1)
         res_tv = self.client.put(f'/api/submissions/{self.sub_b.id}/', {
             'status': 'Teacher Verified'
@@ -4809,6 +4818,1208 @@ class OfficialUserGroupsAndAccessManagementRegressionTest(APITestCase):
             'status': 'Draft'
         }, format='json')
         self.assertEqual(res_dqc_acad.status_code, status.HTTP_201_CREATED)
+
+    def test_prizes_dqc_restrictions(self):
+        """
+        Verify that in criteria 'Prizes':
+        - From Marian College: 1st Prize (group), 2nd Prize (group), 3rd Prize (group)
+        - Outside Marian College: 1st Prize (group) [10 marks], 2nd Prize (group), 3rd Prize (group),
+          participation(Individual), participation(group)
+        are ONLY accessible to student users present in DQC Student Rep Group.
+        Normal students can only access individual prizes.
+        """
+        from users.models import UserGroupModel, UserGroupMember, CriteriaCategory, CriteriaItem
+
+        ay, _ = AcademicYear.objects.get_or_create(year='2025-2026', defaults={'is_active': True})
+        cat_prizes, _ = CriteriaCategory.objects.get_or_create(category='Prizes', code='cat-prizes')
+
+        item_from_marian, _ = CriteriaItem.objects.get_or_create(
+            category=cat_prizes,
+            title='From Marian College',
+            defaults={
+                'type': 'count',
+                'marks': 0.0,
+                'rules_json': {
+                    'subItems': {
+                        '1st Prize (Individual)': 10.0,
+                        '2nd Prize (Individual)': 5.0,
+                        '3rd Prize (Individual)': 3.0,
+                        '1st Prize (group)': 5.0,
+                        '2nd Prize (group)': 3.0,
+                        '3rd Prize (group)': 2.0,
+                    }
+                }
+            }
+        )
+
+        item_outside_marian, _ = CriteriaItem.objects.get_or_create(
+            category=cat_prizes,
+            title='Outside Marian College',
+            defaults={
+                'type': 'count',
+                'marks': 0.0,
+                'rules_json': {
+                    'subItems': {
+                        '1st Prize (Individual)': 15.0,
+                        '2nd Prize (Individual)': 10.0,
+                        '3rd Prize (Individual)': 5.0,
+                        '1st Prize (group)': 10.0,
+                        '2nd Prize (group)': 5.0,
+                        '3rd Prize (group)': 3.0,
+                        'participation(Individual)': 3.0,
+                        'participation(group)': 2.0,
+                    }
+                }
+            }
+        )
+
+        dqc_grp = UserGroupModel.objects.get(group_id='grp-dqc-student-rep')
+        UserGroupMember.objects.create(group=dqc_grp, email=self.dqc_student.email, badge='DQC member')
+
+        normal_student = User.objects.create(
+            username='faizah.25pmc118@mariancollege.org',
+            email='faizah.25pmc118@mariancollege.org',
+            role='student',
+            first_name='Faizah',
+            last_name='N'
+        )
+
+        # 1. Normal student submitting Individual prize in From Marian College -> 201 Created
+        self.client.force_authenticate(user=normal_student)
+        res_indiv = self.client.post('/api/submissions/', {
+            'criteriaId': item_from_marian.id,
+            'academicYear': '2025-2026',
+            'description': 'Student winning individual prize',
+            'evidence': {'subItem': '1st Prize (Individual)', 'count': 1},
+            'status': 'Draft'
+        }, format='json')
+        self.assertEqual(res_indiv.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(res_indiv.data['marks'], 10.0)
+
+        # 2. Normal student attempting 1st Prize (group) in From Marian College -> 403 Forbidden
+        res_group_from = self.client.post('/api/submissions/', {
+            'criteriaId': item_from_marian.id,
+            'academicYear': '2025-2026',
+            'description': 'Normal student attempting group prize',
+            'evidence': {'subItem': '1st Prize (group)', 'count': 1},
+            'status': 'Draft'
+        }, format='json')
+        self.assertEqual(res_group_from.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertIn("restricted to DQC members only", res_group_from.data['error'])
+
+        # 3. Normal student attempting 1st Prize (group) in Outside Marian College -> 403 Forbidden
+        res_group_out = self.client.post('/api/submissions/', {
+            'criteriaId': item_outside_marian.id,
+            'academicYear': '2025-2026',
+            'description': 'Normal student attempting outside group prize',
+            'evidence': {'prizesSubItem': '1st Prize (group)', 'count': 1},
+            'status': 'Draft'
+        }, format='json')
+        self.assertEqual(res_group_out.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertIn("restricted to DQC members only", res_group_out.data['error'])
+
+        # 4. Normal student attempting participation(Individual) in Outside Marian College -> 403 Forbidden
+        res_part_indiv = self.client.post('/api/submissions/', {
+            'criteriaId': item_outside_marian.id,
+            'academicYear': '2025-2026',
+            'description': 'Normal student attempting participation',
+            'evidence': {'prizesSubItem': 'participation(Individual)', 'count': 1},
+            'status': 'Draft'
+        }, format='json')
+        self.assertEqual(res_part_indiv.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertIn("restricted to DQC members only", res_part_indiv.data['error'])
+
+        # 5. Normal student attempting participation(group) in Outside Marian College -> 403 Forbidden
+        res_part_group = self.client.post('/api/submissions/', {
+            'criteriaId': item_outside_marian.id,
+            'academicYear': '2025-2026',
+            'description': 'Normal student attempting group participation',
+            'evidence': {'subItem': 'participation(group)', 'count': 1},
+            'status': 'Draft'
+        }, format='json')
+        self.assertEqual(res_part_group.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertIn("restricted to DQC members only", res_part_group.data['error'])
+
+        # 6. DQC Student submitting 1st Prize (group) in Outside Marian College -> 201 Created with 10.0 marks
+        self.client.force_authenticate(user=self.dqc_student)
+        res_dqc_group_out = self.client.post('/api/submissions/', {
+            'criteriaId': item_outside_marian.id,
+            'academicYear': '2025-2026',
+            'description': 'DQC student submitting outside group prize',
+            'evidence': {'prizesSubItem': '1st Prize (group)', 'count': 1},
+            'status': 'Draft'
+        }, format='json')
+        self.assertEqual(res_dqc_group_out.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(res_dqc_group_out.data['marks'], 10.0)
+
+        # 7. DQC Student submitting participation(group) in Outside Marian College -> 201 Created with 2.0 marks
+        res_dqc_part_grp = self.client.post('/api/submissions/', {
+            'criteriaId': item_outside_marian.id,
+            'academicYear': '2025-2026',
+            'description': 'DQC student submitting participation group',
+            'evidence': {'subItem': 'participation(group)', 'count': 1},
+            'status': 'Draft'
+        }, format='json')
+        self.assertEqual(res_dqc_part_grp.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(res_dqc_part_grp.data['marks'], 2.0)
+
+        # 8. Normal student attempting to edit existing submission to a group prize -> 403 Forbidden
+        self.client.force_authenticate(user=normal_student)
+        res_put_hack = self.client.put(f'/api/submissions/{res_indiv.data["id"]}/', {
+            'criteriaId': item_outside_marian.id,
+            'evidence': {'prizesSubItem': '1st Prize (group)'}
+        }, format='json')
+        self.assertEqual(res_put_hack.status_code, status.HTTP_403_FORBIDDEN)
+
+
+class StaffUserModuleAndVerificationWorkflowTests(TestCase):
+    """
+    Authoritative test suite for Staff User Module, Single-Class Teacher Assignment constraint,
+    Evaluator Category Assignment, and Round 2 / Round 3 Verification Workflow Logic.
+    """
+
+    def setUp(self):
+        self.client = APIClient()
+        self.academic_year = AcademicYear.objects.create(year='2025-2026', is_active=True)
+        self.dept = Department.objects.create(name="PG Department of Computer Applications", code="PGDCA")
+        self.course = Course.objects.create(name="MCA", abbreviation="mc", department=self.dept, duration_years=2)
+
+        self.class1 = Class.objects.create(name="MCA A", department=self.dept, course=self.course, academic_year="2025-2026")
+        self.class2 = Class.objects.create(name="MCA B", department=self.dept, course=self.course, academic_year="2025-2026")
+
+        self.admin = User.objects.create_user(
+            username="admin@mariancollege.org",
+            email="admin@mariancollege.org",
+            password="password123",
+            role="admin",
+            is_staff=True,
+            is_superuser=True
+        )
+
+        self.teacher1 = User.objects.create_user(
+            username="teacher.one@mariancollege.org",
+            email="teacher.one@mariancollege.org",
+            first_name="Teacher",
+            last_name="One",
+            password="password123",
+            role="faculty",
+            is_staff=True,
+            department=self.dept
+        )
+
+        self.teacher2 = User.objects.create_user(
+            username="teacher.two@mariancollege.org",
+            email="teacher.two@mariancollege.org",
+            first_name="Teacher",
+            last_name="Two",
+            password="password123",
+            role="faculty",
+            is_staff=True,
+            department=self.dept
+        )
+
+        self.evaluator1 = User.objects.create_user(
+            username="evaluator.one@mariancollege.org",
+            email="evaluator.one@mariancollege.org",
+            first_name="Evaluator",
+            last_name="One",
+            password="password123",
+            role="evaluation",
+            is_staff=True,
+            department=self.dept
+        )
+
+        self.student1 = User.objects.create_user(
+            username="student1.25pmc101@mariancollege.org",
+            email="student1.25pmc101@mariancollege.org",
+            first_name="Student",
+            last_name="One",
+            password="password123",
+            role="student",
+            class_name=self.class1,
+            department=self.dept
+        )
+
+        self.student2 = User.objects.create_user(
+            username="student2.25pmc102@mariancollege.org",
+            email="student2.25pmc102@mariancollege.org",
+            first_name="Student",
+            last_name="Two",
+            password="password123",
+            role="student",
+            class_name=self.class2,
+            department=self.dept
+        )
+
+        # Categories
+        self.cat_academics = CriteriaCategory.objects.create(category="Academics", code="cat-academics", is_manual_eval=False)
+        self.item_acad = CriteriaItem.objects.create(category=self.cat_academics, title="Semester Exam Results", type="fixed", marks=10.0)
+
+        self.cat_career = CriteriaCategory.objects.create(category="Career Advancement", code="cat-career", is_manual_eval=True)
+        self.item_career = CriteriaItem.objects.create(category=self.cat_career, title="Placement Offer", type="fixed", marks=20.0, is_manual_eval=True)
+
+        # User Groups
+        self.grp_teachers, _ = UserGroupModel.objects.get_or_create(
+            group_id='grp-class-teachers',
+            defaults={'name': 'Class Teachers Council', 'description': 'Faculty members acting as class advisors.'}
+        )
+        self.grp_eval, _ = UserGroupModel.objects.get_or_create(
+            group_id='grp-evaluation-committee',
+            defaults={'name': 'Evaluation Committee', 'description': 'Evaluator members assigned to review activity submissions.'}
+        )
+
+    def test_staff_profile_creation_and_serialization(self):
+        """StaffProfile should be created and serialized with department and designation."""
+        from users.models import StaffProfile
+
+        profile, created = StaffProfile.objects.get_or_create(
+            user=self.teacher1,
+            defaults={'department': self.dept, 'designation': 'Class Teacher'}
+        )
+        self.assertEqual(profile.designation, 'Class Teacher')
+        self.assertEqual(profile.department, self.dept)
+
+        self.client.force_authenticate(user=self.teacher1)
+        res = self.client.get('/api/auth/profile/')
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertIn('staff_profile', res.data)
+        self.assertEqual(res.data['staff_profile']['designation'], 'Class Teacher')
+
+    def test_single_class_teacher_assignment_constraint(self):
+        """A teacher can be assigned to AT MOST ONE class per academic year."""
+        from users.models import TeacherClassAssignment
+
+        # 1. Admin assigns teacher1 to class1 -> 200 OK
+        self.client.force_authenticate(user=self.admin)
+        res1 = self.client.put(f'/api/auth/classes/{self.class1.id}/', {
+            'classTeacher': self.teacher1.email
+        }, format='json')
+        self.assertEqual(res1.status_code, status.HTTP_200_OK)
+
+        # Verify TeacherClassAssignment record
+        assign1 = TeacherClassAssignment.objects.filter(teacher=self.teacher1, class_obj=self.class1).first()
+        self.assertIsNotNone(assign1)
+        self.assertEqual(assign1.academic_year, 2025)
+        self.assertTrue(assign1.is_active)
+
+        # 2. Admin attempts to assign teacher1 to class2 in the same academic year -> 400 Bad Request
+        res2 = self.client.put(f'/api/auth/classes/{self.class2.id}/', {
+            'classTeacher': self.teacher1.email
+        }, format='json')
+        self.assertEqual(res2.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("already assigned", res2.data['error'])
+
+        # 3. Admin assigns teacher2 to class1 -> Replaces teacher1 cleanly
+        res3 = self.client.put(f'/api/auth/classes/{self.class1.id}/', {
+            'classTeacher': self.teacher2.email
+        }, format='json')
+        self.assertEqual(res3.status_code, status.HTTP_200_OK)
+        self.assertTrue(TeacherClassAssignment.objects.filter(teacher=self.teacher2, class_obj=self.class1).exists())
+        self.assertFalse(TeacherClassAssignment.objects.filter(teacher=self.teacher1, class_obj=self.class1).exists())
+
+    def test_class_teacher_round_2_verification_all_categories(self):
+        """Class Teacher has Round 2 authority over ALL categories for their assigned single class."""
+        from users.models import TeacherClassAssignment, VerificationLog, Submission
+
+        # Assign teacher1 to class1
+        self.client.force_authenticate(user=self.admin)
+        self.client.put(f'/api/auth/classes/{self.class1.id}/', {'classTeacher': self.teacher1.email}, format='json')
+
+        # Create submissions in Academics (Cat 1) and Career Advancement (Cat 12) for student1 (class1)
+        sub_acad = Submission.objects.create(
+            user=self.student1,
+            class_obj=self.class1,
+            category=self.cat_academics,
+            criteria_id=self.item_acad.id,
+            status='Student Rep Verified',
+            academic_year='2025-2026',
+            description='Academics Claim'
+        )
+        sub_career = Submission.objects.create(
+            user=self.student1,
+            class_obj=self.class1,
+            category=self.cat_career,
+            criteria_id=self.item_career.id,
+            status='Student Rep Verified',
+            academic_year='2025-2026',
+            description='Career Claim'
+        )
+
+        # Teacher1 verifies Category 1 (Academics) -> VERIFY_AND_FORWARD
+        self.client.force_authenticate(user=self.teacher1)
+        res_v1 = self.client.put(f'/api/submissions/{sub_acad.id}/', {
+            'status': 'Teacher Verified',
+            'actionType': 'VERIFY_AND_FORWARD',
+            'remarks': 'Approved in Round 2'
+        }, format='json')
+        self.assertEqual(res_v1.status_code, status.HTTP_200_OK)
+        sub_acad.refresh_from_db()
+        self.assertEqual(sub_acad.status, 'Teacher Verified')
+
+        # Check VerificationLog
+        vlog1 = VerificationLog.objects.filter(submission=sub_acad).last()
+        self.assertEqual(vlog1.verification_level, 'CLASS_TEACHER')
+        self.assertEqual(vlog1.action, 'VERIFY_AND_FORWARD')
+        self.assertEqual(vlog1.verifier_id, self.teacher1.id)
+
+        # Teacher1 verifies Category 12 (Career Advancement) -> VERIFY_AND_FORWARD
+        res_v2 = self.client.put(f'/api/submissions/{sub_career.id}/', {
+            'status': 'Teacher Verified',
+            'actionType': 'VERIFY_AND_FORWARD',
+            'remarks': 'Career claim approved by class teacher'
+        }, format='json')
+        self.assertEqual(res_v2.status_code, status.HTTP_200_OK)
+
+        # Teacher1 sends back another submission for correction -> SEND_BACK
+        sub_send_back = Submission.objects.create(
+            user=self.student1,
+            class_obj=self.class1,
+            category=self.cat_academics,
+            criteria_id=self.item_acad.id,
+            status='Student Rep Verified',
+            academic_year='2025-2026',
+            description='Send back claim'
+        )
+        res_sb = self.client.put(f'/api/submissions/{sub_send_back.id}/', {
+            'status': 'Correction Requested',
+            'actionType': 'SEND_BACK',
+            'remarks': 'Please upload clearer certificate'
+        }, format='json')
+        self.assertEqual(res_sb.status_code, status.HTTP_200_OK)
+        vlog_sb = VerificationLog.objects.filter(submission=sub_send_back).last()
+        self.assertEqual(vlog_sb.verification_level, 'CLASS_TEACHER')
+        self.assertEqual(vlog_sb.action, 'SEND_BACK')
+
+    def test_class_teacher_cannot_verify_other_class(self):
+        """Class Teacher CANNOT verify submissions from another class."""
+        from users.models import Submission
+
+        # Assign teacher1 to class1 only
+        self.client.force_authenticate(user=self.admin)
+        self.client.put(f'/api/auth/classes/{self.class1.id}/', {'classTeacher': self.teacher1.email}, format='json')
+
+        # Sub in class2
+        sub_class2 = Submission.objects.create(
+            user=self.student2,
+            class_obj=self.class2,
+            category=self.cat_academics,
+            criteria_id=self.item_acad.id,
+            status='Student Rep Verified',
+            academic_year='2025-2026',
+            description='Class 2 claim'
+        )
+
+        # Teacher1 attempts to verify sub_class2 -> 403 Forbidden
+        self.client.force_authenticate(user=self.teacher1)
+        res = self.client.put(f'/api/submissions/{sub_class2.id}/', {
+            'status': 'Teacher Verified',
+            'remarks': 'Hacking cross-class verification'
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_evaluator_round_3_verification_across_classes_and_logging(self):
+        """Evaluator has Round 3 authority for assigned category across all classes and logs APPROVE_AND_CREDIT."""
+        from users.models import EvaluatorCategoryAssignment, VerificationLog, Submission
+
+        # Assign evaluator1 to Category 12 (Career Advancement) via Admin endpoint
+        self.client.force_authenticate(user=self.admin)
+        res_cat = self.client.put(f'/api/criteria-categories/{self.cat_career.code}/', {
+            'evaluators': [self.evaluator1.email]
+        }, format='json')
+        self.assertEqual(res_cat.status_code, status.HTTP_200_OK)
+
+        # Verify assignment record
+        eca = EvaluatorCategoryAssignment.objects.filter(evaluator=self.evaluator1, category=self.cat_career).first()
+        self.assertIsNotNone(eca)
+        self.assertEqual(eca.academic_year, 2025)
+
+        # Submissions from class1 and class2 in 'Teacher Verified' state
+        sub_c1 = Submission.objects.create(
+            user=self.student1,
+            class_obj=self.class1,
+            category=self.cat_career,
+            criteria_id=self.item_career.id,
+            status='Teacher Verified',
+            academic_year='2025-2026',
+            description='Class 1 career claim'
+        )
+        sub_c2 = Submission.objects.create(
+            user=self.student2,
+            class_obj=self.class2,
+            category=self.cat_career,
+            criteria_id=self.item_career.id,
+            status='Teacher Verified',
+            academic_year='2025-2026',
+            description='Class 2 career claim'
+        )
+
+        # Evaluator1 evaluates class1 submission -> Evaluated with marks
+        self.client.force_authenticate(user=self.evaluator1)
+        res_ev1 = self.client.put(f'/api/submissions/{sub_c1.id}/', {
+            'status': 'Evaluated',
+            'marks': 20.0,
+            'remarks': 'Final evaluation passed, approved and credited'
+        }, format='json')
+        self.assertEqual(res_ev1.status_code, status.HTTP_200_OK)
+
+        # Check VerificationLog: APPROVE_AND_CREDIT
+        log_ev1 = VerificationLog.objects.filter(submission=sub_c1).last()
+        self.assertEqual(log_ev1.verification_level, 'EVALUATOR')
+        self.assertEqual(log_ev1.action, 'APPROVE_AND_CREDIT')
+        self.assertEqual(log_ev1.verifier_id, self.evaluator1.id)
+
+        # Evaluator1 evaluates class2 submission -> Evaluated across classes
+        res_ev2 = self.client.put(f'/api/submissions/{sub_c2.id}/', {
+            'status': 'Evaluated',
+            'marks': 15.0,
+            'remarks': 'Cross-class evaluation approved'
+        }, format='json')
+        self.assertEqual(res_ev2.status_code, status.HTTP_200_OK)
+
+        log_ev2 = VerificationLog.objects.filter(submission=sub_c2).last()
+        self.assertEqual(log_ev2.verification_level, 'EVALUATOR')
+        self.assertEqual(log_ev2.action, 'APPROVE_AND_CREDIT')
+
+    def test_evaluator_cannot_verify_unassigned_category(self):
+        """Evaluator CANNOT verify submissions for unassigned category."""
+        from users.models import Submission
+
+        # Assign evaluator1 only to Category 12 (Career)
+        self.client.force_authenticate(user=self.admin)
+        self.client.put(f'/api/criteria-categories/{self.cat_career.code}/', {
+            'evaluators': [self.evaluator1.email]
+        }, format='json')
+
+        # Submission in Category 1 (Academics)
+        sub_acad = Submission.objects.create(
+            user=self.student1,
+            class_obj=self.class1,
+            category=self.cat_academics,
+            criteria_id=self.item_acad.id,
+            status='Teacher Verified',
+            academic_year='2025-2026',
+            description='Academics claim'
+        )
+
+        # Evaluator1 attempts to evaluate sub_acad -> 403 Forbidden
+        self.client.force_authenticate(user=self.evaluator1)
+        res = self.client.put(f'/api/submissions/{sub_acad.id}/', {
+            'status': 'Evaluated',
+            'marks': 10.0,
+            'remarks': 'Unassigned category eval attempt'
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertIn("not assigned", res.data['error'])
+
+    def test_evaluator_category_assignment_update_different_academic_year_and_multiple_evaluators(self):
+        """Updating category evaluators across different academic years does not trigger unique constraint violation and reflects in user groups."""
+        from users.models import EvaluatorCategoryAssignment, UserGroupModel, UserGroupMember
+        from users.views.system_views import serialize_user_group
+
+        # Pre-create assignment for evaluator1 in academic_year 2025
+        ec_group, _ = UserGroupModel.objects.get_or_create(
+            group_id='grp-evaluation-committee',
+            defaults={'name': 'Evaluation Committee'}
+        )
+        mem1, _ = UserGroupMember.objects.get_or_create(group=ec_group, email=self.evaluator1.email, defaults={'user': self.evaluator1})
+        EvaluatorCategoryAssignment.objects.create(
+            category=self.cat_career,
+            member=mem1,
+            evaluator=self.evaluator1,
+            academic_year=2025
+        )
+
+        # Active academic year is now 2026-2027
+        self.academic_year.year = "2026-2027"
+        self.academic_year.save()
+
+        # Update evaluators for cat_career to include evaluator1 AND teacher1
+        self.client.force_authenticate(user=self.admin)
+        res = self.client.put(f'/api/criteria-categories/{self.cat_career.code}/', {
+            'evaluators': [self.evaluator1.email, self.teacher1.email]
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+
+        # Both evaluators should now have EvaluatorCategoryAssignment for cat_career
+        assignments = EvaluatorCategoryAssignment.objects.filter(category=self.cat_career)
+        self.assertEqual(assignments.count(), 2)
+
+        # Serialized group should list Category in member_details for both
+        group_data = serialize_user_group(ec_group)
+        e1_detail = next(m for m in group_data['member_details'] if m['email'] == self.evaluator1.email)
+        t1_detail = next(m for m in group_data['member_details'] if m['email'] == self.teacher1.email)
+        self.assertTrue(any(c['code'] == self.cat_career.code for c in e1_detail['categories']))
+        self.assertTrue(any(c['code'] == self.cat_career.code for c in t1_detail['categories']))
+
+
+
+class DualRoleStaffAndVerificationWorkflowTests(APITestCase):
+    """
+    Test suite for Dual-Role Staff Member capabilities, role switching controller,
+    strict view isolation, and 3-round verification workflow lifecycle transitions.
+    """
+
+    def setUp(self):
+        # Academic Year
+        self.ay, _ = AcademicYear.objects.get_or_create(year="2025-2026", defaults={'is_active': True})
+
+        # Department & Course
+        self.dept, _ = Department.objects.get_or_create(name="Computer Science", defaults={'code': "CS"})
+        self.course, _ = Course.objects.get_or_create(name="BCA", defaults={'abbreviation': "bca", 'department': self.dept, 'duration_years': 3})
+
+        # Classes
+        self.class1, _ = Class.objects.get_or_create(name="III BCA", defaults={'department': self.dept, 'course': self.course, 'academic_year': "2025-2026"})
+        self.class2, _ = Class.objects.get_or_create(name="II BCA", defaults={'department': self.dept, 'course': self.course, 'academic_year': "2025-2026"})
+
+        # Admin
+        self.admin = User.objects.create_user(
+            username="admin_user",
+            email="admin.marian@mariancollege.org",
+            password="password123",
+            role="admin",
+            is_staff=True,
+            is_superuser=True
+        )
+
+        # Dual-Role Staff Member: Class Teacher of class1 AND Evaluator of cat_career
+        self.dual_staff = User.objects.create_user(
+            username="dual_staff",
+            email="dual.staff@mariancollege.org",
+            password="password123",
+            role="faculty",
+            department=self.dept
+        )
+
+        # Single-Role Teacher Member: Class Teacher of class2 only
+        self.teacher_only = User.objects.create_user(
+            username="teacher_only",
+            email="teacher.only@mariancollege.org",
+            password="password123",
+            role="faculty",
+            department=self.dept
+        )
+
+        # Students
+        self.student1 = User.objects.create_user(
+            username="student1",
+            email="student1.cs@mariancollege.org",
+            password="password123",
+            role="student",
+            class_name=self.class1,
+            department=self.dept
+        )
+        self.student2 = User.objects.create_user(
+            username="student2",
+            email="student2.cs@mariancollege.org",
+            password="password123",
+            role="student",
+            class_name=self.class2,
+            department=self.dept
+        )
+
+        # Categories & Items
+        self.cat_acad = CriteriaCategory.objects.create(category="Academics", code="cat-academics", is_manual_eval=False)
+        self.item_acad = CriteriaItem.objects.create(category=self.cat_acad, title="Semester Exam Results", type="fixed", marks=10.0)
+
+        self.cat_career = CriteriaCategory.objects.create(category="Career Advancement", code="cat-career", is_manual_eval=True)
+        self.item_career = CriteriaItem.objects.create(category=self.cat_career, title="Placement Offer", type="fixed", marks=50.0, is_manual_eval=True)
+
+        # Assign class teacher for class1 -> dual_staff
+        self.class1.class_teacher = self.dual_staff
+        self.class1.save()
+        from users.models import TeacherClassAssignment, EvaluatorCategoryAssignment
+        TeacherClassAssignment.objects.create(teacher=self.dual_staff, class_obj=self.class1, academic_year=2025, is_active=True)
+
+        # Assign class teacher for class2 -> teacher_only
+        self.class2.class_teacher = self.teacher_only
+        self.class2.save()
+        TeacherClassAssignment.objects.create(teacher=self.teacher_only, class_obj=self.class2, academic_year=2025, is_active=True)
+
+        # Assign Evaluator for cat_career -> dual_staff
+        EvaluatorCategoryAssignment.objects.create(evaluator=self.dual_staff, category=self.cat_career, academic_year=2025)
+        self.cat_career.evaluators = [self.dual_staff.email]
+        self.cat_career.save()
+
+    def test_dual_role_switch_endpoint(self):
+        """Dual-role staff can switch between teacher and evaluator roles; unauthorized role switches fail."""
+        # 1. Single-role teacher attempts to switch to evaluator -> 403 Forbidden
+        self.client.force_authenticate(user=self.teacher_only)
+        res_single = self.client.post('/api/auth/switch-role/', {'role': 'evaluator'}, format='json')
+        self.assertEqual(res_single.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertIn("not authorized", res_single.data['error'])
+
+        # 2. Dual-role staff switches to evaluator -> 200 OK
+        self.client.force_authenticate(user=self.dual_staff)
+        res_to_eval = self.client.post('/api/auth/switch-role/', {'role': 'evaluator'}, format='json')
+        self.assertEqual(res_to_eval.status_code, status.HTTP_200_OK)
+        self.assertEqual(res_to_eval.data['active_role'], 'evaluator')
+        self.assertEqual(res_to_eval.data['available_roles'], ['teacher', 'evaluator'])
+
+        # Profile returns active_role = 'evaluator'
+        res_prof = self.client.get('/api/auth/profile/')
+        self.assertEqual(res_prof.status_code, status.HTTP_200_OK)
+        self.assertEqual(res_prof.data['active_role'], 'evaluator')
+        self.assertTrue(res_prof.data['has_dual_role'])
+
+        # 3. Dual-role staff switches back to teacher -> 200 OK
+        res_to_teach = self.client.post('/api/auth/switch-role/', {'role': 'teacher'}, format='json')
+        self.assertEqual(res_to_teach.status_code, status.HTTP_200_OK)
+        self.assertEqual(res_to_teach.data['active_role'], 'teacher')
+
+        # 4. Attempt to switch to invalid role -> 400 Bad Request
+        res_invalid = self.client.post('/api/auth/switch-role/', {'role': 'superadmin'}, format='json')
+        self.assertEqual(res_invalid.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_dual_role_teacher_view_isolation_and_no_marks_award(self):
+        """
+        Class Teacher view:
+        - Exclusively displays submissions from students in assigned class.
+        - Approving DOES NOT award marks, sets status to EVALUATOR_PENDING,
+          and writes VerificationLog with VERIFY_AND_FORWARD.
+        - Attempt to verify cross-class student fails with 403.
+        """
+        from users.models import Submission, VerificationLog, ClassIndexResult
+
+        # Submissions for student1 (class1) and student2 (class2) in Cat Career
+        sub_c1 = Submission.objects.create(
+            user=self.student1,
+            class_obj=self.class1,
+            category=self.cat_career,
+            criteria_id=self.item_career.id,
+            status='Student Rep Verified',
+            academic_year='2025-2026',
+            description='Class 1 submission'
+        )
+        sub_c2 = Submission.objects.create(
+            user=self.student2,
+            class_obj=self.class2,
+            category=self.cat_career,
+            criteria_id=self.item_career.id,
+            status='Student Rep Verified',
+            academic_year='2025-2026',
+            description='Class 2 submission'
+        )
+
+        self.client.force_authenticate(user=self.dual_staff)
+
+        # 1. Teacher View List Isolation: returns sub_c1, does NOT return sub_c2
+        res_list = self.client.get('/api/submissions/', HTTP_X_ROLE_CONTEXT='teacher')
+        self.assertEqual(res_list.status_code, status.HTTP_200_OK)
+        ids = [s['id'] for s in res_list.data]
+        self.assertIn(sub_c1.id, ids)
+        self.assertNotIn(sub_c2.id, ids)
+
+        # 2. Teacher approves sub_c1 -> Round 2 Verification
+        res_appr = self.client.put(f'/api/submissions/{sub_c1.id}/', {
+            'status': 'Approved',
+            'actionType': 'VERIFY_AND_FORWARD',
+            'remarks': 'Forwarded to evaluator by class teacher',
+            'role_context': 'teacher'
+        }, format='json')
+        self.assertEqual(res_appr.status_code, status.HTTP_200_OK)
+        sub_c1.refresh_from_db()
+        self.assertEqual(sub_c1.status, 'Teacher Verified')
+        self.assertIsNone(sub_c1.marks)  # Marks NOT awarded
+
+        # VerificationLog recorded with CLASS_TEACHER and VERIFY_AND_FORWARD
+        vlog = VerificationLog.objects.filter(submission=sub_c1).last()
+        self.assertIsNotNone(vlog)
+        self.assertEqual(vlog.verification_level, 'CLASS_TEACHER')
+        self.assertEqual(vlog.action, 'VERIFY_AND_FORWARD')
+        self.assertEqual(vlog.verifier_id, self.dual_staff.id)
+
+        # Class leaderboard ledger was NOT credited by teacher approval
+        cir = ClassIndexResult.objects.filter(class_name=self.class1).first()
+        self.assertIsNone(cir)
+
+        # 3. Teacher attempts to verify sub_c2 (other class) -> 403 Forbidden
+        res_cross = self.client.put(f'/api/submissions/{sub_c2.id}/', {
+            'status': 'Teacher Verified',
+            'remarks': 'Cross-class verification attempt',
+            'role_context': 'teacher'
+        }, format='json')
+        self.assertEqual(res_cross.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_dual_role_evaluator_view_evaluation_and_marks_crediting(self):
+        """
+        Evaluator view:
+        - Displays verified submissions for assigned categories across classes.
+        - Approving records marks, sets status to APPROVED / Evaluated,
+          credits class leaderboard ledger, and logs APPROVE_AND_CREDIT.
+        """
+        from users.models import Submission, VerificationLog, ClassIndexResult
+
+        # Create submissions in Teacher Verified state (Round 2 complete)
+        sub_c1 = Submission.objects.create(
+            user=self.student1,
+            class_obj=self.class1,
+            category=self.cat_career,
+            criteria_id=self.item_career.id,
+            status='Teacher Verified',
+            academic_year='2025-2026',
+            description='Career verified sub 1'
+        )
+        sub_c2 = Submission.objects.create(
+            user=self.student2,
+            class_obj=self.class2,
+            category=self.cat_career,
+            criteria_id=self.item_career.id,
+            status='Teacher Verified',
+            academic_year='2025-2026',
+            description='Career verified sub 2'
+        )
+        # Submission in Academics (unassigned category for dual_staff)
+        sub_unassigned = Submission.objects.create(
+            user=self.student1,
+            class_obj=self.class1,
+            category=self.cat_acad,
+            criteria_id=self.item_acad.id,
+            status='Teacher Verified',
+            academic_year='2025-2026',
+            description='Academics verified sub'
+        )
+
+        self.client.force_authenticate(user=self.dual_staff)
+
+        # 1. Evaluator View List Isolation: shows assigned category across classes, excludes unassigned category
+        res_list = self.client.get('/api/submissions/', HTTP_X_ROLE_CONTEXT='evaluator')
+        self.assertEqual(res_list.status_code, status.HTTP_200_OK)
+        ids = [s['id'] for s in res_list.data]
+        self.assertIn(sub_c1.id, ids)
+        self.assertIn(sub_c2.id, ids)
+        self.assertNotIn(sub_unassigned.id, ids)
+
+        # 2. Evaluator evaluates sub_c1 -> Final Evaluation & Mark Award
+        res_eval = self.client.put(f'/api/submissions/{sub_c1.id}/', {
+            'status': 'Evaluated',
+            'marks': 35.0,
+            'actionType': 'APPROVE_AND_CREDIT',
+            'remarks': 'Evaluator approved and marks credited',
+            'role_context': 'evaluator'
+        }, format='json')
+        self.assertEqual(res_eval.status_code, status.HTTP_200_OK)
+        sub_c1.refresh_from_db()
+        self.assertEqual(sub_c1.status, 'Evaluated')
+        self.assertEqual(sub_c1.marks, 35)
+
+        # VerificationLog recorded with EVALUATOR and APPROVE_AND_CREDIT
+        vlog = VerificationLog.objects.filter(submission=sub_c1).last()
+        self.assertIsNotNone(vlog)
+        self.assertEqual(vlog.verification_level, 'EVALUATOR')
+        self.assertEqual(vlog.action, 'APPROVE_AND_CREDIT')
+        self.assertEqual(vlog.verifier_id, self.dual_staff.id)
+
+        # ClassIndexResult leaderboard ledger is credited!
+        cir = ClassIndexResult.objects.filter(class_name=self.class1).first()
+        self.assertIsNotNone(cir)
+
+        # 3. Evaluator evaluates sub_c2 (other class, same category) -> succeeds
+        res_eval2 = self.client.put(f'/api/submissions/{sub_c2.id}/', {
+            'status': 'Evaluated',
+            'marks': 40.0,
+            'actionType': 'APPROVE_AND_CREDIT',
+            'remarks': 'Evaluator approved for class 2',
+            'role_context': 'evaluator'
+        }, format='json')
+        self.assertEqual(res_eval2.status_code, status.HTTP_200_OK)
+        sub_c2.refresh_from_db()
+        self.assertEqual(sub_c2.marks, 40)
+
+        # 4. Evaluator attempts to evaluate unassigned category -> 403 Forbidden
+        res_un = self.client.put(f'/api/submissions/{sub_unassigned.id}/', {
+            'status': 'Evaluated',
+            'marks': 10.0,
+            'role_context': 'evaluator'
+        }, format='json')
+        self.assertEqual(res_un.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertIn("not assigned", res_un.data['error'])
+
+    def test_evaluator_cannot_evaluate_before_round_2(self):
+        """Evaluator cannot evaluate submissions that have not completed Round 2 Teacher Verification."""
+        from users.models import Submission
+
+        sub_not_ready = Submission.objects.create(
+            user=self.student1,
+            class_obj=self.class1,
+            category=self.cat_career,
+            criteria_id=self.item_career.id,
+            status='Student Rep Verified',  # Has not passed Round 2 (Teacher Verified)
+            academic_year='2025-2026',
+            description='Not yet teacher verified'
+        )
+
+        self.client.force_authenticate(user=self.dual_staff)
+        res = self.client.put(f'/api/submissions/{sub_not_ready.id}/', {
+            'status': 'Evaluated',
+            'marks': 25.0,
+            'role_context': 'evaluator'
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("complete Round 2 Teacher Verification", res.data['error'])
+
+
+class SubcategoryDynamicMarkCalculationEngineTest(TestCase):
+    """
+    Authoritative test suite for the Subcategory-Based Dynamic Mark Calculation Engine.
+    Verifies that:
+      1. For all categories containing subcategories, calculated marks are strictly driven by
+         subcategories.default_marks.
+      2. The backend never assigns a generic or hardcoded mark at the category level.
+      3. Selected subcategory_id in the subcategories table is looked up and sets calculated_marks.
+      4. Categories without subcategories (Cat 1: Academics, Cat 12: Career Advancement) use
+         formulas or manual evaluation respectively.
+      5. Verification controllers (Round 3 Evaluator) strictly enforce subcategory.default_marks.
+      6. Subcategories API endpoints (/api/subcategories/) function accurately.
+    """
+
+    def setUp(self):
+        from users.models import (
+            Category, SubCategory, CriteriaCategory, CriteriaItem,
+            CriteriaVersion, AcademicYear, Class, Department, User,
+            EvaluatorCategoryAssignment, UserGroupModel, UserGroupMember
+        )
+
+        self.client = APIClient()
+        self.ay = AcademicYear.objects.create(year='2025-2026', is_active=True)
+        self.cv = CriteriaVersion.objects.create(academic_year='2025-2026', version=1, is_locked=False)
+        self.dept = Department.objects.create(name='Computer Applications', code='DCA', level='PG')
+        self.cls = Class.objects.create(name='II MCA', department=self.dept, batch_start_year=2025)
+
+        self.student = User.objects.create(
+            username='student@mariancollege.org',
+            email='student@mariancollege.org',
+            role='student',
+            department=self.dept,
+            class_name=self.cls
+        )
+        self.evaluator = User.objects.create(
+            username='evaluator@mariancollege.org',
+            email='evaluator@mariancollege.org',
+            role='evaluation',
+            department=self.dept
+        )
+        self.admin = User.objects.create(
+            username='admin@mariancollege.org',
+            email='admin@mariancollege.org',
+            role='admin',
+            is_staff=True,
+            is_superuser=True
+        )
+
+        # Seed categories table (1-12)
+        categories_data = [
+            (1, 'cat-academics', 'Academics'),
+            (2, 'cat-online-courses', 'Online Courses'),
+            (3, 'cat-competitive-exams', 'Competitive Exams'),
+            (4, 'cat-internships', 'Internships'),
+            (5, 'cat-scholarships', 'Scholarships'),
+            (6, 'cat-research', 'Research'),
+            (7, 'cat-startups', 'Startups'),
+            (8, 'cat-prizes', 'Prizes Won'),
+            (9, 'cat-programs-organized', 'Programs Organized'),
+            (10, 'cat-leadership', 'Leaderships'),
+            (11, 'cat-social-responsibility', 'Social Responsibilities'),
+            (12, 'cat-career-advancement', 'Career Advancement'),
+        ]
+        for cid, ccode, cname in categories_data:
+            Category.objects.get_or_create(id=cid, defaults={'code': ccode, 'name': cname})
+
+        # Seed subcategories
+        from decimal import Decimal
+        self.sub_swayam, _ = SubCategory.objects.get_or_create(
+            category_id=2,
+            subcategory_name='Swayam / NPTEL Course',
+            defaults={'default_marks': Decimal('5.00'), 'requires_dqc': False, 'max_per_cycle': 3}
+        )
+        self.sub_mooc, _ = SubCategory.objects.get_or_create(
+            category_id=2,
+            subcategory_name='MOOC Course',
+            defaults={'default_marks': Decimal('2.00'), 'requires_dqc': False, 'max_per_cycle': 3}
+        )
+
+        self.sub_jrf, _ = SubCategory.objects.get_or_create(
+            category_id=3,
+            subcategory_name='JRF Passed',
+            defaults={'default_marks': Decimal('20.00'), 'requires_dqc': False, 'max_per_cycle': 1}
+        )
+        self.sub_net, _ = SubCategory.objects.get_or_create(
+            category_id=3,
+            subcategory_name='NET Passed',
+            defaults={'default_marks': Decimal('10.00'), 'requires_dqc': False, 'max_per_cycle': 1}
+        )
+        self.sub_exam_other, _ = SubCategory.objects.get_or_create(
+            category_id=3,
+            subcategory_name='Any Other Relevant Exam (IELTS, Language, etc.)',
+            defaults={'default_marks': Decimal('3.00'), 'requires_dqc': False, 'max_per_cycle': 2}
+        )
+        self.sub_exam_part, _ = SubCategory.objects.get_or_create(
+            category_id=3,
+            subcategory_name='Participation in Relevant Exam (UPSC / PSC)',
+            defaults={'default_marks': Decimal('1.00'), 'requires_dqc': False, 'max_per_cycle': 3}
+        )
+
+        self.sub_prize_ind_out, _ = SubCategory.objects.get_or_create(
+            category_id=8,
+            subcategory_name='1st Prize (Individual) - Outside',
+            defaults={'default_marks': Decimal('15.00'), 'requires_dqc': False, 'max_per_cycle': 3}
+        )
+        self.sub_prize_grp_out, _ = SubCategory.objects.get_or_create(
+            category_id=8,
+            subcategory_name='1st Prize (Group) - Outside',
+            defaults={'default_marks': Decimal('10.00'), 'requires_dqc': True, 'max_per_cycle': 3}
+        )
+
+        # Criteria Categories and Items for API tests
+        self.crit_cat_online = CriteriaCategory.objects.create(code='cat-online-courses', category='Online Courses')
+        self.crit_item_swayam = CriteriaItem.objects.create(category=self.crit_cat_online, version=self.cv, title='Swayam / NPTEL Course', type='count', marks=5.0)
+        self.crit_item_mooc = CriteriaItem.objects.create(category=self.crit_cat_online, version=self.cv, title='MOOC Course', type='count', marks=2.0)
+
+        self.crit_cat_exams = CriteriaCategory.objects.create(code='cat-competitive-exams', category='Competitive Exams')
+        self.crit_item_jrf = CriteriaItem.objects.create(category=self.crit_cat_exams, version=self.cv, title='JRF Passed', type='date', marks=20.0)
+        self.crit_item_net = CriteriaItem.objects.create(category=self.crit_cat_exams, version=self.cv, title='NET Passed', type='date', marks=10.0)
+        self.crit_item_other = CriteriaItem.objects.create(category=self.crit_cat_exams, version=self.cv, title='Any Other Relevant Exam (IELTS, Language, etc.)', type='date', marks=3.0)
+        self.crit_item_upsc = CriteriaItem.objects.create(category=self.crit_cat_exams, version=self.cv, title='Participation in Relevant Exam (UPSC / PSC)', type='date', marks=1.0)
+
+        self.crit_cat_prizes = CriteriaCategory.objects.create(code='cat-prizes', category='Prizes Won')
+        self.crit_item_prize_out = CriteriaItem.objects.create(category=self.crit_cat_prizes, version=self.cv, title='Outside Marian College', type='count', marks=0.0)
+
+        self.crit_cat_academics = CriteriaCategory.objects.create(code='cat-academics', category='Academics')
+        self.crit_item_academics = CriteriaItem.objects.create(category=self.crit_cat_academics, version=self.cv, title='Sem Result', type='academic_grades', marks=0.0)
+
+        self.crit_cat_career = CriteriaCategory.objects.create(code='cat-career-advancement', category='Career Advancement', is_manual_eval=True)
+        self.crit_item_career = CriteriaItem.objects.create(category=self.crit_cat_career, version=self.cv, title='Library - Footfall', type='count', marks=0.0, is_manual_eval=True)
+
+        # Assign evaluator to categories
+        EvaluatorCategoryAssignment.objects.create(evaluator=self.evaluator, category=self.crit_cat_online, academic_year=2025)
+        EvaluatorCategoryAssignment.objects.create(evaluator=self.evaluator, category=self.crit_cat_exams, academic_year=2025)
+        EvaluatorCategoryAssignment.objects.create(evaluator=self.evaluator, category=self.crit_cat_prizes, academic_year=2025)
+        EvaluatorCategoryAssignment.objects.create(evaluator=self.evaluator, category=self.crit_cat_career, academic_year=2025)
+
+    def test_subcategories_table_schema_and_seed_data(self):
+        """Verify subcategories table correctly stores default_marks, requires_dqc, and max_per_cycle."""
+        from users.models import SubCategory
+
+        self.assertEqual(float(self.sub_swayam.default_marks), 5.0)
+        self.assertFalse(self.sub_swayam.requires_dqc)
+        self.assertEqual(self.sub_swayam.max_per_cycle, 3)
+
+        self.assertEqual(float(self.sub_mooc.default_marks), 2.0)
+        self.assertEqual(float(self.sub_jrf.default_marks), 20.0)
+        self.assertEqual(float(self.sub_net.default_marks), 10.0)
+        self.assertEqual(float(self.sub_exam_other.default_marks), 3.0)
+        self.assertEqual(float(self.sub_exam_part.default_marks), 1.0)
+
+        self.assertEqual(float(self.sub_prize_ind_out.default_marks), 15.0)
+        self.assertFalse(self.sub_prize_ind_out.requires_dqc)
+
+        self.assertEqual(float(self.sub_prize_grp_out.default_marks), 10.0)
+        self.assertTrue(self.sub_prize_grp_out.requires_dqc)
+
+    def test_online_courses_submission_marks_strictly_driven_by_subcategory(self):
+        """Submitting Swayam course sets calculated_marks to 5.00, MOOC sets to 2.00."""
+        self.client.force_authenticate(user=self.student)
+
+        # 1. Swayam submission
+        res1 = self.client.post('/api/submissions/', {
+            'criteriaId': self.crit_item_swayam.id,
+            'academicYear': '2025-2026',
+            'description': 'Completed Swayam AI Course',
+            'proof': 'https://drive.google.com/file/d/123/view',
+            'startDate': '2025-07-01',
+            'endDate': '2025-09-01',
+            'evidence': {'startDate': '2025-07-01', 'endDate': '2025-09-01'}
+        }, format='json')
+        self.assertEqual(res1.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(float(res1.data['calculatedMarks']), 5.0)
+        self.assertEqual(res1.data['subcategoryId'], self.sub_swayam.id)
+
+        # 2. MOOC submission
+        res2 = self.client.post('/api/submissions/', {
+            'criteriaId': self.crit_item_mooc.id,
+            'academicYear': '2025-2026',
+            'description': 'Completed Coursera MOOC Course',
+            'proof': 'https://drive.google.com/file/d/456/view',
+            'startDate': '2025-08-01',
+            'endDate': '2025-09-01',
+            'evidence': {'startDate': '2025-08-01', 'endDate': '2025-09-01'}
+        }, format='json')
+        self.assertEqual(res2.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(float(res2.data['calculatedMarks']), 2.0)
+        self.assertEqual(res2.data['subcategoryId'], self.sub_mooc.id)
+
+    def test_competitive_exams_submission_marks_driven_by_subcategory(self):
+        """Competitive exams submissions have calculated_marks set to 20, 10, 3, 1."""
+        self.client.force_authenticate(user=self.student)
+
+        # JRF (20 marks)
+        res_jrf = self.client.post('/api/submissions/', {
+            'criteriaId': self.crit_item_jrf.id,
+            'academicYear': '2025-2026',
+            'description': 'Passed UGC JRF',
+            'proof': 'https://drive.google.com/file/d/jrf/view',
+            'startDate': '2025-06-15',
+            'evidence': {'examDate': '2025-06-15'}
+        }, format='json')
+        self.assertEqual(res_jrf.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(float(res_jrf.data['calculatedMarks']), 20.0)
+        self.assertEqual(res_jrf.data['subcategoryId'], self.sub_jrf.id)
+
+        # NET (10 marks)
+        res_net = self.client.post('/api/submissions/', {
+            'criteriaId': self.crit_item_net.id,
+            'academicYear': '2025-2026',
+            'description': 'Passed UGC NET',
+            'proof': 'https://drive.google.com/file/d/net/view',
+            'startDate': '2025-06-15',
+            'evidence': {'examDate': '2025-06-15'}
+        }, format='json')
+        self.assertEqual(res_net.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(float(res_net.data['calculatedMarks']), 10.0)
+
+        # Any Other (3 marks)
+        res_other = self.client.post('/api/submissions/', {
+            'criteriaId': self.crit_item_other.id,
+            'academicYear': '2025-2026',
+            'description': 'IELTS Band 8.0',
+            'proof': 'https://drive.google.com/file/d/ielts/view',
+            'startDate': '2025-06-15',
+            'evidence': {'examDate': '2025-06-15'}
+        }, format='json')
+        self.assertEqual(res_other.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(float(res_other.data['calculatedMarks']), 3.0)
+
+        # UPSC Participation (1 mark)
+        res_upsc = self.client.post('/api/submissions/', {
+            'criteriaId': self.crit_item_upsc.id,
+            'academicYear': '2025-2026',
+            'description': 'UPSC Prelims Exam',
+            'proof': 'https://drive.google.com/file/d/upsc/view',
+            'startDate': '2025-06-15',
+            'evidence': {'examDate': '2025-06-15'}
+        }, format='json')
+        self.assertEqual(res_upsc.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(float(res_upsc.data['calculatedMarks']), 1.0)
+
+    def test_prizes_submission_marks_driven_by_subcategory(self):
+        """Prizes category pulls subcategory base marks (15.0 for 1st Prize Outside)."""
+        self.client.force_authenticate(user=self.student)
+
+        res = self.client.post('/api/submissions/', {
+            'criteriaId': self.crit_item_prize_out.id,
+            'academicYear': '2025-2026',
+            'description': 'Inter-collegiate Fest Winner',
+            'proof': 'https://drive.google.com/file/d/prize/view',
+            'evidence': {
+                'subItem': '1st Prize (Individual) - Outside',
+                'prizesSubItem': '1st Prize (Individual) - Outside'
+            }
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(float(res.data['calculatedMarks']), 15.0)
+        self.assertEqual(res.data['subcategoryId'], self.sub_prize_ind_out.id)
+
+    def test_evaluator_verification_controller_enforces_subcategory_marks(self):
+        """Round 3 Evaluator APPROVE_AND_CREDIT credits subcategory.default_marks."""
+        from users.models import Submission
+
+        sub = Submission.objects.create(
+            user=self.student,
+            class_obj=self.cls,
+            category=self.crit_cat_online,
+            criteria_id=self.crit_item_swayam.id,
+            subcategory_id=self.sub_swayam.id,
+            status='Teacher Verified',
+            academic_year='2025-2026',
+            description='Swayam certificate review ready',
+            calculated_marks=5.0,
+            marks=5
+        )
+
+        self.client.force_authenticate(user=self.evaluator)
+        res = self.client.post('/api/verification/evaluator/', {
+            'submissionId': sub.id,
+            'action': 'APPROVE_AND_CREDIT',
+            'remarks': 'Certificate verified, credit 5 marks'
+        }, format='json')
+
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        sub.refresh_from_db()
+        self.assertEqual(sub.status, 'Evaluated')
+        self.assertEqual(float(sub.calculated_marks), 5.0)
+        self.assertEqual(sub.marks, 5)
+
+    def test_categories_without_subcategories_academics_formula_preserved(self):
+        """Categories without subcategories (Cat 1: Academics) use grade breakdown formula."""
+        from users.models import Submission
+        sub = Submission.objects.create(
+            user=self.student,
+            class_obj=self.cls,
+            category=self.crit_cat_academics,
+            criteria_id=self.crit_item_academics.id,
+            academic_year='2025-2026',
+            description='Semester 1 Mark Result',
+            evidence={
+                'totalStudents': 50,
+                'grades': {'S': 10, 'APlus': 15, 'A': 15, 'Fail': 2},
+                'classPassPercentage': 96.0
+            }
+        )
+        # Expected: (10 * 5) + (15 * 4) + (15 * 3) + 5.0 (pass bonus > 90) - 2 (fail) = 50 + 60 + 45 + 5 - 2 = 158.0
+        from users.scoring_engine import calculate_submission_score
+        score = calculate_submission_score(self.crit_item_academics, sub.evidence)
+        self.assertEqual(score, 158.0)
+
+    def test_categories_without_subcategories_career_advancement_manual_eval(self):
+        """Categories without subcategories (Cat 12: Career) use Evaluator manual score."""
+        from users.models import Submission
+        sub = Submission.objects.create(
+            user=self.student,
+            class_obj=self.cls,
+            category=self.crit_cat_career,
+            criteria_id=self.crit_item_career.id,
+            status='Teacher Verified',
+            academic_year='2025-2026',
+            description='Library footfall logs',
+            is_manual_eval=True
+        )
+
+        self.client.force_authenticate(user=self.evaluator)
+        res = self.client.post('/api/verification/evaluator/', {
+            'submissionId': sub.id,
+            'action': 'APPROVE_AND_CREDIT',
+            'marks': 35.0,
+            'remarks': 'Awarded 35 manual marks based on biometric log'
+        }, format='json')
+
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        sub.refresh_from_db()
+        self.assertEqual(sub.marks, 35)
+
+    def test_subcategories_api_endpoints(self):
+        """Verify GET /api/subcategories/ and GET /api/subcategories/<id>/."""
+        self.client.force_authenticate(user=self.student)
+
+        # List all
+        res_list = self.client.get('/api/subcategories/')
+        self.assertEqual(res_list.status_code, status.HTTP_200_OK)
+        self.assertGreaterEqual(len(res_list.data), 8)
+
+        # Filter by category 2 (Online Courses)
+        res_cat2 = self.client.get('/api/subcategories/?category_id=2')
+        self.assertEqual(res_cat2.status_code, status.HTTP_200_OK)
+        cat2_names = [s['subcategory_name'] for s in res_cat2.data]
+        self.assertIn('Swayam / NPTEL Course', cat2_names)
+        self.assertIn('MOOC Course', cat2_names)
+
+        # Detail view
+        res_det = self.client.get(f'/api/subcategories/{self.sub_swayam.id}/')
+        self.assertEqual(res_det.status_code, status.HTTP_200_OK)
+        self.assertEqual(res_det.data['subcategory_name'], 'Swayam / NPTEL Course')
+        self.assertEqual(float(res_det.data['default_marks']), 5.0)
+
+
+
+
 
 
 

@@ -103,6 +103,8 @@ class UserService:
         if course_code_str == 'sw' and level_char == 'p':
             lookup_code = 'psw'
 
+        class_code = f"{batch_str}{level_char}{course_code_str}{section_digit}"
+
         return {
             'batch_str': batch_str,
             'batch_year': batch_year,
@@ -113,6 +115,7 @@ class UserService:
             'roll_digits': f"{section_digit}{roll_digits}",
             'student_id': roll_digits,
             'roll_number': roll_number,
+            'class_code': class_code,
         }
 
     @staticmethod
@@ -197,6 +200,8 @@ class UserService:
             'department_obj': dept_obj,
             'section': section,
             'class_name': class_name,
+            'class_code': parsed_code.get('class_code', ''),
+            'academic_year': f"{active_year_start}-{active_year_start + 1}",
             'roll_number': roll_number,
             'roll_digits': roll_digits,
             'db_resolved': bool(dept_obj and course_obj),
@@ -278,13 +283,29 @@ class UserService:
                     'course': course,
                     'year_number': year_number,
                     'section': section,
-                    'batch_start_year': parsed.get('batch_year')
+                    'batch_start_year': parsed.get('batch_year'),
+                    'batch_year': parsed.get('batch_year'),
+                    'class_code': parsed.get('class_code', ''),
+                    'academic_year': parsed.get('academic_year', '')
                 }
             )
 
-        if class_obj and dept_obj and class_obj.department != dept_obj:
-            class_obj.department = dept_obj
-            class_obj.save(update_fields=['department'])
+        if class_obj:
+            updated_class_fields = []
+            if parsed.get('class_code') and not class_obj.class_code:
+                class_obj.class_code = parsed['class_code']
+                updated_class_fields.append('class_code')
+            if parsed.get('batch_year') and not class_obj.batch_year:
+                class_obj.batch_year = parsed['batch_year']
+                updated_class_fields.append('batch_year')
+            if parsed.get('academic_year') and not class_obj.academic_year:
+                class_obj.academic_year = parsed['academic_year']
+                updated_class_fields.append('academic_year')
+            if dept_obj and class_obj.department != dept_obj:
+                class_obj.department = dept_obj
+                updated_class_fields.append('department')
+            if updated_class_fields:
+                class_obj.save(update_fields=updated_class_fields)
 
         user.department = dept_obj
         user.class_name = class_obj
@@ -316,6 +337,7 @@ class UserService:
     @staticmethod
     def is_user_dqc_rep(user):
         from users.models import Class, UserGroupMember, UserGroupModel
+        from django.db.models import Q
         if not user or not getattr(user, 'is_authenticated', False):
             return False
         if getattr(user, 'is_dqc_member', False):
@@ -325,9 +347,14 @@ class UserService:
         user_email = (getattr(user, 'email', '') or '').strip().lower()
         if not user_email:
             return False
-        if UserGroupMember.objects.filter(group__group_id='grp-dqc-student-rep', email__iexact=user_email).exists():
+        if UserGroupMember.objects.filter(
+            Q(group__group_id='grp-dqc-student-rep') | Q(group__name__iexact='DQC Student Rep Group'),
+            email__iexact=user_email
+        ).exists():
             return True
-        dqc_group = UserGroupModel.objects.filter(group_id='grp-dqc-student-rep').first()
+        dqc_group = UserGroupModel.objects.filter(
+            Q(group_id='grp-dqc-student-rep') | Q(name__iexact='DQC Student Rep Group')
+        ).first()
         if dqc_group and dqc_group.members and any(isinstance(e, str) and e.strip().lower() == user_email for e in dqc_group.members):
             return True
         return False
@@ -345,14 +372,90 @@ class UserService:
         if user_email:
             if Class.objects.filter(dqc_member__email__iexact=user_email).exists():
                 return True
-            if UserGroupMember.objects.filter(group__group_id__in=['grp-student-reps', 'grp-dqc-student-rep'], email__iexact=user_email).exists():
+            if UserGroupMember.objects.filter(
+                Q(group__group_id__in=['grp-student-reps', 'grp-dqc-student-rep']) |
+                Q(group__name__in=['Student Representatives', 'DQC Student Rep Group']),
+                email__iexact=user_email
+            ).exists():
                 return True
             rep_group = UserGroupModel.objects.filter(
-                Q(group_id__in=['grp-student-reps', 'grp-dqc-student-rep']) | Q(name__icontains='student rep') | Q(name__icontains='dqc')
+                Q(group_id__in=['grp-student-reps', 'grp-dqc-student-rep']) |
+                Q(name__icontains='student rep') |
+                Q(name__icontains='dqc')
             ).first()
             if rep_group and rep_group.members and any(isinstance(e, str) and e.strip().lower() == user_email for e in rep_group.members):
                 return True
         return False
+
+    @staticmethod
+    def get_user_group_names(user):
+        """
+        Returns a sorted list of unique official group names the user is affiliated with:
+        'Student Representatives', 'DQC Student Rep Group', 'Class Teachers Council', 'Evaluation Committee'.
+        """
+        if not user or not getattr(user, 'is_authenticated', False):
+            return []
+
+        group_names = set()
+        user_email = (getattr(user, 'email', '') or '').strip().lower()
+
+        from users.models import UserGroupMember, UserGroupModel, Class, TeacherClassAssignment, EvaluatorCategoryAssignment
+
+        # 1. From UserGroupMember records
+        if user_email:
+            memberships = UserGroupMember.objects.filter(
+                Q(user=user) | Q(email__iexact=user_email)
+            ).select_related('group')
+            for m in memberships:
+                if m.group and m.group.name:
+                    group_names.add(m.group.name)
+
+            # 2. From UserGroupModel JSON members list
+            for g in UserGroupModel.objects.all():
+                if g.members and any(isinstance(e, str) and e.strip().lower() == user_email for e in g.members):
+                    group_names.add(g.name)
+
+        # 3. Direct relational / flag checks
+        if getattr(user, 'is_dqc_member', False):
+            group_names.add('DQC Student Rep Group')
+
+        if getattr(user, 'is_student_rep', False):
+            group_names.add('Student Representatives')
+
+        if user_email and Class.objects.filter(Q(dqc_member=user) | Q(dqc_member__email__iexact=user_email)).exists():
+            group_names.add('DQC Student Rep Group')
+
+        user_role = getattr(user, 'role', '')
+        if user_role in ('faculty', 'staff', 'teacher'):
+            if TeacherClassAssignment.objects.filter(teacher=user, is_active=True).exists() or Class.objects.filter(class_teacher=user).exists():
+                group_names.add('Class Teachers Council')
+            if user_email and Class.objects.filter(class_teacher__email__iexact=user_email).exists():
+                group_names.add('Class Teachers Council')
+
+        if EvaluatorCategoryAssignment.objects.filter(Q(evaluator=user) | Q(member__email__iexact=user_email)).exists():
+            group_names.add('Evaluation Committee')
+
+        return sorted(list(group_names))
+
+    @staticmethod
+    def is_user_round1_verifier(user):
+        """
+        Determines if user has Round 1 Verification Authority.
+        Allowed roles: 'DQC Student Rep Group' OR 'Student Representatives'.
+        """
+        if not user or not getattr(user, 'is_authenticated', False):
+            return False
+        if getattr(user, 'role', '') == 'admin' or getattr(user, 'is_superuser', False):
+            return True
+        if getattr(user, 'role', '') != 'student':
+            return False
+        groups = UserService.get_user_group_names(user)
+        return (
+            'Student Representatives' in groups or
+            'DQC Student Rep Group' in groups or
+            UserService.is_user_dqc_rep(user) or
+            UserService.is_user_student_rep(user)
+        )
 
 
     @staticmethod
@@ -401,7 +504,10 @@ class UserService:
 
         # Staff user: check membership in Class Teachers Council and Evaluation Committee
         in_class_teachers = False
-        if UserGroupMember.objects.filter(group__group_id='grp-class-teachers', email__iexact=email).exists():
+        from users.models import TeacherClassAssignment, EvaluatorCategoryAssignment
+        if TeacherClassAssignment.objects.filter(teacher=user, is_active=True).exists():
+            in_class_teachers = True
+        elif UserGroupMember.objects.filter(group__group_id='grp-class-teachers', email__iexact=email).exists():
             in_class_teachers = True
         elif Class.objects.filter(class_teacher=user).exists() or Class.objects.filter(class_teacher__email__iexact=email).exists():
             in_class_teachers = True
@@ -411,7 +517,9 @@ class UserService:
                 in_class_teachers = True
 
         in_evaluation_committee = False
-        if UserGroupMember.objects.filter(group__group_id='grp-evaluation-committee', email__iexact=email).exists():
+        if EvaluatorCategoryAssignment.objects.filter(Q(evaluator=user) | Q(member__email__iexact=email)).exists():
+            in_evaluation_committee = True
+        elif UserGroupMember.objects.filter(group__group_id='grp-evaluation-committee', email__iexact=email).exists():
             in_evaluation_committee = True
         elif CriteriaCategory.objects.filter(evaluators__contains=email).exists():
             in_evaluation_committee = True
@@ -464,4 +572,6 @@ is_user_student_rep = UserService.is_user_student_rep
 is_user_dqc_rep = UserService.is_user_dqc_rep
 get_user_badge = UserService.get_user_badge
 get_user_roles_and_dual_status = UserService.get_user_roles_and_dual_status
+get_user_group_names = UserService.get_user_group_names
+is_user_round1_verifier = UserService.is_user_round1_verifier
 

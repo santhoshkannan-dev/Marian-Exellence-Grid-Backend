@@ -82,6 +82,7 @@ MIDDLEWARE = [
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
+    'users.middleware.Round1VerificationMiddleware',
 ]
 
 ROOT_URLCONF = 'marian_backend.urls'
@@ -192,6 +193,11 @@ CORS_ALLOWED_ORIGINS = [
 ]
 CORS_ALLOW_CREDENTIALS = True
 
+from corsheaders.defaults import default_headers
+CORS_ALLOW_HEADERS = list(default_headers) + [
+    'x-role-context',
+]
+
 # CSRF Trusted Origins (Required for HTTPS forms & admin in Django 4+)
 _csrf_origins = os.environ.get('CSRF_TRUSTED_ORIGINS')
 if _csrf_origins:
@@ -227,7 +233,7 @@ REST_FRAMEWORK = {
     'DEFAULT_THROTTLING_RATES': {
         'anon': '200/day',
         'user': '2000/day',
-        'login': '10/minute',
+        'login': '100/minute' if DEBUG else '10/minute',
     }
 }
 

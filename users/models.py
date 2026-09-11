@@ -1,6 +1,7 @@
 import hashlib
 from django.db import models
 from django.contrib.auth.models import AbstractUser
+from django.utils import timezone
 
 DEPARTMENT_LEVEL_CHOICES = [
     ('UG', 'Under-Graduate'),
@@ -14,6 +15,9 @@ USER_ROLE_CHOICES = [
     ("faculty", "Faculty"),
     ("evaluation", "Evaluation Team"),
     ("admin", "Admin"),
+    ("STUDENT", "Student (Uppercase)"),
+    ("STAFF", "Staff (Uppercase)"),
+    ("ADMIN", "Admin (Uppercase)"),
 ]
 
 SUBMISSION_STATUS_CHOICES = [
@@ -30,6 +34,12 @@ SUBMISSION_STATUS_CHOICES = [
     ('Evaluated', 'Evaluated'),
     ('Locked', 'Locked'),
     ('Correction', 'Correction'),
+    ('DQC_PENDING', 'DQC Pending'),
+    ('TEACHER_PENDING', 'Teacher Pending'),
+    ('EVALUATOR_PENDING', 'Evaluator Pending'),
+    ('APPROVED', 'Approved (Canonical)'),
+    ('SENT_BACK', 'Sent Back'),
+    ('REJECTED', 'Rejected (Canonical)'),
 ]
 
 BUG_TYPE_CHOICES = [
@@ -132,6 +142,9 @@ class Class(models.Model):
     year_number = models.IntegerField(null=True, blank=True)   # 1=I, 2=II, 3=III
     section = models.CharField(max_length=5, blank=True, default='')  # 'A', 'B', '' for single-batch
     batch_start_year = models.IntegerField(null=True, blank=True)  # e.g. 2025
+    batch_year = models.IntegerField(null=True, blank=True)        # Canonical alias
+    class_code = models.CharField(max_length=50, blank=True, default='', db_index=True)
+    academic_year = models.CharField(max_length=50, blank=True, default='')
     class_teacher = models.ForeignKey('User', on_delete=models.SET_NULL, null=True, blank=True, related_name='advisor_classes')
     dqc_member = models.ForeignKey('User', on_delete=models.SET_NULL, null=True, blank=True, related_name='rep_classes')
     # Mark moderation fields
@@ -139,6 +152,21 @@ class Class(models.Model):
     negative_points = models.FloatField(default=0.0)    # P — penalty points for this class
     created_at = models.DateTimeField(auto_now_add=True, null=True, blank=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    @property
+    def department_name(self):
+        return self.department.name if self.department else ''
+
+    @property
+    def course_name(self):
+        return self.course.name if self.course else ''
+
+    def save(self, *args, **kwargs):
+        if self.batch_start_year and not self.batch_year:
+            self.batch_year = self.batch_start_year
+        elif self.batch_year and not self.batch_start_year:
+            self.batch_start_year = self.batch_year
+        super().save(*args, **kwargs)
 
     class Meta:
         verbose_name_plural = "Classes"
@@ -170,12 +198,7 @@ class Class(models.Model):
         return self.name
 
 class User(AbstractUser):
-    ROLE_CHOICES = [
-        ("student", "Student"),
-        ("faculty", "Faculty"),
-        ("evaluation", "Evaluation Team"),
-        ("admin", "Admin"),
-    ]
+    ROLE_CHOICES = USER_ROLE_CHOICES
 
     google_id = models.CharField(max_length=255, blank=True, null=True)
     email = models.EmailField(unique=True)
@@ -200,10 +223,36 @@ class User(AbstractUser):
     USERNAME_FIELD = 'email'
     REQUIRED_FIELDS = ['username']
 
+    @property
+    def full_name(self):
+        fn = f"{self.first_name} {self.last_name}".strip()
+        return fn or self.username or self.email
+
+    @property
+    def class_id(self):
+        return self.class_name_id
+
+    @property
+    def user_groups(self):
+        from users.services.user_service import UserService
+        return UserService.get_user_group_names(self)
+
+    def save(self, *args, **kwargs):
+        if not self.username and self.email:
+            self.username = self.email
+        # Normalize uppercase roles to canonical lowercase
+        if self.role == 'STUDENT':
+            self.role = 'student'
+        elif self.role == 'STAFF':
+            self.role = 'faculty'
+        elif self.role == 'ADMIN':
+            self.role = 'admin'
+        super().save(*args, **kwargs)
+
     class Meta:
         constraints = [
             models.CheckConstraint(
-                condition=models.Q(role__in=['student', 'faculty', 'evaluation', 'admin']),
+                condition=models.Q(role__in=['student', 'faculty', 'evaluation', 'admin', 'STUDENT', 'STAFF', 'ADMIN']),
                 name='check_user_role_valid'
             ),
             models.CheckConstraint(
@@ -220,24 +269,13 @@ class User(AbstractUser):
         return f"{self.email} - {self.get_role_display()}"
 
 class Submission(models.Model):
-    STATUS_CHOICES = [
-        ('Approved', 'Approved'),
-        ('Pending', 'Pending'),
-        ('Pending Rep Verification', 'Pending Rep Verification'),
-        ('Student Rep Verified', 'Student Rep Verified'),
-        ('Teacher Verified', 'Teacher Verified'),
-        ('Correction Requested', 'Correction Requested'),
-        ('Rejected', 'Rejected'),
-        ('Draft', 'Draft'),
-        ('Submitted', 'Submitted'),
-        ('Verified', 'Verified'),
-        ('Evaluated', 'Evaluated'),
-        ('Locked', 'Locked'),
-        ('Correction', 'Correction'),
-    ]
+    STATUS_CHOICES = SUBMISSION_STATUS_CHOICES
 
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='submissions')
+    class_obj = models.ForeignKey(Class, on_delete=models.SET_NULL, null=True, blank=True, related_name='submissions')
+    category = models.ForeignKey('CriteriaCategory', on_delete=models.SET_NULL, null=True, blank=True, related_name='submissions')
     criteria_id = models.IntegerField()
+    subcategory_id = models.IntegerField(null=True, blank=True)
     criteria_version = models.ForeignKey('CriteriaVersion', on_delete=models.SET_NULL, null=True, blank=True, related_name='submissions')
     academic_year = models.CharField(max_length=50, blank=True, null=True)
     submission_type = models.CharField(max_length=50, blank=True, null=True) # e.g. 'Sem Result', 'SAVE Sem Result'
@@ -245,14 +283,19 @@ class Submission(models.Model):
     status = models.CharField(max_length=50, choices=STATUS_CHOICES, default='Draft')
     remarks = models.TextField(blank=True, null=True)
     marks = models.IntegerField(blank=True, null=True)
-    proof = models.CharField(max_length=255, blank=True, null=True)
+    calculated_marks = models.FloatField(null=True, blank=True)
+    is_manual_eval = models.BooleanField(default=False)
+    proof = models.CharField(max_length=500, blank=True, null=True)
+    proof_url = models.CharField(max_length=500, blank=True, null=True)
     proof_hash = models.CharField(max_length=64, blank=True, null=True, db_index=True)
     certificate_id = models.CharField(max_length=100, blank=True, null=True, db_index=True)
     event_id = models.CharField(max_length=100, blank=True, null=True)
     start_date = models.CharField(max_length=50, blank=True, null=True)
     end_date = models.CharField(max_length=50, blank=True, null=True)
+    submission_date = models.DateTimeField(null=True, blank=True)
     evaluator_verified = models.BooleanField(default=False)
     evidence = models.JSONField(blank=True, null=True)
+    submission_metadata = models.JSONField(blank=True, null=True)
     verified_by_name = models.CharField(max_length=255, blank=True, null=True)
     rep_verified_by_name = models.CharField(max_length=255, blank=True, null=True)
     rep_remarks = models.TextField(blank=True, null=True)
@@ -262,6 +305,89 @@ class Submission(models.Model):
     evaluator_remarks = models.TextField(blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    @property
+    def student_id(self):
+        return self.user_id
+
+    @property
+    def class_id(self):
+        return self.class_obj_id or (self.user.class_name_id if self.user else None)
+
+    @property
+    def subcategory(self):
+        if self.subcategory_id:
+            return SubCategory.objects.filter(id=self.subcategory_id).first()
+        return None
+
+    def save(self, *args, **kwargs):
+        from django.utils import timezone
+        if not self.submission_date:
+            self.submission_date = self.created_at or timezone.now()
+
+        if not self.class_obj and self.user and self.user.class_name:
+            self.class_obj = self.user.class_name
+
+        c_item = None
+        if self.criteria_id:
+            c_item = CriteriaItem.objects.filter(pk=self.criteria_id).select_related('category').first()
+
+        if not self.category and c_item and c_item.category:
+            self.category = c_item.category
+            if not self.is_manual_eval:
+                self.is_manual_eval = getattr(c_item.category, 'is_manual_eval', False) or getattr(c_item, 'is_manual_eval', False)
+
+        # Dynamic Subcategory Lookup & Mark Calculation Engine:
+        # For all categories containing subcategories, the calculated marks are strictly
+        # driven by subcategories.default_marks.
+        subcat = None
+        if self.subcategory_id:
+            subcat = SubCategory.objects.filter(id=self.subcategory_id).first()
+
+        if not subcat:
+            subcat = SubCategory.find_subcategory(
+                subcategory_id=self.subcategory_id,
+                category_id=getattr(self.category, 'id', None),
+                category_code=getattr(self.category, 'code', None),
+                criteria_item=c_item,
+                evidence=self.evidence
+            )
+            if subcat:
+                self.subcategory_id = subcat.id
+
+        if subcat:
+            count_val = 1
+            ev = self.evidence if isinstance(self.evidence, dict) else {}
+            if (c_item and c_item.type == 'count') or 'count' in ev:
+                try:
+                    count_val = max(1, int(ev.get('count', 1)))
+                except (ValueError, TypeError):
+                    count_val = 1
+            self.calculated_marks = float(subcat.default_marks) * count_val
+            if self.marks is None or not self.is_manual_eval:
+                self.marks = int(round(self.calculated_marks))
+        else:
+            # Submissions for categories without subcategories (e.g. Cat 1 Academics, Cat 12 Career)
+            # must not store arbitrary foreign criteria IDs in subcategory_id
+            if not self.subcategory_id:
+                self.subcategory_id = None
+
+        if self.proof and not self.proof_url:
+            self.proof_url = self.proof
+        elif self.proof_url and not self.proof:
+            self.proof = self.proof_url
+
+        if self.evidence and not self.submission_metadata:
+            self.submission_metadata = self.evidence
+        elif self.submission_metadata and not self.evidence:
+            self.evidence = self.submission_metadata
+
+        if self.marks is not None and self.calculated_marks is None:
+            self.calculated_marks = float(self.marks)
+        elif self.calculated_marks is not None and self.marks is None:
+            self.marks = int(round(self.calculated_marks))
+
+        super().save(*args, **kwargs)
 
     class Meta:
         indexes = [
@@ -317,10 +443,205 @@ class CriteriaVersion(models.Model):
         return f"{self.academic_year} v{self.version} ({status})"
 
 
+class Category(models.Model):
+    id = models.IntegerField(primary_key=True)
+    name = models.CharField(max_length=255)
+    code = models.CharField(max_length=100, unique=True)
+
+    class Meta:
+        db_table = 'categories'
+        verbose_name = 'Category'
+        verbose_name_plural = 'Categories'
+
+    def __str__(self):
+        return f"{self.id} - {self.name} ({self.code})"
+
+
+class SubCategory(models.Model):
+    category = models.ForeignKey(Category, on_delete=models.CASCADE, related_name='subcategories', db_column='category_id')
+    subcategory_name = models.CharField(max_length=255)
+    default_marks = models.DecimalField(max_digits=5, decimal_places=2, default=0.00)
+    requires_dqc = models.BooleanField(default=False)
+    max_per_cycle = models.IntegerField(null=True, blank=True)
+
+    class Meta:
+        db_table = 'subcategories'
+        verbose_name = 'Subcategory'
+        verbose_name_plural = 'Subcategories'
+        ordering = ['category_id', 'id']
+
+    def __str__(self):
+        return f"{self.subcategory_name} ({self.default_marks} marks)"
+
+    @classmethod
+    def find_subcategory(cls, subcategory_id=None, category_id=None, category_code=None, criteria_item=None, evidence=None):
+        """
+        Authoritative resolver that finds the exact SubCategory record.
+        Handles direct subcategory_id, criteria_item, and evidence payloads.
+        """
+        # 1. Direct ID lookup
+        if subcategory_id:
+            try:
+                sub = cls.objects.filter(pk=int(subcategory_id)).first()
+                if sub:
+                    return sub
+            except (ValueError, TypeError):
+                pass
+
+        # 2. Resolve Category Number (1-12)
+        code_map = {
+            'cat-academics': 1,
+            'cat-online-courses': 2,
+            'cat-competitive-exams': 3,
+            'cat-internships': 4,
+            'cat-scholarships': 5,
+            'cat-research': 6,
+            'cat-startups': 7,
+            'cat-prizes': 8,
+            'cat-programs-organized': 9,
+            'cat-leadership': 10,
+            'cat-leaderships': 10,
+            'cat-social-responsibility': 11,
+            'cat-social-responsibilities': 11,
+            'cat-career-advancement': 12,
+        }
+
+        target_cat_num = None
+
+        # A. Resolve by canonical category code
+        raw_code = (category_code or '').strip().lower()
+        if not raw_code and criteria_item and getattr(criteria_item, 'category', None):
+            raw_code = (getattr(criteria_item.category, 'code', '') or '').strip().lower()
+
+        if raw_code and raw_code in code_map:
+            target_cat_num = code_map[raw_code]
+
+        # B. Resolve via CriteriaCategory database lookup if category_id passed
+        if not target_cat_num and category_id is not None:
+            try:
+                crit_c = CriteriaCategory.objects.filter(pk=int(category_id)).first()
+                if crit_c and crit_c.code and crit_c.code.strip().lower() in code_map:
+                    target_cat_num = code_map[crit_c.code.strip().lower()]
+            except Exception:
+                pass
+
+        # C. Resolve via direct Category table ID
+        if not target_cat_num and category_id is not None:
+            try:
+                cid_int = int(category_id)
+                if 106 <= cid_int <= 118:
+                    target_cat_num = cid_int - 105
+                elif 1 <= cid_int <= 12 and Category.objects.filter(id=cid_int).exists():
+                    target_cat_num = cid_int
+            except (ValueError, TypeError):
+                pass
+
+        # D. Fallback via category display name
+        if not target_cat_num and criteria_item and getattr(criteria_item, 'category', None):
+            cat_display = (getattr(criteria_item.category, 'category', '') or '').strip().lower()
+            for code_sub, num in [
+                ('academic', 1), ('online course', 2), ('competitive', 3),
+                ('internship', 4), ('scholarship', 5), ('research', 6),
+                ('startup', 7), ('prize', 8), ('program', 9),
+                ('leadership', 10), ('social', 11), ('career', 12)
+            ]:
+                if code_sub in cat_display:
+                    target_cat_num = num
+                    break
+
+        if not target_cat_num:
+            return None
+
+        # Categories without subcategories (Cat 1: Academics, Cat 12: Career Advancement)
+        if target_cat_num in (1, 12):
+            return None
+
+        # Extract submitted subItem text
+        ev = evidence if isinstance(evidence, dict) else {}
+        sub_name = (
+            ev.get('subItem') or
+            ev.get('researchSubItem') or
+            ev.get('prizesSubItem') or
+            ev.get('subcategory_name') or
+            ev.get('sub_item') or
+            (criteria_item.title if criteria_item else '') or
+            ''
+        )
+        sub_name_str = str(sub_name).strip()
+        item_title_str = str(getattr(criteria_item, 'title', '') or '').strip()
+
+        qs = cls.objects.filter(category_id=target_cat_num)
+
+        # A. Exact match by sub_name or item_title
+        if sub_name_str:
+            matched = qs.filter(subcategory_name__iexact=sub_name_str).first()
+            if matched:
+                return matched
+        if item_title_str:
+            matched = qs.filter(subcategory_name__iexact=item_title_str).first()
+            if matched:
+                return matched
+
+        # B. Category 8: Prizes special disambiguation (Marian vs Outside, Individual vs Group)
+        if target_cat_num == 8:
+            is_outside = 'outside' in item_title_str.lower() or 'outside' in sub_name_str.lower()
+            scope = 'Outside' if is_outside else 'Marian'
+            scope_qs = qs.filter(subcategory_name__icontains=scope)
+
+            is_group = 'group' in sub_name_str.lower() or 'group' in item_title_str.lower()
+            is_part = 'participat' in sub_name_str.lower() or 'participat' in item_title_str.lower()
+
+            for cand in scope_qs:
+                c_name = cand.subcategory_name.lower()
+                if is_part and 'participat' in c_name:
+                    if is_group and 'group' in c_name:
+                        return cand
+                    if not is_group and 'individual' in c_name:
+                        return cand
+                elif not is_part:
+                    if '1st' in sub_name_str.lower() and '1st' in c_name and ((is_group and 'group' in c_name) or (not is_group and 'individual' in c_name)):
+                        return cand
+                    if '2nd' in sub_name_str.lower() and '2nd' in c_name and ((is_group and 'group' in c_name) or (not is_group and 'individual' in c_name)):
+                        return cand
+                    if '3rd' in sub_name_str.lower() and '3rd' in c_name and ((is_group and 'group' in c_name) or (not is_group and 'individual' in c_name)):
+                        return cand
+
+        # C. Category 3: Competitive Exams matching
+        if target_cat_num == 3:
+            combined = f"{sub_name_str} {item_title_str}".lower()
+            if 'jrf' in combined:
+                return qs.filter(subcategory_name__icontains='JRF').first()
+            if 'net' in combined:
+                return qs.filter(subcategory_name__icontains='NET').first()
+            if 'upsc' in combined or 'psc' in combined or 'participation' in combined:
+                return qs.filter(subcategory_name__icontains='Participation').first()
+            if 'ielts' in combined or 'language' in combined or 'other' in combined:
+                return qs.filter(subcategory_name__icontains='Any Other').first()
+
+        # D. Category 2: Online Courses matching
+        if target_cat_num == 2:
+            combined = f"{sub_name_str} {item_title_str}".lower()
+            if 'swayam' in combined or 'nptel' in combined:
+                return qs.filter(subcategory_name__icontains='Swayam').first()
+            if 'mooc' in combined:
+                return qs.filter(subcategory_name__icontains='MOOC').first()
+
+        # E. Substring matching
+        for cand in qs:
+            c_name = cand.subcategory_name.lower()
+            if sub_name_str and (c_name in sub_name_str.lower() or sub_name_str.lower() in c_name):
+                return cand
+            if item_title_str and (c_name in item_title_str.lower() or item_title_str.lower() in c_name):
+                return cand
+
+        return None
+
+
 class CriteriaCategory(models.Model):
     code = models.CharField(max_length=50, unique=True) # e.g. 'cat-academics'
     category = models.CharField(max_length=100)
-    access_level = models.CharField(max_length=20, default='all_students') # 'all_students', 'student_rep_only'
+    access_level = models.CharField(max_length=20, default='all_students') # 'all_students', 'dqc_only', 'student_rep_only'
+    is_manual_eval = models.BooleanField(default=False)
     evaluators = models.JSONField(default=list, blank=True) # list of evaluator emails
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -335,6 +656,8 @@ class CriteriaItem(models.Model):
     title = models.CharField(max_length=255)
     type = models.CharField(max_length=20) # 'count', 'fixed', 'range', 'negative', 'academic_grades', 'date'
     marks = models.FloatField(default=0.0)
+    access_level = models.CharField(max_length=50, default='all_students') # 'all_students', 'dqc_only'
+    is_manual_eval = models.BooleanField(default=False)
     rules_json = models.JSONField(blank=True, null=True) # Deprecated flexible metadata
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -362,6 +685,29 @@ class CriteriaItem(models.Model):
                 }
             )
         return rule
+
+    def get_access_level(self) -> str:
+        """
+        Return the effective access_level for this CriteriaItem.
+
+        Priority:
+          1. Item's own access_level if it is non-empty — always authoritative.
+             (Migration 0030 explicitly sets this on every row; trust it unconditionally.)
+          2. Parent CriteriaCategory.access_level as fallback when item field is empty.
+          3. 'all_students' as the final default.
+
+        Access level values: 'all_students', 'dqc_only', 'student_rep_only'.
+        """
+        item_level = (self.access_level or '').strip()
+        if item_level:
+            # Item has an explicit access level — always authoritative regardless of value.
+            return item_level
+        # Item field is empty — defer to parent category.
+        cat_level = ''
+        if self.category_id:
+            cat_level = (getattr(self.category, 'access_level', '') or '').strip()
+        return cat_level if cat_level else 'all_students'
+
 
     def __str__(self):
         return f"{self.category.category} - {self.title}"
@@ -645,6 +991,10 @@ class UserGroupModel(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
+    @property
+    def group_name(self):
+        return self.name
+
     def __str__(self):
         return f"{self.name} ({self.group_id})"
 
@@ -674,19 +1024,104 @@ class UserGroupMember(models.Model):
         return f"{self.email} ({self.group.name})"
 
 
+class StaffProfile(models.Model):
+    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='staff_profile', db_column='user_id')
+    department = models.ForeignKey(Department, on_delete=models.SET_NULL, null=True, blank=True, related_name='staff_profiles', db_column='department_id')
+    designation = models.CharField(max_length=100, blank=True, default='')
+
+    class Meta:
+        db_table = 'staff_profiles'
+        verbose_name = 'Staff Profile'
+        verbose_name_plural = 'Staff Profiles'
+
+    def __str__(self):
+        return f"{self.user.email} - {self.designation}"
+
+
+class TeacherClassAssignment(models.Model):
+    teacher = models.ForeignKey(User, on_delete=models.CASCADE, related_name='teacher_class_assignments', db_column='teacher_id')
+    class_obj = models.ForeignKey(Class, on_delete=models.CASCADE, related_name='teacher_assignments', db_column='class_id')
+    academic_year = models.IntegerField(default=2025)
+    assigned_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='assigned_teacher_classes', db_column='assigned_by')
+    created_at = models.DateTimeField(default=timezone.now)
+    assigned_at = models.DateTimeField(auto_now_add=True)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        db_table = 'teacher_class_assignments'
+        constraints = [
+            models.UniqueConstraint(fields=['teacher', 'academic_year'], name='unique_single_teacher_per_year'),
+            models.UniqueConstraint(fields=['class_obj'], name='unique_single_class_teacher'),
+        ]
+        ordering = ['-assigned_at']
+
+    def __str__(self):
+        return f"{self.teacher.email} -> {self.class_obj.name} ({self.academic_year})"
+
+
 class EvaluatorCategoryAssignment(models.Model):
-    member = models.ForeignKey(UserGroupMember, on_delete=models.CASCADE, related_name='category_assignments')
-    category = models.ForeignKey('CriteriaCategory', on_delete=models.CASCADE, related_name='evaluator_assignments')
+    member = models.ForeignKey(UserGroupMember, on_delete=models.CASCADE, null=True, blank=True, related_name='category_assignments')
+    evaluator = models.ForeignKey('User', on_delete=models.CASCADE, null=True, blank=True, related_name='evaluator_category_assignments', db_column='evaluator_id')
+    category = models.ForeignKey('CriteriaCategory', on_delete=models.CASCADE, related_name='evaluator_assignments', db_column='category_id')
+    academic_year = models.IntegerField(default=2025)
+    assigned_by = models.ForeignKey('User', on_delete=models.SET_NULL, null=True, blank=True, related_name='assigned_evaluator_categories', db_column='assigned_by')
+    created_at = models.DateTimeField(default=timezone.now)
     assigned_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
+        db_table = 'evaluator_category_assignments'
         constraints = [
-            models.UniqueConstraint(fields=['member', 'category'], name='unique_member_category_assignment')
+            models.UniqueConstraint(fields=['evaluator', 'category', 'academic_year'], condition=models.Q(evaluator__isnull=False), name='unique_evaluator_category'),
+            models.UniqueConstraint(fields=['member', 'category'], condition=models.Q(member__isnull=False), name='unique_member_category_assignment'),
         ]
         ordering = ['id']
 
     def __str__(self):
-        return f"{self.member.email} -> {self.category.category}"
+        actor_email = self.evaluator.email if self.evaluator else (self.member.email if self.member else 'Unknown')
+        return f"{actor_email} -> {self.category.category} ({self.academic_year})"
+
+
+class VerificationLog(models.Model):
+    VERIFICATION_LEVEL_CHOICES = [
+        ('DQC', 'DQC'),
+        ('CLASS_TEACHER', 'Class Teacher'),
+        ('EVALUATOR', 'Evaluator'),
+    ]
+    ACTION_CHOICES = [
+        ('VERIFY_AND_FORWARD', 'Verify and Forward'),
+        ('SEND_BACK', 'Send Back'),
+        ('REJECT', 'Reject'),
+        ('APPROVE_AND_CREDIT', 'Approve and Credit'),
+    ]
+
+    submission = models.ForeignKey(Submission, on_delete=models.CASCADE, related_name='verification_logs')
+    verification_level = models.CharField(max_length=50, choices=VERIFICATION_LEVEL_CHOICES)
+    verifier = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, db_column='verifier_id', related_name='verification_logs')
+    verifier_name = models.CharField(max_length=255, blank=True, default='')
+    action = models.CharField(max_length=50, choices=ACTION_CHOICES)
+    remarks = models.TextField(blank=True, default='')
+    timestamp = models.DateTimeField(auto_now_add=True)
+    action_timestamp = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        db_table = 'verification_logs'
+        ordering = ['action_timestamp', 'timestamp']
+
+    def __str__(self):
+        return f"VerificationLog #{self.id} - Sub #{self.submission_id} [{self.verification_level}] {self.action}"
+
+    @classmethod
+    def log_action(cls, submission_id, verification_level, verifier_id, verifier_name, action, remarks=None, action_timestamp=None):
+        ts = action_timestamp or timezone.now()
+        return cls.objects.create(
+            submission_id=submission_id,
+            verification_level=verification_level,
+            verifier_id=verifier_id,
+            verifier_name=verifier_name,
+            action=action,
+            remarks=remarks or '',
+            action_timestamp=ts
+        )
 
 
 class Champion(models.Model):

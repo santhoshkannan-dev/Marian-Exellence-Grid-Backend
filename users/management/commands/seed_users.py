@@ -424,6 +424,9 @@ class Command(BaseCommand):
                                 "1st Prize (Individual)": 10.0,
                                 "2nd Prize (Individual)": 5.0,
                                 "3rd Prize (Individual)": 3.0,
+                                "1st Prize (group)": 5.0,
+                                "2nd Prize (group)": 3.0,
+                                "3rd Prize (group)": 2.0,
                                 "1st Prize (Group)": 5.0,
                                 "2nd Prize (Group)": 3.0,
                                 "3rd Prize (Group)": 2.0
@@ -439,9 +442,14 @@ class Command(BaseCommand):
                                 "1st Prize (Individual)": 15.0,
                                 "2nd Prize (Individual)": 10.0,
                                 "3rd Prize (Individual)": 5.0,
+                                "1st Prize (group)": 10.0,
+                                "2nd Prize (group)": 5.0,
+                                "3rd Prize (group)": 3.0,
                                 "1st Prize (Group)": 10.0,
                                 "2nd Prize (Group)": 5.0,
                                 "3rd Prize (Group)": 3.0,
+                                "participation(Individual)": 3.0,
+                                "participation(group)": 2.0,
                                 "Participation (Individual)": 3.0,
                                 "Participation (Group)": 2.0
                             }
@@ -452,7 +460,7 @@ class Command(BaseCommand):
             {
                 "code": "cat-programs-organized",
                 "category": "Programs Organized",
-                "access_level": "all_students",
+                "access_level": "student_rep_only",
                 "items": [
                     {"title": "Intercollegiate", "type": "count", "marks": 5.0},
                     {"title": "Intra - Collegiate", "type": "count", "marks": 3.0},
@@ -462,7 +470,7 @@ class Command(BaseCommand):
             {
                 "code": "cat-leadership",
                 "category": "Leaderships",
-                "access_level": "all_students",
+                "access_level": "student_rep_only",
                 "items": [
                     {"title": "MCSC Executive Body Position", "type": "fixed", "marks": 5.0},
                     {"title": "SAHYA Executive Body Position", "type": "fixed", "marks": 5.0},
@@ -473,7 +481,7 @@ class Command(BaseCommand):
             {
                 "code": "cat-social-responsibility",
                 "category": "Social Responsibilities",
-                "access_level": "all_students",
+                "access_level": "student_rep_only",
                 "items": [
                     {"title": "Coordination of Event (Community Action / Outreach)", "type": "count", "marks": 5.0},
                     {"title": "Participation in Event", "type": "count", "marks": 3.0},
@@ -484,13 +492,14 @@ class Command(BaseCommand):
                 "code": "cat-career-advancement",
                 "category": "Career Advancement",
                 "access_level": "all_students",
+                "is_manual_eval": True,
                 "items": [
-                    {"title": "Library - Regular Footfall (Biometric / Entry)", "type": "count", "marks": 5.0},
-                    {"title": "Library - Academic & Career Books Issued/Read", "type": "count", "marks": 5.0},
-                    {"title": "Repository Creation (Drive / GitHub / LMS / Website)", "type": "fixed", "marks": 5.0},
-                    {"title": "LinkedIn - Profile Completion (Active Profile)", "type": "fixed", "marks": 3.0},
-                    {"title": "LinkedIn - Skill Badges Earned", "type": "count", "marks": 1.0},
-                    {"title": "LinkedIn - Micro-credentials / Learning Certifications", "type": "count", "marks": 1.0},
+                    {"title": "Library - Regular Footfall (Biometric / Entry)", "type": "count", "marks": 5.0, "access_level": "student_rep_only", "is_manual_eval": True},
+                    {"title": "Library - Academic & Career Books Issued/Read", "type": "count", "marks": 5.0, "access_level": "student_rep_only", "is_manual_eval": True},
+                    {"title": "Repository Creation (Drive / GitHub / LMS / Website)", "type": "fixed", "marks": 5.0, "access_level": "student_rep_only", "is_manual_eval": True},
+                    {"title": "LinkedIn - Profile Completion (Active Profile)", "type": "fixed", "marks": 3.0, "access_level": "all_students", "is_manual_eval": True},
+                    {"title": "LinkedIn - Skill Badges Earned", "type": "count", "marks": 1.0, "access_level": "all_students", "is_manual_eval": True},
+                    {"title": "LinkedIn - Micro-credentials / Learning Certifications", "type": "count", "marks": 1.0, "access_level": "all_students", "is_manual_eval": True},
                 ]
             },
             {
@@ -508,7 +517,8 @@ class Command(BaseCommand):
             cat_obj = CriteriaCategory.objects.create(
                 code=cat_data["code"],
                 category=cat_data["category"],
-                access_level=cat_data["access_level"]
+                access_level=cat_data["access_level"],
+                is_manual_eval=cat_data.get("is_manual_eval", False)
             )
             for item_data in cat_data["items"]:
                 item_obj = CriteriaItem.objects.create(
@@ -516,6 +526,8 @@ class Command(BaseCommand):
                     title=item_data["title"],
                     type=item_data["type"],
                     marks=item_data["marks"],
+                    access_level=item_data.get("access_level", cat_data["access_level"]),
+                    is_manual_eval=item_data.get("is_manual_eval", cat_data.get("is_manual_eval", False)),
                     rules_json=item_data.get("rules_json", None)
                 )
                 CriteriaRule.objects.create(
@@ -527,7 +539,7 @@ class Command(BaseCommand):
                 )
 
         # 7. Seed Official User Groups (strictly 4 official groups)
-        from users.models import UserGroupModel, UserGroupMember, EvaluatorCategoryAssignment
+        from users.models import UserGroupModel, UserGroupMember, EvaluatorCategoryAssignment, TeacherClassAssignment, StaffProfile
         UserGroupModel.objects.exclude(group_id__in=[
             'grp-evaluation-committee',
             'grp-class-teachers',
@@ -559,49 +571,76 @@ class Command(BaseCommand):
         ]
 
         created_groups = {}
-        for gdata in official_groups:
-            grp, _ = UserGroupModel.objects.update_or_create(
-                group_id=gdata["group_id"],
+        for g_data in official_groups:
+            group, _ = UserGroupModel.objects.update_or_create(
+                group_id=g_data["group_id"],
                 defaults={
-                    "name": gdata["name"],
-                    "description": gdata["description"]
+                    "name": g_data["name"],
+                    "description": g_data["description"]
                 }
             )
-            created_groups[gdata["group_id"]] = grp
-            self.stdout.write(f"Seeded User Group: {grp.name} ({grp.group_id})")
+            created_groups[g_data["group_id"]] = group
 
         # Seed group members with peer details
         mca_class = Class.objects.filter(name="II MCA").first()
         pgdca_dept = Department.objects.filter(code="PGDCA").first()
 
+        # Ensure Official Group Memberships are synced with seeded personas
         # 1. Allen George -> Evaluation Committee
+        eval_user = seeded_users.get("allen.george@mariancollege.org")
         eval_member, _ = UserGroupMember.objects.update_or_create(
             group=created_groups["grp-evaluation-committee"],
             email="allen.george@mariancollege.org",
             defaults={
                 "name": "Allen George",
-                "user": seeded_users.get("allen.george@mariancollege.org"),
+                "user": eval_user,
                 "department": pgdca_dept,
             }
         )
+        if eval_user:
+            StaffProfile.objects.update_or_create(
+                user=eval_user,
+                defaults={
+                    "department": pgdca_dept,
+                    "designation": "Evaluator"
+                }
+            )
         # Assign all categories to Allen George
         for cat in CriteriaCategory.objects.all():
-            EvaluatorCategoryAssignment.objects.get_or_create(member=eval_member, category=cat)
+            EvaluatorCategoryAssignment.objects.get_or_create(
+                member=eval_member,
+                category=cat,
+                defaults={"evaluator": eval_user, "academic_year": 2025}
+            )
             if "allen.george@mariancollege.org" not in cat.evaluators:
                 cat.evaluators.append("allen.george@mariancollege.org")
                 cat.save(update_fields=["evaluators"])
 
         # 2. Kochumol Abraham -> Class Teachers Council
+        teacher_user = seeded_users.get("kochumol.abraham@mariancollege.org")
         UserGroupMember.objects.update_or_create(
             group=created_groups["grp-class-teachers"],
             email="kochumol.abraham@mariancollege.org",
             defaults={
                 "name": "Kochumol Abraham",
-                "user": seeded_users.get("kochumol.abraham@mariancollege.org"),
+                "user": teacher_user,
                 "department": pgdca_dept,
                 "assigned_class": mca_class,
             }
         )
+        if teacher_user and mca_class:
+            StaffProfile.objects.update_or_create(
+                user=teacher_user,
+                defaults={
+                    "department": pgdca_dept,
+                    "designation": "Class Teacher"
+                }
+            )
+            TeacherClassAssignment.objects.get_or_create(
+                teacher=teacher_user,
+                class_obj=mca_class,
+                defaults={"academic_year": 2025}
+            )
 
         # 3. Santhosh Kannan -> DQC Student Rep Group & Student Representatives
         UserGroupMember.objects.update_or_create(

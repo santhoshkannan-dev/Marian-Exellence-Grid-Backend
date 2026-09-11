@@ -141,44 +141,97 @@ def get_criteria_allowed_bounds(criteria_item, evidence: Any = None) -> Tuple[fl
 
     rule = CriteriaRule.objects.filter(item=criteria_item).first()
 
-    # Base mark calculation: CriteriaRule is authoritative
-    if rule and rule.maximum_marks is not None:
-        base_mark = float(rule.maximum_marks)
-    else:
-        base_mark = float(criteria_item.marks or 0.0)
-    details = ""
-
-    # 1. SubItems mapping in CriteriaRule.extra_config (authoritative) or rules_json (fallback)
-    sub_items = None
-    if rule and isinstance(rule.extra_config, dict) and 'subItems' in rule.extra_config:
-        sub_items = rule.extra_config.get('subItems')
-    elif isinstance(criteria_item.rules_json, dict) and 'subItems' in criteria_item.rules_json:
-        sub_items = criteria_item.rules_json.get('subItems')
-
-    if isinstance(sub_items, dict) and len(sub_items) > 0:
-        submitted_sub_item = (
-            ev.get('subItem') or
-            ev.get('researchSubItem') or
-            ev.get('prizesSubItem')
+    # Base mark calculation: SubCategory is authoritative for categories with subcategories
+    subcat_matched = False
+    try:
+        from .models import SubCategory
+        subcat = SubCategory.find_subcategory(
+            subcategory_id=ev.get('subcategory_id') or ev.get('subcategoryId'),
+            category_id=getattr(getattr(criteria_item, 'category', None), 'id', None),
+            category_code=getattr(getattr(criteria_item, 'category', None), 'code', None),
+            criteria_item=criteria_item,
+            evidence=ev
         )
-        matched_val = None
-        if submitted_sub_item:
-            if submitted_sub_item in sub_items:
-                matched_val = float(sub_items[submitted_sub_item])
-                details = f" (subcategory '{submitted_sub_item}': {matched_val})"
-            else:
-                sub_norm = str(submitted_sub_item).strip().lower()
-                for k, v in sub_items.items():
-                    if str(k).strip().lower() == sub_norm:
-                        matched_val = float(v)
-                        details = f" (subcategory '{k}': {matched_val})"
-                        break
+        if subcat:
+            base_mark = float(subcat.default_marks)
+            details = f" (subcategory '{subcat.subcategory_name}': {base_mark})"
+            subcat_matched = True
+    except Exception as _ex:
+        logger.debug("Subcategory lookup in scoring engine error: %s", _ex)
 
-        if matched_val is not None:
-            base_mark = matched_val
+    if not subcat_matched:
+        if rule and rule.maximum_marks is not None:
+            base_mark = float(rule.maximum_marks)
         else:
-            base_mark = float(max(sub_items.values()))
-            details = f" (max subcategory: {base_mark})"
+            base_mark = float(criteria_item.marks or 0.0)
+        details = ""
+
+        # 1. SubItems mapping in CriteriaRule.extra_config (authoritative) or rules_json (fallback)
+        sub_items = None
+        if rule and isinstance(rule.extra_config, dict) and 'subItems' in rule.extra_config:
+            sub_items = rule.extra_config.get('subItems')
+        elif isinstance(criteria_item.rules_json, dict) and 'subItems' in criteria_item.rules_json:
+            sub_items = criteria_item.rules_json.get('subItems')
+
+        if isinstance(sub_items, dict) and len(sub_items) > 0:
+            submitted_sub_item = (
+                ev.get('subItem') or
+                ev.get('researchSubItem') or
+                ev.get('prizesSubItem')
+            )
+            matched_val = None
+            if submitted_sub_item:
+                if submitted_sub_item in sub_items:
+                    matched_val = float(sub_items[submitted_sub_item])
+                    details = f" (subcategory '{submitted_sub_item}': {matched_val})"
+                else:
+                    sub_norm = str(submitted_sub_item).strip().lower()
+                    for k, v in sub_items.items():
+                        if str(k).strip().lower() == sub_norm:
+                            matched_val = float(v)
+                            details = f" (subcategory '{k}': {matched_val})"
+                            break
+
+            if matched_val is not None:
+                base_mark = matched_val
+            else:
+                base_mark = float(max(sub_items.values()))
+                details = f" (max subcategory: {base_mark})"
+
+        # 1a. CATEGORY_MARK_TABLE cross-validation (authoritative spec cross-check)
+        # If access_rules.CATEGORY_MARK_TABLE has a canonical mark for this subcategory,
+        # it acts as an authoritative cap to prevent stale DB data from inflating marks.
+        try:
+            from users.access_rules import CATEGORY_MARK_TABLE
+            cat = getattr(criteria_item, 'category', None)
+            cat_code_for_table = str(getattr(cat, 'code', '') or '').strip().lower()
+            if cat_code_for_table in CATEGORY_MARK_TABLE:
+                cat_table = CATEGORY_MARK_TABLE[cat_code_for_table]
+                submitted_sub = (
+                    ev.get('subItem') or ev.get('researchSubItem') or ev.get('prizesSubItem') or ''
+                )
+                sub_norm_table = str(submitted_sub).strip().lower()
+                item_title_norm = str(getattr(criteria_item, 'title', '') or '').strip().lower()
+                sub_candidates = [sub_norm_table]
+                if 'outside' in item_title_norm:
+                    sub_candidates.insert(0, f"outside - {sub_norm_table}")
+
+                canonical_mark = None
+                for cand in sub_candidates:
+                    if cand in cat_table:
+                        canonical_mark = float(cat_table[cand])
+                        break
+                # Only override if canonical_mark is positive (manual-eval items stay 0.0)
+                if canonical_mark is not None and canonical_mark > 0.0 and base_mark > canonical_mark + 1e-5:
+                    logger.warning(
+                        "Scoring engine: base_mark %.2f for subcategory '%s' exceeds canonical "
+                        "CATEGORY_MARK_TABLE value %.2f — capping to canonical value.",
+                        base_mark, submitted_sub, canonical_mark
+                    )
+                    base_mark = canonical_mark
+                    details += f" [capped to canonical {canonical_mark}]"
+        except Exception as _e:
+            logger.debug("CATEGORY_MARK_TABLE cross-check skipped: %s", _e)
 
     # 2. Count multiplier for count-based items
     count_val = 1
@@ -192,33 +245,74 @@ def get_criteria_allowed_bounds(criteria_item, evidence: Any = None) -> Tuple[fl
 
     # 3. Dynamic handling for Academic Grades
     if criteria_item.type == 'academic_grades' or (
+        criteria_item.category and criteria_item.category.code == 'cat-academics'
+    ) or (
         isinstance(criteria_item.rules_json, dict) and 'pass_percentage_ranges' in criteria_item.rules_json
     ):
         rules = criteria_item.rules_json or {}
         m90 = float(rules.get('90_above', 5.0))
         m80 = float(rules.get('80_90', 4.0))
         m70 = float(rules.get('70_80', 3.0))
-        ranges = rules.get('pass_percentage_ranges', [])
-        max_pass_mark = max([float(r.get('marks', 0)) for r in ranges], default=5.0) if ranges else 5.0
 
         total_students = 100
         try:
             total_students = max(1, int(ev.get('totalStudents', 100)))
         except (ValueError, TypeError):
             total_students = 100
-        allowed_max = (total_students * max(m90, m80, m70)) + max_pass_mark
-        details = " (academic grades breakdown)"
 
-    # 4. CriteriaRule overrides/caps
+        # Exact Academics Formula:
+        # Exact Academics Formula:
+        # (Count >= 90% * 5) + (Count 80-90% * 4) + (Count 70-80% * 3) + Pass Rate Bonus - Count Fail
+        grades = ev.get('grades') or ev.get('markBreakdown') or ev
+        cnt_90 = int(grades.get('count90Above', grades.get('90_above', grades.get('S', grades.get('s_grade_count', 0)))) or 0)
+        cnt_80 = int(grades.get('count80to90', grades.get('80_90', grades.get('APlus', grades.get('a_plus_grade_count', 0)))) or 0)
+        cnt_70 = int(grades.get('count70to80', grades.get('70_80', grades.get('A', grades.get('a_grade_count', 0)))) or 0)
+        cnt_fail = int(grades.get('failCount', grades.get('failed_count', grades.get('Fail', 0))) or 0)
+
+        pass_pct_raw = ev.get('classPassPercentage') or ev.get('effectivePassPercentage') or ev.get('class_pass_percentage')
+        if pass_pct_raw is None and total_students > 0:
+            passed = max(0, total_students - cnt_fail)
+            pass_pct = round((passed / float(total_students)) * 100.0, 2)
+        elif pass_pct_raw is not None:
+            pass_pct = float(pass_pct_raw)
+        else:
+            pass_pct = 0.0
+
+        pass_bonus = 0.0
+        if pass_pct > 90.0:
+            pass_bonus = 5.0
+        elif pass_pct > 80.0:
+            pass_bonus = 4.0
+        elif pass_pct > 70.0:
+            pass_bonus = 3.0
+        elif pass_pct > 60.0:
+            pass_bonus = 2.0
+        elif pass_pct >= 50.0:
+            pass_bonus = 1.0
+        else:
+            pass_bonus = 0.0
+
+        calculated_academic_score = (cnt_90 * 5.0) + (cnt_80 * 4.0) + (cnt_70 * 3.0) + pass_bonus - cnt_fail
+        allowed_max = max(0.0, calculated_academic_score) if (cnt_90 or cnt_80 or cnt_70 or cnt_fail or pass_bonus) else ((total_students * max(m90, m80, m70)) + 5.0)
+        base_mark = allowed_max
+        details = f" (academics formula: 90%={cnt_90}, 80-90%={cnt_80}, 70-80%={cnt_70}, fail={cnt_fail}, passBonus={pass_bonus})"
+
+    # 4. CriteriaRule overrides/caps (for non-academic grade items)
     allowed_min = 0.0
+    is_academic = (criteria_item.type == 'academic_grades') or (criteria_item.category and criteria_item.category.code == 'cat-academics')
     is_negative = (criteria_item.type in ('negative', 'academic_grades')) or (rule and rule.is_negative)
-    if rule:
+    if rule and not is_academic and not subcat_matched:
+        has_sub_items = bool(
+            (rule and isinstance(rule.extra_config, dict) and 'subItems' in rule.extra_config) or
+            (isinstance(criteria_item.rules_json, dict) and 'subItems' in criteria_item.rules_json)
+        )
         if rule.maximum_marks is not None:
             rule_max = float(rule.maximum_marks)
-            if allowed_max > 0:
-                allowed_max = min(allowed_max, rule_max)
-            else:
-                allowed_max = rule_max
+            if not (has_sub_items and rule_max == 0.0):
+                if allowed_max > 0:
+                    allowed_max = min(allowed_max, rule_max)
+                else:
+                    allowed_max = rule_max
         if getattr(rule, 'minimum_marks', None) is not None:
             allowed_min = float(rule.minimum_marks)
         if rule.is_negative:
@@ -232,8 +326,35 @@ def get_criteria_allowed_bounds(criteria_item, evidence: Any = None) -> Tuple[fl
 
 def calculate_submission_score(criteria_item, evidence: Any = None) -> float:
     """
-    Evaluates the authoritative marks for a submission against a CriteriaItem and its CriteriaRule.
+    Evaluates the authoritative marks for a submission against a CriteriaItem and its CriteriaRule/SubCategory.
+    For categories containing subcategories, the calculated marks are strictly driven by
+    subcategories.default_marks.
+    For Category 12 (Career Advancement), marks are manually evaluated by the Evaluator.
     """
+    if getattr(criteria_item, 'is_manual_eval', False) or (criteria_item.category and getattr(criteria_item.category, 'is_manual_eval', False)):
+        return 0.0
+
+    ev = evidence if isinstance(evidence, dict) else {}
+    try:
+        from .models import SubCategory
+        subcat = SubCategory.find_subcategory(
+            subcategory_id=ev.get('subcategory_id') or ev.get('subcategoryId'),
+            category_id=getattr(getattr(criteria_item, 'category', None), 'id', None),
+            category_code=getattr(getattr(criteria_item, 'category', None), 'code', None),
+            criteria_item=criteria_item,
+            evidence=ev
+        )
+        if subcat:
+            count_val = 1
+            if criteria_item.type == 'count' or 'count' in ev:
+                try:
+                    count_val = max(1, int(ev.get('count', 1)))
+                except (ValueError, TypeError):
+                    count_val = 1
+            return float(subcat.default_marks) * count_val
+    except Exception as _ex:
+        logger.debug("calculate_submission_score subcategory lookup: %s", _ex)
+
     allowed_min, allowed_max, _ = get_criteria_allowed_bounds(criteria_item, evidence)
     return allowed_max
 
@@ -265,16 +386,18 @@ def compute_class_scores(cls, academic_year: Optional[str] = None, n_benchmark: 
 
     # Build submission queryset
     sub_qs = Submission.objects.filter(
-        status__in=['Locked', 'Evaluated'],
-        user__class_name=cls,
-        marks__isnull=False
+        status__in=['Locked', 'Evaluated', 'Approved', 'APPROVED'],
+        user__class_name=cls
     )
     if academic_year:
         sub_qs = sub_qs.filter(academic_year=academic_year)
 
     # Calculate gross marks S
-    S = sub_qs.aggregate(total=Sum('marks'))['total'] or 0.0
-    S = round(float(S), 2)
+    total_s = 0.0
+    for sub in sub_qs:
+        m = sub.calculated_marks if sub.calculated_marks is not None else (float(sub.marks) if sub.marks is not None else 0.0)
+        total_s += float(m)
+    S = round(total_s, 2)
     P = round(float(P), 2)
 
     # Category breakdown and Pillar breakdown
@@ -288,7 +411,7 @@ def compute_class_scores(cls, academic_year: Optional[str] = None, n_benchmark: 
     # Fetch criteria items for category mapping
     all_items = {it.id: it for it in CriteriaItem.objects.select_related('category').all()}
 
-    for sub in sub_qs.only('criteria_id', 'marks'):
+    for sub in sub_qs:
         c_id = None
         try:
             c_id = int(sub.criteria_id)
@@ -298,7 +421,7 @@ def compute_class_scores(cls, academic_year: Optional[str] = None, n_benchmark: 
         item = all_items.get(c_id)
         cat_code = item.category.code if item and item.category else 'unknown'
         cat_name = item.category.category if item and item.category else 'Unknown Category'
-        marks_val = float(sub.marks or 0.0)
+        marks_val = float(sub.calculated_marks if sub.calculated_marks is not None else (sub.marks or 0.0))
 
         category_scores[cat_name] = round(category_scores.get(cat_name, 0.0) + marks_val, 2)
 
