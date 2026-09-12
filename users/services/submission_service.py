@@ -121,6 +121,7 @@ class SubmissionService:
         has_dual = auth_info.get('has_dual_role', False)
 
         # 1. Explicit Role Context (or queue-derived context)
+        is_admin_user = (user_role == 'admin' or getattr(user, 'is_superuser', False))
         active_ctx = norm_context
         if not active_ctx:
             if queue in ('teacher', 'round2'):
@@ -129,15 +130,20 @@ class SubmissionService:
                 active_ctx = 'evaluator'
             elif queue in ('dqc', 'round1'):
                 active_ctx = 'dqc'
+            elif is_admin_user:
+                active_ctx = 'admin'
+            elif user_role in ('evaluation', 'evaluator'):
+                active_ctx = 'evaluator'
             elif has_dual:
                 active_ctx = 'teacher'  # Default dual-role landing context
             elif user_role in ('faculty', 'staff') or getattr(user, 'is_staff', False):
                 active_ctx = 'teacher'
-            elif user_role in ('evaluation', 'evaluator'):
-                active_ctx = 'evaluator'
 
         # 2. Verification Queue Filtering
-        if queue in ('dqc', 'round1', 'student_rep', 'rep') or active_ctx in ('dqc', 'round1', 'student_rep', 'rep'):
+        if active_ctx == 'admin' or (is_admin_user and not active_ctx and not queue):
+            # Admin has oversight across all submissions
+            pass
+        elif queue in ('dqc', 'round1', 'student_rep', 'rep') or active_ctx in ('dqc', 'round1', 'student_rep', 'rep'):
             is_round1 = (
                 user_role == 'student' and (
                     UserService.is_user_round1_verifier(user) or
@@ -202,23 +208,29 @@ class SubmissionService:
                 queryset = queryset.none()
         elif active_ctx == 'evaluator':
             # Evaluator View: Strictly restricted to assigned categories across all classes
-            eval_cats = CriteriaCategory.objects.filter(
-                Q(evaluator_assignments__evaluator=user) |
-                Q(evaluator_assignments__member__email__iexact=user.email) |
-                Q(evaluators__contains=user.email)
-            ).distinct()
-            if eval_cats.exists():
-                eval_items = CriteriaItem.objects.filter(category__in=eval_cats).values_list('id', flat=True)
-                queryset = queryset.filter(
-                    Q(category__in=eval_cats) | Q(criteria_id__in=eval_items)
-                )
+            if is_admin_user:
                 if queue in ('evaluator', 'round3'):
                     queryset = queryset.filter(status__in=['EVALUATOR_PENDING', 'Teacher Verified'])
             else:
-                queryset = queryset.none()
+                eval_cats = CriteriaCategory.objects.filter(
+                    Q(evaluator_assignments__evaluator=user) |
+                    Q(evaluator_assignments__member__email__iexact=user.email) |
+                    Q(evaluators__contains=user.email)
+                ).distinct()
+                if eval_cats.exists():
+                    eval_items = CriteriaItem.objects.filter(category__in=eval_cats).values_list('id', flat=True)
+                    queryset = queryset.filter(
+                        Q(category__in=eval_cats) | Q(criteria_id__in=eval_items)
+                    )
+                    if queue in ('evaluator', 'round3'):
+                        queryset = queryset.filter(status__in=['EVALUATOR_PENDING', 'Teacher Verified'])
+                else:
+                    queryset = queryset.none()
         else:
             # Standard Role Scoping (non-staff / single-role fallback)
-            if user_role == 'student':
+            if is_admin_user:
+                pass
+            elif user_role == 'student':
                 if UserService.is_user_student_rep(user) or UserService.is_user_dqc_rep(user) or UserService.is_user_round1_verifier(user):
                     user_email = (getattr(user, 'email', '') or '').strip().lower()
                     from users.models import UserGroupMember
@@ -231,15 +243,6 @@ class SubmissionService:
                     queryset = queryset.filter(Q(user=user) | Q(user__class_name__in=rep_classes) | Q(class_obj__in=rep_classes))
                 else:
                     queryset = queryset.filter(user=user)
-            elif user_role in ('faculty', 'staff') or getattr(user, 'is_staff', False):
-                assigned_classes = Class.objects.filter(
-                    Q(class_teacher=user) | Q(teacher_assignments__teacher=user, teacher_assignments__is_active=True)
-                )
-                dept_q = Q(user__department=user.department) if user.department else Q(pk__in=[])
-                if assigned_classes.exists() or user.department:
-                    queryset = queryset.filter(Q(class_obj__in=assigned_classes) | Q(user__class_name__in=assigned_classes) | dept_q)
-                else:
-                    queryset = queryset.none()
             elif user_role in ('evaluation', 'evaluator'):
                 eval_cats = CriteriaCategory.objects.filter(
                     Q(evaluator_assignments__evaluator=user) |
@@ -249,6 +252,15 @@ class SubmissionService:
                 if eval_cats.exists():
                     eval_items = CriteriaItem.objects.filter(category__in=eval_cats).values_list('id', flat=True)
                     queryset = queryset.filter(Q(category__in=eval_cats) | Q(criteria_id__in=eval_items))
+                else:
+                    queryset = queryset.none()
+            elif user_role in ('faculty', 'staff') or getattr(user, 'is_staff', False):
+                assigned_classes = Class.objects.filter(
+                    Q(class_teacher=user) | Q(teacher_assignments__teacher=user, teacher_assignments__is_active=True)
+                )
+                dept_q = Q(user__department=user.department) if user.department else Q(pk__in=[])
+                if assigned_classes.exists() or user.department:
+                    queryset = queryset.filter(Q(class_obj__in=assigned_classes) | Q(user__class_name__in=assigned_classes) | dept_q)
                 else:
                     queryset = queryset.none()
 

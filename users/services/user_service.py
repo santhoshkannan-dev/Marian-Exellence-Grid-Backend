@@ -216,6 +216,9 @@ class UserService:
         """
         from users.models import Class, Department
 
+        if user.role == 'admin' or user.is_superuser:
+            return user
+
         if user.role != 'student' and cls.determine_role_from_email(user.email) != 'student':
             advisor_class = Class.objects.filter(class_teacher=user).first()
             if advisor_class:
@@ -317,14 +320,29 @@ class UserService:
     def determine_role_from_email(email):
         """
         Determines user role based on Marian College email format:
-        - name.number (e.g. santhosh.25pmc152, amal.25pmc114, faizah.24uce109) -> student
-        - name.name (e.g. kochumol.abraham) -> faculty (staff)
+        - Emails listed in settings.ADMIN_EMAILS → admin
+        - name.number (e.g. santhosh.25pmc152, amal.25pmc114, faizah.24uce109) → student
+        - name.name (e.g. kochumol.abraham) → faculty (staff)
+
+        Admin addresses are resolved from the ADMIN_EMAILS environment variable
+        (parsed in settings.py) to avoid hardcoded credentials in source code.
         """
         if not email or '@' not in email:
             return "student"
-        username_part = email.strip().split('@')[0].lower()
-        if username_part in ('admin',):
+        email_lower = email.strip().lower()
+        # --- Admin check: compare against env-configured ADMIN_EMAILS list ---
+        try:
+            from django.conf import settings
+            admin_emails = getattr(settings, 'ADMIN_EMAILS', frozenset())
+            if email_lower in admin_emails:
+                return "admin"
+        except Exception:
+            pass
+
+        if email_lower.startswith('admin@'):
             return "admin"
+
+        username_part = email_lower.split('@')[0]
         parts = username_part.split('.')
         if len(parts) >= 2:
             last_part = parts[-1]

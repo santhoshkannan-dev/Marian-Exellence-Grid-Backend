@@ -33,6 +33,117 @@ from .base import (
 logger = logging.getLogger(__name__)
 
 
+HISTORICAL_CRITERIA_TITLES = {
+    # Prizes
+    336: "From Marian College", 258: "From Marian College", 21: "From Marian College",
+    337: "Outside Marian College", 259: "Outside Marian College", 22: "Outside Marian College",
+    # Online Courses
+    318: "Swayam / NPTEL Course", 199: "Swayam / NPTEL Course", 3: "Swayam / NPTEL Course",
+    319: "MOOC Course", 200: "MOOC Course", 4: "MOOC Course",
+    # Academics
+    316: "Class Pass Percentage %", 236: "Class Pass Percentage %", 1: "Class Pass Percentage %",
+    317: "SAVE Sem Result", 237: "SAVE Sem Result", 2: "SAVE Sem Result",
+    # Competitive Exams
+    320: "JRF Passed", 5: "JRF Passed",
+    321: "NET Passed", 6: "NET Passed",
+    322: "Any Other Relevant Exam (IELTS, PET, Language Specific, etc.)", 7: "Any Other Relevant Exam (IELTS, PET, Language Specific, etc.)",
+    323: "Participation in Relevant Exam (UPSC / PSC Exams)", 8: "Participation in Relevant Exam (UPSC / PSC Exams)",
+    # Internships
+    324: "Offline Internship (Min. 1 month)", 9: "Offline Internship (Min. 1 month)",
+    325: "Online Internship (Min. 1 month)", 10: "Online Internship (Min. 1 month)",
+    # Scholarships
+    326: "International Level Scholarship", 11: "International Level Scholarship",
+    327: "National Level Scholarship", 12: "National Level Scholarship",
+    328: "State Level Scholarship", 13: "State Level Scholarship",
+    329: "District Level Scholarship", 14: "District Level Scholarship",
+    # Research
+    330: "Publications", 252: "Publications", 15: "Publications",
+    331: "Paper Presentation", 16: "Paper Presentation",
+    332: "Patents", 17: "Patents",
+    333: "Book Publications", 18: "Book Publications",
+    334: "Funded Projects", 19: "Funded Projects",
+    # Startups
+    335: "Government-Registered Start-up", 20: "Government-Registered Start-up",
+    # Programs Organized
+    338: "Intercollegiate", 23: "Intercollegiate",
+    339: "Intra - Collegiate", 24: "Intra - Collegiate",
+    340: "Class Magazine", 25: "Class Magazine",
+    # Leaderships
+    341: "MCSC Executive Body Position", 26: "MCSC Executive Body Position",
+    342: "SAHYA Executive Body Position", 27: "SAHYA Executive Body Position",
+    343: "Clubs & Associations Leadership Position", 28: "Clubs & Associations Leadership Position",
+    344: "Innovative / Sustainable Suggestion", 29: "Innovative / Sustainable Suggestion",
+    # Social Responsibilities
+    345: "Coordination of Event (Community Action / Outreach)", 30: "Coordination of Event (Community Action / Outreach)",
+    346: "Participation in Event", 31: "Participation in Event",
+    347: "News Media Coverage (Excluding Social Media)", 32: "News Media Coverage (Excluding Social Media)",
+    # Career Advancement
+    348: "Library - Regular Footfall (Biometric / Entry)", 270: "Library - Regular Footfall (Biometric / Entry)", 33: "Library - Regular Footfall (Biometric / Entry)",
+    349: "Library - Academic & Career Books Issued/Read", 34: "Library - Academic & Career Books Issued/Read",
+    350: "Repository Creation (Drive / GitHub / LMS / Website)", 35: "Repository Creation (Drive / GitHub / LMS / Website)",
+    351: "LinkedIn - Profile Completion (Active Profile)", 36: "LinkedIn - Profile Completion (Active Profile)",
+    352: "LinkedIn - Skill Badges Earned", 37: "LinkedIn - Skill Badges Earned",
+    353: "LinkedIn - Micro-credentials / Learning Certifications", 38: "LinkedIn - Micro-credentials / Learning Certifications",
+    # Documentation
+    354: "Class Activity Report & Documents", 39: "Class Activity Report & Documents",
+}
+
+
+def resolve_criteria_item(criteria_id, data=None, submission=None):
+    if not criteria_id:
+        return None
+    try:
+        c_id = int(criteria_id)
+    except (ValueError, TypeError):
+        return None
+
+    # 1. Direct PK lookup
+    item = CriteriaItem.objects.filter(pk=c_id).select_related('category').first()
+    if item:
+        return item
+
+    # 2. Historical ID mapping
+    if c_id in HISTORICAL_CRITERIA_TITLES:
+        title = HISTORICAL_CRITERIA_TITLES[c_id]
+        item = CriteriaItem.objects.filter(title__iexact=title).select_related('category').first()
+        if item:
+            return item
+
+    # 3. Match from description or payload
+    desc = ''
+    if data and isinstance(data, dict):
+        desc = str(data.get('description') or '')
+    if not desc and submission:
+        desc = str(submission.description or '')
+
+    if desc:
+        desc_lower = desc.lower()
+        for cand in CriteriaItem.objects.select_related('category').all():
+            if cand.title.lower() in desc_lower or desc_lower.startswith(cand.title.lower()[:15]):
+                return cand
+
+    # 4. Fallback: match via SubCategory if evidence contains subItem or subcategoryId
+    from users.models import SubCategory
+    subcat = None
+    subcat_id = (data.get('subcategoryId') or data.get('subcategory_id')) if isinstance(data, dict) else None
+    if not subcat_id and submission:
+        subcat_id = submission.subcategory_id
+    if subcat_id:
+        try:
+            subcat = SubCategory.objects.filter(pk=int(subcat_id)).select_related('category').first()
+        except (ValueError, TypeError):
+            pass
+
+    if subcat and subcat.category:
+        crit_cat = CriteriaCategory.objects.filter(code=subcat.category.code).first()
+        if crit_cat:
+            first_item = crit_cat.items.first()
+            if first_item:
+                return first_item
+
+    return None
+
+
 class SubmissionListView(APIView):
     permission_classes = [IsAuthenticated]
     parser_classes = [MultiPartParser, FormParser, JSONParser]
@@ -97,9 +208,12 @@ class SubmissionListView(APIView):
         except (ValueError, TypeError):
             return Response({"error": "criteriaId must be a valid integer ID."}, status=status.HTTP_400_BAD_REQUEST)
 
-        criteria_item = CriteriaItem.objects.filter(pk=criteria_id_int).first()
+        criteria_item = CriteriaItem.objects.filter(pk=criteria_id_int).select_related('category').first()
+        if not criteria_item:
+            criteria_item = resolve_criteria_item(criteria_id_int, request.data)
         if not criteria_item:
             return Response({"error": f"Criteria item with id '{criteria_id_int}' does not exist."}, status=status.HTTP_404_NOT_FOUND)
+        criteria_id_int = criteria_item.id
 
         academic_year = request.data.get('academicYear', '2025-2026')
         clean_ay = str(academic_year).strip()
@@ -678,7 +792,10 @@ class SubmissionDetailView(APIView):
                 return Response({"error": "criteriaId must be a valid integer ID."}, status=status.HTTP_400_BAD_REQUEST)
             criteria_item = CriteriaItem.objects.filter(pk=req_criteria_id).select_related('category').first()
             if not criteria_item:
+                criteria_item = resolve_criteria_item(req_criteria_id, request.data, submission=submission)
+            if not criteria_item:
                 return Response({"error": f"Criteria item with id '{req_criteria_id}' does not exist."}, status=status.HTTP_404_NOT_FOUND)
+            req_criteria_id = criteria_item.id
             if not is_evaluator_assigned_to_item(user, req_criteria_id):
                 return Response(
                     {"error": "Unauthorized: Evaluator is not assigned to evaluate this criteria category."},
@@ -700,10 +817,17 @@ class SubmissionDetailView(APIView):
                 return Response({"error": "criteriaId must be a valid integer ID."}, status=status.HTTP_400_BAD_REQUEST)
             c_check = CriteriaItem.objects.filter(pk=target_criteria_id).select_related('category').first()
             if not c_check:
+                c_check = resolve_criteria_item(target_criteria_id, request.data, submission=submission)
+            if not c_check:
                 return Response({"error": f"Criteria item with id '{target_criteria_id}' does not exist."}, status=status.HTTP_404_NOT_FOUND)
+            target_criteria_id = c_check.id
         else:
             target_criteria_id = int(submission.criteria_id)
             c_check = CriteriaItem.objects.filter(pk=target_criteria_id).select_related('category').first()
+            if not c_check:
+                c_check = resolve_criteria_item(target_criteria_id, request.data, submission=submission)
+            if c_check:
+                target_criteria_id = c_check.id
 
         # Subcategory-Level Access Control on update — delegate to access_rules
         # Class representatives have full verification authority over all 12 categories for their class.
@@ -948,8 +1072,10 @@ class SubmissionDetailView(APIView):
                 target_status = request.data.get('status', submission.status)
 
                 extra_updates = {}
-                if 'criteriaId' in request.data:
-                    extra_updates['criteria_id'] = int(request.data.get('criteriaId'))
+                if 'criteriaId' in request.data or submission.criteria_id != target_criteria_id:
+                    extra_updates['criteria_id'] = target_criteria_id
+                if c_check and (not submission.category_id or submission.category_id != c_check.category_id):
+                    extra_updates['category'] = c_check.category
                 if 'academicYear' in request.data:
                     extra_updates['academic_year'] = request.data.get('academicYear')
                 if 'description' in request.data:

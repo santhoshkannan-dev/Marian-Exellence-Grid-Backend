@@ -17,7 +17,29 @@ if env_path.exists():
             line = line.strip()
             if line and not line.startswith('#') and '=' in line:
                 key, val = line.split('=', 1)
-                os.environ.setdefault(key.strip(), val.strip())
+                val = val.strip()
+                # Strip surrounding single or double quotes (standard .env convention)
+                if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
+                    val = val[1:-1]
+                os.environ.setdefault(key.strip(), val)
+
+# ---------------------------------------------------------------------------
+# Startup environment validation
+# Equivalent to: const { validateEnv } = require('./config/env'); validateEnv();
+# Exits immediately with a clear error if any required variable is missing.
+# Only enforced in production (DEBUG=False) to keep local dev frictionless.
+# ---------------------------------------------------------------------------
+_is_debug = os.environ.get("DJANGO_DEBUG", "False").lower() == "true"
+if not _is_debug:
+    import sys as _sys
+    _sys.path.insert(0, str(BASE_DIR))
+    try:
+        from config.env import validate_env as _validate_env
+        _validate_env()
+    except SystemExit:
+        raise  # Let validate_env()'s sys.exit(1) propagate
+    except Exception as _e:
+        print(f"[config/env.py] Warning: env validation skipped ({_e})", file=_sys.stderr)
 
 from django.core.exceptions import ImproperlyConfigured
 
@@ -258,6 +280,23 @@ SIMPLE_JWT = {
 GOOGLE_CLIENT_ID = os.environ.get('GOOGLE_CLIENT_ID')
 if not DEBUG and not GOOGLE_CLIENT_ID:
     raise ImproperlyConfigured("GOOGLE_CLIENT_ID environment variable is required in production.")
+
+# ------------------------------------------------------------------------------
+# Admin Email Configuration
+# ------------------------------------------------------------------------------
+# Comma-separated list of email addresses that are treated as system admins.
+# These accounts receive the 'admin' role on login and are seeded as superusers.
+# NEVER hardcode real email addresses here — configure via the .env file.
+# Example: ADMIN_EMAILS="admin@example.org,principal@example.org"
+_admin_emails_raw = os.environ.get('ADMIN_EMAILS', '')
+ADMIN_EMAILS: frozenset = frozenset(
+    e.strip().lower() for e in _admin_emails_raw.split(',') if e.strip()
+)
+if not DEBUG and not ADMIN_EMAILS:
+    raise ImproperlyConfigured(
+        "ADMIN_EMAILS environment variable is required in production. "
+        "Provide a comma-separated list of admin email addresses (e.g. ADMIN_EMAILS=admin@example.org)."
+    )
 
 # Production Security Defaults (Fail-Safe HTTPS, HSTS, Secure Cookies, Security Headers)
 if not DEBUG:

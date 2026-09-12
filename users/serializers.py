@@ -104,7 +104,10 @@ class VerificationLogSerializer(serializers.ModelSerializer):
             'id', 'submission', 'verification_level', 'verifier_id',
             'verifier_name', 'action', 'remarks', 'timestamp', 'action_timestamp'
         ]
-        read_only_fields = '__all__'
+        read_only_fields = [
+            'id', 'submission', 'verification_level', 'verifier_id',
+            'verifier_name', 'action', 'remarks', 'timestamp', 'action_timestamp'
+        ]
 
 
 class TeacherClassAssignmentSerializer(serializers.ModelSerializer):
@@ -245,6 +248,7 @@ class SubmissionSerializer(serializers.ModelSerializer):
     student_id = serializers.IntegerField(source='user.id', read_only=True)
     class_id = serializers.SerializerMethodField()
     class_name = serializers.SerializerMethodField()
+    department_name = serializers.SerializerMethodField()
     category_id = serializers.SerializerMethodField()
     verification_logs = VerificationLogSerializer(many=True, read_only=True)
     grade_breakdown = AcademicGradeBreakdownSerializer(read_only=True)
@@ -255,6 +259,15 @@ class SubmissionSerializer(serializers.ModelSerializer):
     def get_class_name(self, obj):
         return obj.class_obj.name if obj.class_obj else (obj.user.class_name.name if obj.user and obj.user.class_name else None)
 
+    def get_department_name(self, obj):
+        if obj.class_obj and obj.class_obj.department:
+            return getattr(obj.class_obj.department, 'name', str(obj.class_obj.department))
+        if obj.user and getattr(obj.user, 'department', None):
+            return getattr(obj.user.department, 'name', str(obj.user.department))
+        if obj.user and obj.user.class_name and getattr(obj.user.class_name, 'department', None):
+            return getattr(obj.user.class_name.department, 'name', str(obj.user.class_name.department))
+        return None
+
     def get_category_id(self, obj):
         return obj.category_id or (obj.criteria_item.category_id if getattr(obj, 'criteria_item', None) else None)
 
@@ -262,7 +275,7 @@ class SubmissionSerializer(serializers.ModelSerializer):
         model = Submission
         fields = [
             'id', 'user', 'student_id', 'user_email', 'user_name', 'class_obj', 'class_id', 'class_name',
-            'category', 'category_id', 'criteria_id', 'subcategory_id', 'criteria_version',
+            'department_name', 'category', 'category_id', 'criteria_id', 'subcategory_id', 'criteria_version',
             'academic_year', 'submission_date', 'submission_type', 'description', 'status',
             'remarks', 'marks', 'calculated_marks', 'is_manual_eval', 'proof', 'proof_url',
             'proof_hash', 'certificate_id', 'event_id', 'start_date', 'end_date', 'evaluator_verified',
@@ -271,7 +284,7 @@ class SubmissionSerializer(serializers.ModelSerializer):
             'evaluator_remarks', 'verification_logs', 'grade_breakdown', 'created_at', 'updated_at'
         ]
         read_only_fields = [
-            'user', 'student_id', 'class_id', 'class_name', 'category_id', 'verified_by_name', 'rep_verified_by_name',
+            'user', 'student_id', 'class_id', 'class_name', 'department_name', 'category_id', 'verified_by_name', 'rep_verified_by_name',
             'teacher_verified_by_name', 'evaluator_verified_by_name',
             'evaluator_verified', 'created_at', 'updated_at'
         ]
@@ -288,7 +301,12 @@ class WorkflowAuditTrailSerializer(serializers.ModelSerializer):
             'ip_address', 'user_agent', 'request_id', 'previous_hash',
             'record_hash', 'created_at'
         ]
-        read_only_fields = '__all__'
+        read_only_fields = [
+            'id', 'submission', 'actor', 'actor_email', 'stage',
+            'stage_name', 'previous_status', 'new_status', 'comments',
+            'ip_address', 'user_agent', 'request_id', 'previous_hash',
+            'record_hash', 'created_at'
+        ]
 
 
 class ClassIndexResultSerializer(serializers.ModelSerializer):
@@ -298,7 +316,7 @@ class ClassIndexResultSerializer(serializers.ModelSerializer):
     class Meta:
         model = ClassIndexResult
         fields = ['id', 'class_name', 'class_name_display', 'academic_year', 'academic_year_display', 'academic_score', 'co_curricular_score', 'extra_curricular_score', 'final_index', 'rank', 'updated_at']
-        read_only_fields = '__all__'
+        read_only_fields = ['id', 'class_name', 'academic_year', 'academic_score', 'co_curricular_score', 'extra_curricular_score', 'final_index', 'rank', 'updated_at']
 
 
 class ChampionSerializer(serializers.ModelSerializer):

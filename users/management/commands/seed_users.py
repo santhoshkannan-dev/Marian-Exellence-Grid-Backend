@@ -191,15 +191,34 @@ class Command(BaseCommand):
             classes[cls["name"]] = obj
             self.stdout.write(f"Created Class: {obj.name}")
 
-        # 5. Seed Users (without IQAC)
-        users_data = [
+        # 5. Seed Users (non-admin accounts are static personas for development)
+        # Admin accounts are sourced exclusively from the ADMIN_EMAILS env variable.
+        from django.conf import settings as django_settings
+
+        base_users_data = [
             ("santhosh.25pmc152@mariancollege.org", "student", "PGDCA", "II MCA", False, False, "Santhosh", "Kannan"),
             ("amal.25pmc114@mariancollege.org", "student", "PGDCA", "II MCA", False, False, "Amal", "Thomas"),
             ("santhosh.25ubc154@mariancollege.org", "student", "UGDCA", "II BCA A", False, False, "Santhosh", "Kannan"),
             ("kochumol.abraham@mariancollege.org", "faculty", "PGDCA", None, True, False, "Kochumol", "Abraham"),
             ("allen.george@mariancollege.org", "evaluation", "PGDCA", None, True, False, "Allen", "George"),
-            ("admin@mariancollege.org", "admin", None, None, True, True, "System", "Administrator"),
         ]
+
+        # Dynamically build admin user entries from ADMIN_EMAILS environment variable
+        admin_emails = getattr(django_settings, 'ADMIN_EMAILS', frozenset())
+        if not admin_emails:
+            self.stdout.write(self.style.WARNING(
+                "WARNING: ADMIN_EMAILS is not set in your .env file. "
+                "No admin accounts will be seeded. "
+                "Add ADMIN_EMAILS=admin@example.org to your .env file to seed admin users."
+            ))
+        admin_users_data = [
+            (email, "admin", None, None, True, True, "System", "Administrator")
+            for email in sorted(admin_emails)
+        ]
+        users_data = base_users_data + admin_users_data
+
+        import os
+        seed_pwd = os.environ.get('SEED_DEFAULT_PASSWORD') or getattr(django_settings, 'SEED_DEFAULT_PASSWORD', 'MarianPassword@123')
 
         seeded_users = {}
         for email, role, dept_code, class_name, is_staff, is_superuser, first, last in users_data:
@@ -213,7 +232,7 @@ class Command(BaseCommand):
                 user = User.objects.create_user(
                     email=email,
                     username=username,
-                    password="MarianPassword@123",
+                    password=seed_pwd,
                     role=role,
                     department=dept,
                     class_name=cls,
@@ -231,7 +250,7 @@ class Command(BaseCommand):
                 user.is_superuser = is_superuser
                 user.first_name = first
                 user.last_name = last
-                user.set_password("MarianPassword@123")
+                user.set_password(seed_pwd)
                 user.save()
 
             user = allocate_student_from_email(user)
@@ -245,11 +264,8 @@ class Command(BaseCommand):
             mca_class.save()
             self.stdout.write("Configured MCA Class Teacher and DQC member links")
 
-        # 6. Seed Criteria Catalog (Wipe and recreate clean 12 categories)
+        # 6. Seed Criteria Catalog (Idempotent 12 categories)
         from users.models import CriteriaCategory, CriteriaItem, CriteriaRule
-        CriteriaRule.objects.all().delete()
-        CriteriaItem.objects.all().delete()
-        CriteriaCategory.objects.all().delete()
 
         criteria_catalog_data = [
             {
@@ -512,30 +528,35 @@ class Command(BaseCommand):
             }
         ]
 
-        CriteriaCategory.objects.all().delete()
         for cat_data in criteria_catalog_data:
-            cat_obj = CriteriaCategory.objects.create(
+            cat_obj, _ = CriteriaCategory.objects.update_or_create(
                 code=cat_data["code"],
-                category=cat_data["category"],
-                access_level=cat_data["access_level"],
-                is_manual_eval=cat_data.get("is_manual_eval", False)
+                defaults={
+                    "category": cat_data["category"],
+                    "access_level": cat_data["access_level"],
+                    "is_manual_eval": cat_data.get("is_manual_eval", False)
+                }
             )
             for item_data in cat_data["items"]:
-                item_obj = CriteriaItem.objects.create(
+                item_obj, _ = CriteriaItem.objects.update_or_create(
                     category=cat_obj,
                     title=item_data["title"],
-                    type=item_data["type"],
-                    marks=item_data["marks"],
-                    access_level=item_data.get("access_level", cat_data["access_level"]),
-                    is_manual_eval=item_data.get("is_manual_eval", cat_data.get("is_manual_eval", False)),
-                    rules_json=item_data.get("rules_json", None)
+                    defaults={
+                        "type": item_data["type"],
+                        "marks": item_data["marks"],
+                        "access_level": item_data.get("access_level", cat_data["access_level"]),
+                        "is_manual_eval": item_data.get("is_manual_eval", cat_data.get("is_manual_eval", False)),
+                        "rules_json": item_data.get("rules_json", None)
+                    }
                 )
-                CriteriaRule.objects.create(
+                CriteriaRule.objects.update_or_create(
                     item=item_obj,
-                    rule_type=item_data["type"],
-                    maximum_marks=item_data["marks"],
-                    min_count=1 if item_data["type"] == 'count' else None,
-                    is_negative=True if item_data["type"] == 'negative' else False
+                    defaults={
+                        "rule_type": item_data["type"],
+                        "maximum_marks": item_data["marks"],
+                        "min_count": 1 if item_data["type"] == 'count' else None,
+                        "is_negative": True if item_data["type"] == 'negative' else False
+                    }
                 )
 
         # 7. Seed Official User Groups (strictly 4 official groups)
@@ -668,6 +689,9 @@ class Command(BaseCommand):
 
         for grp in created_groups.values():
             grp.sync_json_members()
+
+        from django.core.management import call_command
+        call_command('heal_criteria_submissions')
 
         self.stdout.write(self.style.SUCCESS("Database seeding completed successfully!"))
 

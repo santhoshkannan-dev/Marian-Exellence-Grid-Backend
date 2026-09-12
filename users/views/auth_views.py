@@ -142,7 +142,18 @@ class GoogleLoginView(APIView):
                 first_n = names[0]
                 last_n = names[1] if len(names) > 1 else ""
 
-                if detected_role == 'student':
+                if detected_role == 'admin':
+                    user = User.objects.create(
+                        username=email,
+                        email=email,
+                        first_name=first_n,
+                        last_name=last_n,
+                        role='admin',
+                        is_staff=True,
+                        is_superuser=True,
+                        google_id=google_id
+                    )
+                elif detected_role == 'student':
                     user = User.objects.create(
                         username=email,
                         email=email,
@@ -175,6 +186,11 @@ class GoogleLoginView(APIView):
                 user.first_name = names[0]
                 if len(names) > 1:
                     user.last_name = names[1]
+
+            if detected_role == 'admin':
+                user.role = 'admin'
+                user.is_staff = True
+                user.is_superuser = True
 
             user.save()
             user = allocate_student_from_email(user)
@@ -322,9 +338,19 @@ class DevBypassLoginView(APIView):
                 user.role = override_role
         except User.DoesNotExist:
             detected_role = determine_role_from_email(email)
-            if detected_role == 'student':
-                derived_name = parse_name_from_email(email)
-                names = derived_name.split(" ", 1)
+            derived_name = parse_name_from_email(email)
+            names = derived_name.split(" ", 1)
+            if detected_role == 'admin':
+                user = User.objects.create(
+                    username=email,
+                    email=email,
+                    first_name=names[0],
+                    last_name=names[1] if len(names) > 1 else "",
+                    role='admin',
+                    is_staff=True,
+                    is_superuser=True
+                )
+            elif detected_role == 'student':
                 user = User.objects.create(
                     username=email,
                     email=email,
@@ -337,6 +363,14 @@ class DevBypassLoginView(APIView):
                     {"error": "User not found. Privileged accounts (admin/faculty/evaluator) must be provisioned through administrative channels."},
                     status=status.HTTP_404_NOT_FOUND
                 )
+
+        detected_role = determine_role_from_email(user.email)
+        if detected_role == 'admin':
+            if user.role != 'admin' or not user.is_staff or not user.is_superuser:
+                user.role = 'admin'
+                user.is_staff = True
+                user.is_superuser = True
+                user.save(update_fields=['role', 'is_staff', 'is_superuser'])
 
         user = allocate_student_from_email(user)
         tokens = get_tokens_for_user(user)
