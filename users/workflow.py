@@ -148,7 +148,8 @@ def is_user_class_advisor(user: User, class_obj: Optional[Class]) -> bool:
         return False
     if getattr(user, 'role', '') == 'admin' or getattr(user, 'is_superuser', False):
         return True
-    if getattr(user, 'role', '') not in ('faculty', 'teacher'):
+    # Pure student accounts cannot be class advisors unless granted staff permissions
+    if getattr(user, 'role', '') == 'student' and not getattr(user, 'is_staff', False):
         return False
     if not class_obj:
         return True
@@ -269,7 +270,7 @@ def validate_workflow_transition(
     user_role = getattr(user, 'role', '')
     is_admin = user_role == 'admin' or getattr(user, 'is_superuser', False)
     sub_owner = submission.user
-    sub_class = sub_owner.class_name if sub_owner else None
+    sub_class = getattr(submission, 'class_obj', None) or (sub_owner.class_name if sub_owner else None)
 
     # Resolve active role context (teacher vs evaluator vs student vs dqc)
     ctx = (role_context or data.get('role_context') or data.get('role') or '').strip().lower()
@@ -280,22 +281,30 @@ def validate_workflow_transition(
             ctx = 'teacher'
         elif action_type == 'APPROVE_AND_CREDIT' or target_status in ('Evaluated', 'APPROVED'):
             ctx = 'evaluator'
-        elif user_role in ('faculty', 'staff') and current_norm in (WorkflowState.SUBMITTED, WorkflowState.STUDENT_REP_VERIFIED, WorkflowState.PENDING_REP_VERIFICATION):
+        elif data.get('evaluatorVerifiedByName') or data.get('evaluatorRemarks'):
+            ctx = 'evaluator'
+        elif (user_role in ('faculty', 'staff', 'teacher') or data.get('teacherVerifiedByName') or data.get('teacherRemarks') or is_user_class_advisor(user, sub_class)) and current_norm in (WorkflowState.SUBMITTED, WorkflowState.STUDENT_REP_VERIFIED, WorkflowState.PENDING_REP_VERIFICATION):
             ctx = 'teacher'
-        elif user_role in ('evaluation', 'evaluator') and current_norm == WorkflowState.TEACHER_VERIFIED:
+        elif user_role in ('evaluation', 'evaluator') and current_norm in (WorkflowState.TEACHER_VERIFIED, 'Teacher Verified', 'EVALUATOR_PENDING'):
             ctx = 'evaluator'
 
-    # If acting in Class Teacher context:
-    if ctx == 'teacher' and not is_admin:
-        # Approval in Teacher context is strictly Round 2 verification — forward to EVALUATOR_PENDING only
-        if target_status in ('Approved', 'APPROVED', 'Teacher Verified', 'EVALUATOR_PENDING') or action_type == 'VERIFY_AND_FORWARD':
+    # If acting in Class Teacher context or approving a submission in Student Rep Verified state:
+    is_teacher_approval = (
+        ctx == 'teacher' or
+        bool(data.get('teacherVerifiedByName') or data.get('teacherRemarks')) or
+        (current_norm == WorkflowState.STUDENT_REP_VERIFIED and target_status in ('Approved', 'APPROVED', 'Teacher Verified', 'EVALUATOR_PENDING', 'Verified'))
+    )
+    if is_teacher_approval and target_status not in (WorkflowState.CORRECTION_REQUESTED, WorkflowState.REJECTED, 'Correction Requested', 'Correction', 'Rejected'):
+        # Approval in Teacher context is strictly Round 2 verification — forward to TEACHER_VERIFIED (Evaluator Pending)
+        if target_status in ('Approved', 'APPROVED', 'Teacher Verified', 'EVALUATOR_PENDING', 'Verified') or action_type == 'VERIFY_AND_FORWARD':
             target_norm = WorkflowState.TEACHER_VERIFIED
 
-        # Strict check: teacher can ONLY verify their own assigned class
-        is_advisor = is_user_class_advisor(user, sub_class)
-        if not is_advisor:
-            stage_num, stage_name = determine_stage(target_norm, user)
-            return False, "Unauthorized: Class Teacher can only verify submissions for their assigned class.", stage_num, stage_name
+        # Strict check: teacher can ONLY verify their own assigned class (admins have override authority)
+        if not is_admin:
+            is_advisor = is_user_class_advisor(user, sub_class)
+            if not is_advisor:
+                stage_num, stage_name = determine_stage(target_norm, user)
+                return False, "Unauthorized: Class Teacher can only verify submissions for their assigned class.", stage_num, stage_name
 
         # Strict guard: teacher CANNOT execute APPROVE_AND_CREDIT or award marks under any circumstance
         if action_type == 'APPROVE_AND_CREDIT':
@@ -303,7 +312,7 @@ def validate_workflow_transition(
             return False, "Unauthorized: Class Teacher verification cannot award marks or finalize evaluation. Only Evaluators (Round 3) may credit marks.", stage_num, stage_name
 
         # Strict guard: teacher CANNOT directly jump to EVALUATED or APPROVED
-        if target_norm in (WorkflowState.EVALUATED, WorkflowState.APPROVED):
+        if not is_admin and target_norm in (WorkflowState.EVALUATED, WorkflowState.APPROVED):
             stage_num, stage_name = determine_stage(target_norm, user)
             return False, "Unauthorized: Class Teacher cannot finalize evaluation. Forward the submission to Evaluator Pending (Round 3) instead.", stage_num, stage_name
 
@@ -501,18 +510,26 @@ def execute_workflow_transition(
     # Resolve context
     ctx = (role_context or extra_fields.get('role_context') or extra_fields.get('role') or '').strip().lower()
     action_type = (extra_fields.get('actionType') or extra_fields.get('action') or '').strip().upper()
+    sub_class = getattr(submission, 'class_obj', None) or (submission.user.class_name if submission.user else None)
     if not ctx:
         if action_type == 'VERIFY_AND_FORWARD' or target_status in ('Teacher Verified', 'EVALUATOR_PENDING'):
             ctx = 'teacher'
         elif action_type == 'APPROVE_AND_CREDIT' or target_status in ('Evaluated', 'APPROVED'):
             ctx = 'evaluator'
-        elif user_role in ('faculty', 'staff') and norm == WorkflowState.TEACHER_VERIFIED:
+        elif extra_fields.get('evaluatorVerifiedByName') or extra_fields.get('evaluatorRemarks'):
+            ctx = 'evaluator'
+        elif (user_role in ('faculty', 'staff', 'teacher') or extra_fields.get('teacherVerifiedByName') or extra_fields.get('teacherRemarks') or is_user_class_advisor(user, sub_class)) and (norm == WorkflowState.TEACHER_VERIFIED or prev_status in ('Student Rep Verified', WorkflowState.STUDENT_REP_VERIFIED)):
             ctx = 'teacher'
-        elif user_role in ('evaluation', 'evaluator') and norm == WorkflowState.EVALUATED:
+        elif user_role in ('evaluation', 'evaluator') and (norm == WorkflowState.EVALUATED or prev_status in (WorkflowState.TEACHER_VERIFIED, 'Teacher Verified', 'EVALUATOR_PENDING')):
             ctx = 'evaluator'
 
-    if ctx == 'teacher' and not is_admin:
-        if target_status in ('Approved', 'APPROVED', 'Teacher Verified', 'EVALUATOR_PENDING') or action_type == 'VERIFY_AND_FORWARD':
+    is_teacher_approval = (
+        ctx == 'teacher' or
+        bool(extra_fields.get('teacherVerifiedByName') or extra_fields.get('teacherRemarks')) or
+        (prev_status in ('Student Rep Verified', WorkflowState.STUDENT_REP_VERIFIED) and target_status in ('Approved', 'APPROVED', 'Teacher Verified', 'EVALUATOR_PENDING', 'Verified'))
+    )
+    if is_teacher_approval and target_status not in (WorkflowState.CORRECTION_REQUESTED, WorkflowState.REJECTED, 'Correction Requested', 'Correction', 'Rejected'):
+        if target_status in ('Approved', 'APPROVED', 'Teacher Verified', 'EVALUATOR_PENDING', 'Verified') or action_type == 'VERIFY_AND_FORWARD' or norm == WorkflowState.TEACHER_VERIFIED:
             norm = WorkflowState.TEACHER_VERIFIED
             target_status = 'EVALUATOR_PENDING' if target_status == 'EVALUATOR_PENDING' else 'Teacher Verified'
 
@@ -527,57 +544,38 @@ def execute_workflow_transition(
                 sub.rep_remarks = remarks
             sub.verified_by_name = actor_name
 
-        elif norm == WorkflowState.TEACHER_VERIFIED or (ctx == 'teacher' and norm in (WorkflowState.CORRECTION_REQUESTED, WorkflowState.REJECTED)) or (user_role in ('faculty', 'staff') and norm in (WorkflowState.CORRECTION_REQUESTED, WorkflowState.REJECTED)):
+        elif norm == WorkflowState.EVALUATED or (ctx == 'evaluator' and norm in (WorkflowState.CORRECTION_REQUESTED, WorkflowState.REJECTED)) or (user_role in ('evaluation', 'evaluator') and norm in (WorkflowState.CORRECTION_REQUESTED, WorkflowState.REJECTED)) or ((extra_fields.get('evaluatorVerifiedByName') or extra_fields.get('evaluatorRemarks')) and norm in (WorkflowState.CORRECTION_REQUESTED, WorkflowState.REJECTED)):
+            sub.evaluator_verified_by_name = actor_name
+            sub.evaluator_verified = (norm == WorkflowState.EVALUATED)
+
+            # Dynamic marking from evaluation_engine:
+            if norm == WorkflowState.EVALUATED:
+                if marks is not None:
+                    sub.calculated_marks = float(marks)
+                    sub.marks = int(round(float(marks)))
+                else:
+                    from evaluation_engine import resolve_evaluator_marks
+                    try:
+                        res_marks = resolve_evaluator_marks(sub)
+                        sub.calculated_marks = float(res_marks)
+                        sub.marks = int(round(float(res_marks)))
+                    except Exception:
+                        pass
+            else:
+                sub.marks = 0
+                sub.calculated_marks = 0
+
+            if remarks:
+                sub.evaluator_remarks = remarks
+            sub.verified_by_name = actor_name
+
+        elif norm == WorkflowState.TEACHER_VERIFIED or (ctx == 'teacher' and norm in (WorkflowState.CORRECTION_REQUESTED, WorkflowState.REJECTED)) or (ctx != 'evaluator' and user_role in ('faculty', 'staff') and norm in (WorkflowState.CORRECTION_REQUESTED, WorkflowState.REJECTED)) or (is_user_class_advisor(user, sub_class) and norm in (WorkflowState.CORRECTION_REQUESTED, WorkflowState.REJECTED)):
             sub.teacher_verified_by_name = actor_name
             if remarks:
                 sub.teacher_remarks = remarks
             sub.verified_by_name = actor_name
             # Teacher verification strictly DOES NOT award marks to student or class
             marks = None
-
-        elif norm == WorkflowState.EVALUATED or (ctx == 'evaluator' and norm in (WorkflowState.CORRECTION_REQUESTED, WorkflowState.REJECTED)) or (user_role in ('evaluation', 'evaluator') and norm in (WorkflowState.CORRECTION_REQUESTED, WorkflowState.REJECTED)):
-            sub.evaluator_verified_by_name = actor_name
-            sub.evaluator_verified = (norm == WorkflowState.EVALUATED)
-
-            # Subcategory-based mark calculation:
-            # For all categories containing subcategories, the calculated marks are strictly
-            # driven by subcategories.default_marks.
-            from users.models import SubCategory, CriteriaItem
-            crit_item = CriteriaItem.objects.filter(pk=sub.criteria_id).select_related('category').first()
-            subcat = None
-            if sub.subcategory_id:
-                subcat = SubCategory.objects.filter(id=sub.subcategory_id).first()
-            if not subcat and crit_item and crit_item.category:
-                cat_code_check = (crit_item.category.code or '').strip().lower()
-                if cat_code_check not in ('cat-academics', 'cat-career-advancement', 'cat-documentation'):
-                    subcat = SubCategory.find_subcategory(
-                        subcategory_id=sub.subcategory_id,
-                        category_id=getattr(crit_item.category, 'id', None),
-                        category_code=cat_code_check,
-                        criteria_item=crit_item,
-                        evidence=sub.evidence
-                    )
-                    if subcat:
-                        sub.subcategory_id = subcat.id
-
-            if subcat:
-                count_val = 1
-                ev = sub.evidence if isinstance(sub.evidence, dict) else {}
-                if (crit_item and crit_item.type == 'count') or 'count' in ev:
-                    try:
-                        count_val = max(1, int(ev.get('count', 1)))
-                    except (ValueError, TypeError):
-                        count_val = 1
-                final_m = float(subcat.default_marks) * count_val
-                sub.calculated_marks = final_m
-                sub.marks = int(round(final_m))
-            elif marks is not None:
-                sub.marks = int(round(float(marks)))
-                sub.calculated_marks = float(marks)
-
-            if remarks:
-                sub.evaluator_remarks = remarks
-            sub.verified_by_name = actor_name
 
         elif is_admin:
             sub.verified_by_name = actor_name
@@ -588,7 +586,7 @@ def execute_workflow_transition(
                 subcat = SubCategory.objects.filter(id=sub.subcategory_id).first()
             if not subcat and crit_item and crit_item.category:
                 cat_code_check = (crit_item.category.code or '').strip().lower()
-                if cat_code_check not in ('cat-academics', 'cat-career-advancement', 'cat-documentation'):
+                if cat_code_check not in ('cat-academics', 'cat-career-advancement'):
                     subcat = SubCategory.find_subcategory(
                         subcategory_id=sub.subcategory_id,
                         category_id=getattr(crit_item.category, 'id', None),
@@ -715,17 +713,18 @@ def execute_workflow_transition(
             except Exception:
                 pass
 
-            # Credit Marks: Upon Evaluator approval, write calculated_marks to the class leaderboard ledger
-            if sub.user and sub.user.class_name:
+            # Credit Marks: Upon Evaluator approval, write calculated_marks to the class leaderboard ledger and ClassLedger
+            target_cls = getattr(sub, 'class_obj', None) or (sub.user.class_name if sub.user else None)
+            if target_cls:
                 try:
                     from users.scoring_engine import compute_class_scores
-                    from users.models import ClassIndexResult, AcademicYear
+                    from users.models import ClassIndexResult, AcademicYear, ClassLedger
                     ay_str = sub.academic_year or '2025-2026'
                     ay_obj = AcademicYear.objects.filter(year=ay_str).first()
                     if ay_obj:
-                        res = compute_class_scores(sub.user.class_name, academic_year=ay_str)
+                        res = compute_class_scores(target_cls, academic_year=ay_str)
                         ClassIndexResult.objects.update_or_create(
-                            class_name=sub.user.class_name,
+                            class_name=target_cls,
                             academic_year=ay_obj,
                             defaults={
                                 'academic_score': res.get('academic_score', 0.0),
@@ -735,6 +734,32 @@ def execute_workflow_transition(
                                 'snapshot_data': res
                             }
                         )
+
+                    # Update ClassLedger total_marks
+                    from decimal import Decimal
+                    cls_id_candidates = [str(target_cls.id)]
+                    if getattr(target_cls, 'name', None):
+                        cls_id_candidates.append(str(target_cls.name))
+                    if sub.user and getattr(sub.user, 'class_code', None):
+                        cls_id_candidates.append(str(sub.user.class_code))
+
+                    ledgers = ClassLedger.objects.filter(class_id__in=cls_id_candidates)
+                    if not ledgers.exists():
+                        cls_key = getattr(target_cls, 'name', None) or str(target_cls.id)
+                        ClassLedger.objects.create(class_id=cls_key, total_marks=Decimal('0.00'))
+                        ledgers = ClassLedger.objects.filter(class_id__in=cls_id_candidates + [cls_key])
+
+                    approved_subs = Submission.objects.filter(
+                        Q(user__class_name=target_cls) | Q(class_obj=target_cls),
+                        status__in=['Approved', 'APPROVED', 'Evaluated', 'Locked']
+                    )
+                    tot_marks = sum(
+                        Decimal(str(s.calculated_marks if s.calculated_marks is not None else (s.marks or 0.0)))
+                        for s in approved_subs
+                    )
+                    for led in ledgers:
+                        led.total_marks = tot_marks
+                        led.save(update_fields=['total_marks', 'updated_at'])
                 except Exception as ex:
                     logger.warning(f"Could not auto-credit class leaderboard ledger: {ex}")
 

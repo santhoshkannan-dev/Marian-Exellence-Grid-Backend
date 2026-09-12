@@ -311,11 +311,11 @@ class TeacherVerificationView(APIView):
 
         # Map action to target status
         if action == 'VERIFY_AND_FORWARD':
-            target_status = WorkflowState.TEACHER_VERIFIED   # normalizes → EVALUATOR_PENDING
+            target_status = 'EVALUATOR_PENDING'
         elif action == 'SEND_BACK':
-            target_status = WorkflowState.CORRECTION_REQUESTED
+            target_status = 'SENT_BACK'
         else:  # REJECT
-            target_status = WorkflowState.REJECTED
+            target_status = 'REJECTED'
 
         # CRITICAL: Strip marks — teachers never award marks
         try:
@@ -422,91 +422,112 @@ class EvaluatorVerificationView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        # Subcategory-based dynamic mark resolution:
-        # For all categories containing subcategories, the calculated marks are strictly driven
-        # by the specific subcategory's defined base mark (subcategories.default_marks).
-        from users.models import SubCategory
-        subcat = None
-        criteria_item = CriteriaItem.objects.filter(pk=submission.criteria_id).select_related('category').first()
-        cat_code_check = (criteria_item.category.code or '').strip().lower() if (criteria_item and criteria_item.category) else ''
+        # ------------------------------------------------------------------
+        # Role & Access Controls: DQC-Restricted Categories Enforcement
+        # ------------------------------------------------------------------
+        # Categories 1, 9, 10, 11, Group subcategories in Category 8, and specific Category 12 items
+        # (Library footfall, Library books, Repository creation) are strictly restricted to DQC Members.
+        # Attempting to approve an illegal category-role combination must throw an HTTP 403 Forbidden error.
+        from users.access_rules import (
+            DQC_ONLY_CATEGORY_CODES,
+            DQC_ONLY_CATEGORY_NAMES,
+            PRIZE_DQC_SUBCATEGORY_FRAGMENTS,
+            CAREER_DQC_SUBCATEGORY_TITLES,
+            _norm,
+        )
+        from users.services.user_service import UserService
 
-        # Only categories containing subcategories are resolved via SubCategory table
-        if cat_code_check not in ('cat-academics', 'cat-career-advancement', 'cat-documentation'):
-            if submission.subcategory_id:
-                subcat = SubCategory.objects.filter(id=submission.subcategory_id).first()
+        cat_obj = submission.category
+        cat_code = _norm(getattr(cat_obj, 'code', '') or '')
+        cat_name = _norm(getattr(cat_obj, 'name', '') or getattr(cat_obj, 'category', '') or '')
+        cat_id = getattr(submission, 'category_id', None)
 
-            if not subcat and criteria_item and criteria_item.category:
-                subcat = SubCategory.find_subcategory(
-                    subcategory_id=submission.subcategory_id,
-                    category_id=getattr(criteria_item.category, 'id', None),
-                    category_code=cat_code_check,
-                    criteria_item=criteria_item,
-                    evidence=submission.evidence
-                )
-                if subcat:
-                    submission.subcategory_id = subcat.id
-
-        marks_val = None
-        if subcat:
-            count_val = 1
+        is_dqc_category = False
+        if cat_id in (1, 9, 10, 11) or cat_code in DQC_ONLY_CATEGORY_CODES or cat_name in DQC_ONLY_CATEGORY_NAMES:
+            is_dqc_category = True
+        elif cat_id == 8 or 'prize' in cat_code or 'prize' in cat_name:
             ev = submission.evidence if isinstance(submission.evidence, dict) else {}
-            if (criteria_item and criteria_item.type == 'count') or 'count' in ev:
-                try:
-                    count_val = max(1, int(ev.get('count', 1)))
-                except (ValueError, TypeError):
-                    count_val = 1
-            expected_mark = float(subcat.default_marks) * count_val
-            # Strictly drive marks by subcategory default mark
-            if action == 'APPROVE_AND_CREDIT':
-                marks_val = expected_mark
-        else:
-            # Categories without subcategories (Academics / Career Advancement manual eval)
-            if action == 'APPROVE_AND_CREDIT':
-                raw_marks = request.data.get('marks')
-                if raw_marks is None:
-                    return Response(
-                        {"error": "marks is required for APPROVE_AND_CREDIT action."},
-                        status=status.HTTP_400_BAD_REQUEST
-                    )
-                try:
-                    marks_val = float(raw_marks)
-                except (ValueError, TypeError):
-                    return Response({"error": "marks must be a valid number."}, status=status.HTTP_400_BAD_REQUEST)
+            sub_name = _norm(ev.get('subItem') or ev.get('prizesSubItem') or '')
+            item_title = ''
+            if submission.criteria_id:
+                crit = CriteriaItem.objects.filter(pk=submission.criteria_id).first()
+                if crit:
+                    item_title = _norm(crit.title)
+            subcat_name = _norm(submission.subcategory.subcategory_name) if submission.subcategory else ''
+            combined = f"{sub_name} {item_title} {subcat_name}".lower()
+            for frag in PRIZE_DQC_SUBCATEGORY_FRAGMENTS:
+                if frag in combined or 'group' in combined:
+                    is_dqc_category = True
+                    break
+        elif cat_id == 12 or 'career' in cat_code or 'career' in cat_name:
+            ev = submission.evidence if isinstance(submission.evidence, dict) else {}
+            sub_name = _norm(ev.get('subItem') or '')
+            item_title = ''
+            if submission.criteria_id:
+                crit = CriteriaItem.objects.filter(pk=submission.criteria_id).first()
+                if crit:
+                    item_title = _norm(crit.title)
+            subcat_name = _norm(submission.subcategory.subcategory_name) if submission.subcategory else ''
+            combined = f"{sub_name} {item_title} {subcat_name}".lower()
+            if 'linkedin' not in combined:
+                for dt in CAREER_DQC_SUBCATEGORY_TITLES:
+                    if dt in combined:
+                        is_dqc_category = True
+                        break
 
-            if marks_val is not None and criteria_item:
-                is_manual = (
-                    getattr(criteria_item, 'is_manual_eval', False) or
-                    (criteria_item.category and getattr(criteria_item.category, 'is_manual_eval', False))
+        if is_dqc_category and action == 'APPROVE_AND_CREDIT':
+            submitter = submission.user
+            is_submitter_dqc = (
+                UserService.is_user_dqc_rep(submitter) or
+                UserService.is_user_student_rep(submitter) or
+                getattr(submitter, 'role', '') in ('STUDENT_REP', 'student_rep') or
+                getattr(submitter, 'is_staff', False) or
+                getattr(submitter, 'is_superuser', False)
+            )
+            if not is_submitter_dqc:
+                return Response(
+                    {
+                        "error": "Forbidden: Attempting to approve an illegal category-role combination. "
+                                 "This category is strictly restricted to DQC Members."
+                    },
+                    status=status.HTTP_403_FORBIDDEN
                 )
-                if is_manual:
-                    if marks_val < 0 or marks_val > 500:
-                        return Response(
-                            {"error": "Manual evaluation score must be between 0 and 500."},
-                            status=status.HTTP_400_BAD_REQUEST
-                        )
-                else:
-                    allowed_min, allowed_max, details = SubmissionService.get_criteria_allowed_bounds(
-                        criteria_item, submission.evidence
-                    )
-                    is_negative = criteria_item.type in ('negative', 'academic_grades') or (allowed_min is not None and allowed_min < 0)
-                    if marks_val < 0 and not is_negative:
-                        return Response(
-                            {"error": f"Score ({marks_val}) cannot be negative for non-penalty criteria."},
-                            status=status.HTTP_400_BAD_REQUEST
-                        )
-                    if allowed_max is not None and marks_val > (allowed_max + 1e-5):
-                        return Response(
-                            {"error": f"Score ({marks_val}) exceeds the maximum allowed limit ({allowed_max}) for '{criteria_item.title}'{details}."},
-                            status=status.HTTP_400_BAD_REQUEST
-                        )
+
+        # ------------------------------------------------------------------
+        # Mark Allocation Modes (evaluation_engine.py):
+        # 1. Formula-Driven (Category 1): Evaluated dynamically using weighted semester formula.
+        # 2. Lookup-Driven (Categories 2-11): Auto-calculated from subcategory default_marks.
+        #    Evaluators verify proof integrity; they do not alter the base mark.
+        # 3. Manual Input (Category 12): Requires explicit numeric entry by Evaluator.
+        # ------------------------------------------------------------------
+        marks_val = None
+        if action == 'APPROVE_AND_CREDIT':
+            from evaluation_engine import resolve_evaluator_marks
+            from django.core.exceptions import ValidationError
+            from decimal import Decimal
+
+            raw_marks = request.data.get('marks')
+            manual_input = None
+            if raw_marks is not None:
+                try:
+                    manual_input = Decimal(str(raw_marks))
+                except Exception:
+                    return Response({"error": "marks must be a valid numeric value."}, status=status.HTTP_400_BAD_REQUEST)
+
+            try:
+                marks_decimal = resolve_evaluator_marks(submission, evaluator_manual_input=manual_input)
+                marks_val = float(marks_decimal)
+            except ValidationError as ve:
+                err_msg = ve.message if hasattr(ve, 'message') else str(ve)
+                return Response({"error": err_msg}, status=status.HTTP_400_BAD_REQUEST)
 
         # Map action to target status
         if action == 'APPROVE_AND_CREDIT':
-            target_status = WorkflowState.EVALUATED   # normalizes → APPROVED, credits marks
+            target_status = 'APPROVED'
         elif action == 'SEND_BACK':
-            target_status = WorkflowState.CORRECTION_REQUESTED
+            target_status = 'SENT_BACK'
         else:  # REJECT
-            target_status = WorkflowState.REJECTED
+            target_status = 'REJECTED'
 
         try:
             with transaction.atomic():

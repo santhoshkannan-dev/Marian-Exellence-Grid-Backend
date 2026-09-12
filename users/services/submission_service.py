@@ -355,7 +355,10 @@ class SubmissionService:
             "status": s.status,
             "remarks": s.remarks,
             "marks": s.marks,
-            "calculatedMarks": s.calculated_marks if s.calculated_marks is not None else s.marks,
+            "calculatedMarks": (
+                sub_default if (s.calculated_marks is None or s.calculated_marks == 0.0) and sub_default is not None and s.status in ('Draft', 'Submitted', 'Pending Rep Verification', 'Pending Verification')
+                else (s.calculated_marks if s.calculated_marks is not None else s.marks)
+            ),
             "calculated_marks": s.calculated_marks if s.calculated_marks is not None else s.marks,
             "isManualEval": s.is_manual_eval,
             "is_manual_eval": s.is_manual_eval,

@@ -479,16 +479,16 @@ class VerificationPipelineTests(TestCase):
         activity categories (1 through 12) for submissions of their assigned class.
         """
         # Category 1: Academics
-        cat_acad = CriteriaCategory.objects.create(category='Academics', code='cat-academics')
-        item_acad = CriteriaItem.objects.create(category=cat_acad, title='Semester Results', type='fixed', marks=15.0)
+        cat_acad, _ = CriteriaCategory.objects.get_or_create(code='cat-academics', defaults={'category': 'Academics'})
+        item_acad, _ = CriteriaItem.objects.get_or_create(category=cat_acad, title='Semester Results', defaults={'type': 'fixed', 'marks': 15.0})
 
         # Category 9: Programs Organized
-        cat_prog = CriteriaCategory.objects.create(category='Programs Organized', code='cat-programs-organized')
-        item_prog = CriteriaItem.objects.create(category=cat_prog, title='Seminar Organizing', type='fixed', marks=10.0)
+        cat_prog, _ = CriteriaCategory.objects.get_or_create(code='cat-programs-organized', defaults={'category': 'Programs Organized'})
+        item_prog, _ = CriteriaItem.objects.get_or_create(category=cat_prog, title='Seminar Organizing', defaults={'type': 'fixed', 'marks': 10.0})
 
         # Category 12: Documentation
-        cat_doc = CriteriaCategory.objects.create(category='Documentation', code='cat-documentation')
-        item_doc = CriteriaItem.objects.create(category=cat_doc, title='Annual Documentation', type='fixed', marks=20.0)
+        cat_doc, _ = CriteriaCategory.objects.get_or_create(code='cat-documentation', defaults={'category': 'Documentation'})
+        item_doc, _ = CriteriaItem.objects.get_or_create(category=cat_doc, title='Annual Documentation', defaults={'type': 'fixed', 'marks': 20.0})
 
         self.client.force_authenticate(user=self.student_rep)
 

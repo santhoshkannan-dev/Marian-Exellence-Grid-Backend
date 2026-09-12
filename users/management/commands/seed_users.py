@@ -274,14 +274,14 @@ class Command(BaseCommand):
                 "access_level": "student_rep_only",
                 "items": [
                     {
-                        "title": "Class Pass Percentage %",
+                        "title": "Sem Result (End Semester Examination)",
                         "type": "academic_grades",
                         "marks": 0.0,
                         "rules_json": {
                             "90_above": 5.0,
                             "80_90": 4.0,
                             "70_80": 3.0,
-                            "fail": -2.0,
+                            "fail": -1.0,
                             "pass_percentage_ranges": [
                                 {"min": 90.01, "max": 100.0, "marks": 5.0},
                                 {"min": 80.01, "max": 90.0, "marks": 4.0},
@@ -289,26 +289,17 @@ class Command(BaseCommand):
                                 {"min": 60.01, "max": 70.0, "marks": 2.0},
                                 {"min": 50.01, "max": 60.0, "marks": 1.0},
                                 {"min": 0.0, "max": 50.0, "marks": 0.0}
-                            ]
-                        }
-                    },
-                    {
-                        "title": "SAVE Sem Result",
-                        "type": "academic_grades",
-                        "marks": 0.0,
-                        "rules_json": {
-                            "90_above": 5.0,
-                            "80_90": 4.0,
-                            "70_80": 3.0,
-                            "fail": -2.0,
-                            "pass_percentage_ranges": [
-                                {"min": 90.01, "max": 100.0, "marks": 5.0},
-                                {"min": 80.01, "max": 90.0, "marks": 4.0},
-                                {"min": 70.01, "max": 80.0, "marks": 3.0},
-                                {"min": 60.01, "max": 70.0, "marks": 2.0},
-                                {"min": 50.01, "max": 60.0, "marks": 1.0},
-                                {"min": 0.0, "max": 50.0, "marks": 0.0}
-                            ]
+                            ],
+                            "fields": {
+                                "count_90_above": True,
+                                "count_80_90": True,
+                                "count_70_80": True,
+                                "count_fail": True,
+                                "pass_percentage": True,
+                                "proof_url": True,
+                                "description": True
+                            },
+                            "max_per_cycle": 1
                         }
                     },
                 ]
@@ -428,7 +419,7 @@ class Command(BaseCommand):
             },
             {
                 "code": "cat-prizes",
-                "category": "Prizes",
+                "category": "Prizes Won",
                 "access_level": "all_students",
                 "items": [
                     {
@@ -514,19 +505,17 @@ class Command(BaseCommand):
                     {"title": "Library - Academic & Career Books Issued/Read", "type": "count", "marks": 5.0, "access_level": "student_rep_only", "is_manual_eval": True},
                     {"title": "Repository Creation (Drive / GitHub / LMS / Website)", "type": "fixed", "marks": 5.0, "access_level": "student_rep_only", "is_manual_eval": True},
                     {"title": "LinkedIn - Profile Completion (Active Profile)", "type": "fixed", "marks": 3.0, "access_level": "all_students", "is_manual_eval": True},
-                    {"title": "LinkedIn - Skill Badges Earned", "type": "count", "marks": 1.0, "access_level": "all_students", "is_manual_eval": True},
-                    {"title": "LinkedIn - Micro-credentials / Learning Certifications", "type": "count", "marks": 1.0, "access_level": "all_students", "is_manual_eval": True},
-                ]
-            },
-            {
-                "code": "cat-documentation",
-                "category": "Documentation",
-                "access_level": "student_rep_only",
-                "items": [
-                    {"title": "Class Activity Report & Documents", "type": "fixed", "marks": 10.0},
                 ]
             }
         ]
+
+        # Clean up deprecated categories and items
+        CriteriaCategory.objects.filter(code="cat-documentation").delete()
+        CriteriaItem.objects.filter(title__in=[
+            "LinkedIn - Skill Badges Earned",
+            "LinkedIn - Micro-credentials / Learning Certifications",
+            "Class Activity Report & Documents"
+        ]).delete()
 
         for cat_data in criteria_catalog_data:
             cat_obj, _ = CriteriaCategory.objects.update_or_create(
@@ -689,6 +678,9 @@ class Command(BaseCommand):
 
         for grp in created_groups.values():
             grp.sync_json_members()
+
+        from users.models import SystemSetting
+        SystemSetting.objects.get_or_create(key='smallest_class_size', defaults={'value': '0'})
 
         from django.core.management import call_command
         call_command('heal_criteria_submissions')

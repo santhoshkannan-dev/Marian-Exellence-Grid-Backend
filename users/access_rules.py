@@ -48,7 +48,6 @@ DQC_ONLY_CATEGORY_CODES: frozenset[str] = frozenset({
     "cat-leaderships",          # alias used in some DB rows
     "cat-social-responsibility",
     "cat-social-responsibilities",
-    "cat-documentation",        # legacy alias
 })
 
 #: Human-readable display names that also map to DQC-only (lowercase, used for
@@ -60,7 +59,6 @@ DQC_ONLY_CATEGORY_NAMES: frozenset[str] = frozenset({
     "leadership",
     "social responsibilities",
     "social responsibility",
-    "documentation",
 })
 
 #: Categories where every CriteriaItem is open to all students.

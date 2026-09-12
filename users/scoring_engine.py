@@ -1,18 +1,13 @@
 """
 Authoritative Scoring & Moderation Engine for Marian Best Class.
 
-Institutional Formula Reference (from frontend/docs/scoring-logic.md):
-  Step 1: Net Obtained Score = S - P
-          S = Gross Evaluated Marks (sum of verified marks on Evaluated/Locked submissions)
-          P = Class Penalty Points (Class.negative_points)
-  Step 2: Class Strength Moderation Mark
-          Mod = min(200.0, max(0.0, 2.0 * (N - n)))
-          N = Class Size (Class.num_students)
-          n = Benchmark Minimum Class Size (SystemSetting['smallest_class_size'])
-          Range: strictly bounded between 0.0 and 200.0 marks.
-  Step 3: Total Score = max(0.0, Net Score + Mod)
-  Step 4: Class Index Mark (M) = Total Score / N
-          Per-capita normalized institutional ranking metric.
+Institutional Moderation Formula:
+  M = (S - P) / N² * (1 + 100 * (N - n))
+  where:
+    S = Evaluated Marks (sum of verified marks on Evaluated/Locked submissions)
+    P = Penalties (defined in department management via Class.negative_points)
+    N = Class Size (defined in department management via Class.num_students)
+    n = 0 (Smallest Class Benchmark defined in department management via SystemSetting['smallest_class_size'])
 """
 
 from typing import Dict, List, Optional, Tuple, Any
@@ -24,7 +19,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 SCORING_ENGINE_VERSION = 'v1.0-authoritative'
-DEFAULT_BENCHMARK_CLASS_SIZE = 20.0
+DEFAULT_BENCHMARK_CLASS_SIZE = 0.0
 MAX_MODERATION_MARK = 200.0
 MODERATION_FACTOR = 2.0
 
@@ -51,17 +46,16 @@ PILLAR_MAPPING = {
         'scholarships',
         'startups',
         'prizes',
+        'prizes won',
         'co-curricular',
     },
     'Extra-Curricular': {
         'cat-programs-organized',
         'cat-leadership',
         'cat-social-responsibility',
-        'cat-documentation',
         'programs organized',
         'leaderships',
         'social responsibilities',
-        'documentation',
         'extra-curricular',
     },
 }
@@ -76,45 +70,70 @@ def get_pillar_for_category(category_identifier: str) -> str:
     return 'Other'
 
 
-def calculate_class_moderation(N: int, n: float) -> float:
+def calculate_class_moderation(N: int, n: float = 0.0) -> float:
     """
-    Step 2: Class Strength Moderation Mark.
-    Mod = min(200.0, max(0.0, 2.0 * (N - n)))
+    Class cohort benchmark difference: (N - n).
     """
     n_val = float(n) if n is not None else 0.0
-    diff = float(N) - n_val
-    raw_mod = MODERATION_FACTOR * diff
-    return round(min(MAX_MODERATION_MARK, max(0.0, raw_mod)), 2)
+    return round(float(N) - n_val, 2)
 
 
 def calculate_net_score(gross_marks: float, negative_points: float) -> float:
     """
-    Step 1: Net Obtained Score = S - P.
+    Net Obtained Score = S - P.
     """
     s_val = float(gross_marks) if gross_marks is not None else 0.0
     p_val = float(negative_points) if negative_points is not None else 0.0
     return round(s_val - p_val, 2)
 
 
-def calculate_total_score(net_score: float, moderation_mark: float) -> float:
+def calculate_total_score(net_score: float, moderation_mark: float = 0.0) -> float:
     """
-    Step 3: Total Score = max(0.0, Net Score + Mod).
-    Ensures total score cannot be negative.
+    Total Score (non-negative).
     """
     net_val = float(net_score) if net_score is not None else 0.0
-    mod_val = float(moderation_mark) if moderation_mark is not None else 0.0
-    return round(max(0.0, net_val + mod_val), 2)
+    return round(max(0.0, net_val), 2)
 
 
-def calculate_class_index(total_score: float, N: int) -> Optional[float]:
+def calculate_class_index(
+    S: float,
+    P: float = 0.0,
+    N: Optional[int] = None,
+    n: float = 0.0,
+    **kwargs
+) -> Optional[float]:
     """
-    Step 4: Class Index Mark M = Total Score / N.
-    Returns None if N <= 0.
+    Moderation Formula:
+    M = (S − P) / N² × (1 + 100 × (N − n))
+    where:
+      S = Evaluated Marks
+      P = Penalties (defined in department management)
+      N = Class Size (defined in department management)
+      n = 0 (Smallest Class Benchmark defined in department management)
     """
-    if N is None or N <= 0:
+    # Support backward compatibility if called as calculate_class_index(total_score, N=40)
+    if N is None:
+        if 'N' in kwargs:
+            N = kwargs['N']
+        elif isinstance(P, int) and P > 0 and 'n' not in kwargs:
+            # Called as (S, N)
+            N = P
+            P = 0.0
+        else:
+            return None
+
+    if N <= 0:
         return None
-    tot_val = float(total_score) if total_score is not None else 0.0
-    return round(tot_val / float(N), 4)
+
+    s_val = float(S) if S is not None else 0.0
+    p_val = float(P) if P is not None else 0.0
+    n_val = float(n) if n is not None else 0.0
+
+    net_score = s_val - p_val
+    diff = float(N) - n_val
+    multiplier = 1.0 + 100.0 * diff
+    m_val = (net_score / (float(N) ** 2)) * multiplier
+    return round(max(0.0, m_val), 4)
 
 
 def get_criteria_allowed_bounds(criteria_item, evidence: Any = None) -> Tuple[float, float, str]:
@@ -143,21 +162,23 @@ def get_criteria_allowed_bounds(criteria_item, evidence: Any = None) -> Tuple[fl
 
     # Base mark calculation: SubCategory is authoritative for categories with subcategories
     subcat_matched = False
-    try:
-        from .models import SubCategory
-        subcat = SubCategory.find_subcategory(
-            subcategory_id=ev.get('subcategory_id') or ev.get('subcategoryId'),
-            category_id=getattr(getattr(criteria_item, 'category', None), 'id', None),
-            category_code=getattr(getattr(criteria_item, 'category', None), 'code', None),
-            criteria_item=criteria_item,
-            evidence=ev
-        )
-        if subcat:
-            base_mark = float(subcat.default_marks)
-            details = f" (subcategory '{subcat.subcategory_name}': {base_mark})"
-            subcat_matched = True
-    except Exception as _ex:
-        logger.debug("Subcategory lookup in scoring engine error: %s", _ex)
+    is_academic = (criteria_item.type == 'academic_grades') or (criteria_item.category and criteria_item.category.code == 'cat-academics')
+    if not is_academic:
+        try:
+            from .models import SubCategory
+            subcat = SubCategory.find_subcategory(
+                subcategory_id=ev.get('subcategory_id') or ev.get('subcategoryId'),
+                category_id=getattr(getattr(criteria_item, 'category', None), 'id', None),
+                category_code=getattr(getattr(criteria_item, 'category', None), 'code', None),
+                criteria_item=criteria_item,
+                evidence=ev
+            )
+            if subcat:
+                base_mark = float(subcat.default_marks)
+                details = f" (subcategory '{subcat.subcategory_name}': {base_mark})"
+                subcat_matched = True
+        except Exception as _ex:
+            logger.debug("Subcategory lookup in scoring engine error: %s", _ex)
 
     if not subcat_matched:
         if rule and rule.maximum_marks is not None:
@@ -264,17 +285,27 @@ def get_criteria_allowed_bounds(criteria_item, evidence: Any = None) -> Tuple[fl
         # Exact Academics Formula:
         # (Count >= 90% * 5) + (Count 80-90% * 4) + (Count 70-80% * 3) + Pass Rate Bonus - Count Fail
         grades = ev.get('grades') or ev.get('markBreakdown') or ev
-        cnt_90 = int(grades.get('count90Above', grades.get('90_above', grades.get('S', grades.get('s_grade_count', 0)))) or 0)
-        cnt_80 = int(grades.get('count80to90', grades.get('80_90', grades.get('APlus', grades.get('a_plus_grade_count', 0)))) or 0)
-        cnt_70 = int(grades.get('count70to80', grades.get('70_80', grades.get('A', grades.get('a_grade_count', 0)))) or 0)
-        cnt_fail = int(grades.get('failCount', grades.get('failed_count', grades.get('Fail', 0))) or 0)
+        cnt_90 = int(grades.get('count_90_above', grades.get('count90Above', grades.get('90_above', grades.get('S', grades.get('s_grade_count', 0))))) or 0)
+        cnt_80 = int(grades.get('count_80_90', grades.get('count80to90', grades.get('80_90', grades.get('APlus', grades.get('a_plus_grade_count', 0))))) or 0)
+        cnt_70 = int(grades.get('count_70_80', grades.get('count70to80', grades.get('70_80', grades.get('A', grades.get('a_grade_count', 0))))) or 0)
+        cnt_fail = int(grades.get('count_fail', grades.get('failCount', grades.get('failed_count', grades.get('Fail', 0)))) or 0)
 
-        pass_pct_raw = ev.get('classPassPercentage') or ev.get('effectivePassPercentage') or ev.get('class_pass_percentage')
-        if pass_pct_raw is None and total_students > 0:
+        pass_pct_raw = (
+            ev.get('pass_percentage') if ev.get('pass_percentage') is not None else
+            (grades.get('pass_percentage') if isinstance(grades, dict) and grades.get('pass_percentage') is not None else None) or
+            ev.get('classPassPercentage') or
+            ev.get('effectivePassPercentage') or
+            ev.get('class_pass_percentage') or
+            (grades.get('class_pass_percentage') if isinstance(grades, dict) else None)
+        )
+        if (pass_pct_raw is None or pass_pct_raw == '') and (cnt_90 or cnt_80 or cnt_70 or cnt_fail) and total_students > 0:
             passed = max(0, total_students - cnt_fail)
             pass_pct = round((passed / float(total_students)) * 100.0, 2)
-        elif pass_pct_raw is not None:
-            pass_pct = float(pass_pct_raw)
+        elif pass_pct_raw is not None and pass_pct_raw != '':
+            try:
+                pass_pct = float(pass_pct_raw)
+            except (ValueError, TypeError):
+                pass_pct = 0.0
         else:
             pass_pct = 0.0
 
@@ -287,13 +318,16 @@ def get_criteria_allowed_bounds(criteria_item, evidence: Any = None) -> Tuple[fl
             pass_bonus = 3.0
         elif pass_pct > 60.0:
             pass_bonus = 2.0
-        elif pass_pct >= 50.0:
+        elif pass_pct > 50.0:
             pass_bonus = 1.0
         else:
             pass_bonus = 0.0
 
         calculated_academic_score = (cnt_90 * 5.0) + (cnt_80 * 4.0) + (cnt_70 * 3.0) + pass_bonus - cnt_fail
-        allowed_max = max(0.0, calculated_academic_score) if (cnt_90 or cnt_80 or cnt_70 or cnt_fail or pass_bonus) else ((total_students * max(m90, m80, m70)) + 5.0)
+        if evidence is not None:
+            allowed_max = max(0.0, calculated_academic_score)
+        else:
+            allowed_max = max(0.0, calculated_academic_score) if (cnt_90 or cnt_80 or cnt_70 or cnt_fail or pass_bonus) else ((total_students * max(m90, m80, m70)) + 5.0)
         base_mark = allowed_max
         details = f" (academics formula: 90%={cnt_90}, 80-90%={cnt_80}, 70-80%={cnt_70}, fail={cnt_fail}, passBonus={pass_bonus})"
 
@@ -335,36 +369,38 @@ def calculate_submission_score(criteria_item, evidence: Any = None) -> float:
         return 0.0
 
     ev = evidence if isinstance(evidence, dict) else {}
-    try:
-        from .models import SubCategory
-        subcat = SubCategory.find_subcategory(
-            subcategory_id=ev.get('subcategory_id') or ev.get('subcategoryId'),
-            category_id=getattr(getattr(criteria_item, 'category', None), 'id', None),
-            category_code=getattr(getattr(criteria_item, 'category', None), 'code', None),
-            criteria_item=criteria_item,
-            evidence=ev
-        )
-        if subcat:
-            count_val = 1
-            if criteria_item.type == 'count' or 'count' in ev:
-                try:
-                    count_val = max(1, int(ev.get('count', 1)))
-                except (ValueError, TypeError):
-                    count_val = 1
-            return float(subcat.default_marks) * count_val
-    except Exception as _ex:
-        logger.debug("calculate_submission_score subcategory lookup: %s", _ex)
+    is_academic = (criteria_item.type == 'academic_grades') or (criteria_item.category and criteria_item.category.code == 'cat-academics')
+    if not is_academic:
+        try:
+            from .models import SubCategory
+            subcat = SubCategory.find_subcategory(
+                subcategory_id=ev.get('subcategory_id') or ev.get('subcategoryId'),
+                category_id=getattr(getattr(criteria_item, 'category', None), 'id', None),
+                category_code=getattr(getattr(criteria_item, 'category', None), 'code', None),
+                criteria_item=criteria_item,
+                evidence=ev
+            )
+            if subcat:
+                count_val = 1
+                if criteria_item.type == 'count' or 'count' in ev:
+                    try:
+                        count_val = max(1, int(ev.get('count', 1)))
+                    except (ValueError, TypeError):
+                        count_val = 1
+                return float(subcat.default_marks) * count_val
+        except Exception as _ex:
+            logger.debug("calculate_submission_score subcategory lookup: %s", _ex)
 
     allowed_min, allowed_max, _ = get_criteria_allowed_bounds(criteria_item, evidence)
     return allowed_max
 
 
 def get_benchmark_class_size() -> float:
-    """Retrieve benchmark class size n from SystemSetting or fallback to default."""
+    """Retrieve benchmark class size n from SystemSetting or fallback to default 0.0."""
     from .models import SystemSetting
     try:
         n_setting = SystemSetting.objects.get(key='smallest_class_size')
-        return float(n_setting.value) if n_setting.value else DEFAULT_BENCHMARK_CLASS_SIZE
+        return float(n_setting.value) if n_setting.value is not None and str(n_setting.value).strip() != '' else DEFAULT_BENCHMARK_CLASS_SIZE
     except (SystemSetting.DoesNotExist, ValueError, TypeError):
         return DEFAULT_BENCHMARK_CLASS_SIZE
 
@@ -386,8 +422,7 @@ def compute_class_scores(cls, academic_year: Optional[str] = None, n_benchmark: 
 
     # Build submission queryset
     sub_qs = Submission.objects.filter(
-        status__in=['Locked', 'Evaluated', 'Approved', 'APPROVED'],
-        user__class_name=cls
+        Q(status__in=['Locked', 'Evaluated', 'Approved', 'APPROVED']) & (Q(class_obj=cls) | Q(user__class_name=cls))
     )
     if academic_year:
         sub_qs = sub_qs.filter(academic_year=academic_year)
@@ -433,11 +468,28 @@ def compute_class_scores(cls, academic_year: Optional[str] = None, n_benchmark: 
         else:
             pillar_scores['Extra-Curricular'] = round(pillar_scores['Extra-Curricular'] + marks_val, 2)
 
+    # Total submissions and submitted categories for this class
+    all_cls_subs = Submission.objects.filter(Q(class_obj=cls) | Q(user__class_name=cls))
+    if academic_year:
+        all_cls_subs = all_cls_subs.filter(academic_year=academic_year)
+    total_submissions = all_cls_subs.count()
+
+    cat_counts: Dict[str, Dict[str, Any]] = {}
+    for sub in all_cls_subs.select_related('category'):
+        c_name = sub.category.category if sub.category else 'General Activities'
+        if c_name not in cat_counts:
+            cat_counts[c_name] = {'category': c_name, 'count': 0, 'points': 0.0}
+        cat_counts[c_name]['count'] += 1
+        if sub.status in ['Locked', 'Evaluated', 'Approved', 'APPROVED'] and sub.marks:
+            cat_counts[c_name]['points'] += float(sub.marks)
+
+    submitted_categories = sorted(cat_counts.values(), key=lambda x: (-x['count'], -x['points']))
+
     if N > 0:
         net_score = calculate_net_score(S, P)
         moderation_mark = calculate_class_moderation(N, n)
-        total_score = calculate_total_score(net_score, moderation_mark)
-        M = calculate_class_index(total_score, N)
+        M = calculate_class_index(S=S, P=P, N=N, n=n)
+        total_score = round(M * float(N), 2) if M is not None else 0.0
     else:
         net_score = calculate_net_score(S, P)
         moderation_mark = 0.0
@@ -459,6 +511,8 @@ def compute_class_scores(cls, academic_year: Optional[str] = None, n_benchmark: 
         "net_score": net_score,
         "moderation_mark": moderation_mark,
         "total_score": total_score,
+        "total_submissions": total_submissions,
+        "submitted_categories": submitted_categories,
         "M": M,
         "academic_score": pillar_scores['Academic'],
         "co_curricular_score": pillar_scores['Co-Curricular'],
@@ -498,25 +552,54 @@ def compute_all_rankings(academic_year: Optional[str] = None, n_benchmark: Optio
 
     # 2. Batch aggregate in single SQL query
     sub_qs = Submission.objects.filter(
-        status__in=['Locked', 'Evaluated'],
+        status__in=['Locked', 'Evaluated', 'Approved', 'APPROVED'],
         marks__isnull=False
     )
     if academic_year:
         sub_qs = sub_qs.filter(academic_year=academic_year)
 
-    class_criteria_sums = (
-        sub_qs.values('user__class_name_id', 'criteria_id')
+    class_criteria_sums_user = (
+        sub_qs.filter(user__class_name_id__isnull=False)
+        .values('user__class_name_id', 'criteria_id')
+        .annotate(total_marks=Sum('marks'))
+    )
+    class_criteria_sums_obj = (
+        sub_qs.filter(class_obj_id__isnull=False, user__class_name_id__isnull=True)
+        .values('class_obj_id', 'criteria_id')
         .annotate(total_marks=Sum('marks'))
     )
 
     class_scores_map: Dict[int, Dict[int, float]] = {}
-    for entry in class_criteria_sums:
-        c_id = entry['user__class_name_id']
+    for entry in list(class_criteria_sums_user) + list(class_criteria_sums_obj):
+        c_id = entry.get('user__class_name_id') or entry.get('class_obj_id')
+        if not c_id:
+            continue
         crit_id = entry['criteria_id']
         tot = float(entry['total_marks'] or 0.0)
         if c_id not in class_scores_map:
             class_scores_map[c_id] = {}
-        class_scores_map[c_id][crit_id] = tot
+        class_scores_map[c_id][crit_id] = class_scores_map[c_id].get(crit_id, 0.0) + tot
+
+    # 3. Pre-aggregate total submission counts and category breakdown per class
+    all_subs_qs = Submission.objects.all()
+    if academic_year:
+        all_subs_qs = all_subs_qs.filter(academic_year=academic_year)
+
+    from collections import defaultdict
+    class_sub_counts: Dict[int, int] = defaultdict(int)
+    class_cat_breakdown: Dict[int, Dict[str, Dict[str, Any]]] = defaultdict(lambda: defaultdict(lambda: {'category': '', 'count': 0, 'points': 0.0}))
+
+    for sub in all_subs_qs.select_related('category', 'user'):
+        c_id = sub.class_obj_id or (sub.user.class_name_id if sub.user else None)
+        if not c_id:
+            continue
+        class_sub_counts[c_id] += 1
+        cat_name = sub.category.category if sub.category else 'General Activities'
+        cat_item = class_cat_breakdown[c_id][cat_name]
+        cat_item['category'] = cat_name
+        cat_item['count'] += 1
+        if sub.status in ['Locked', 'Evaluated', 'Approved', 'APPROVED'] and sub.marks:
+            cat_item['points'] += float(sub.marks)
 
     ranked: List[Dict[str, Any]] = []
     unranked: List[Dict[str, Any]] = []
@@ -551,8 +634,8 @@ def compute_all_rankings(academic_year: Optional[str] = None, n_benchmark: Optio
         if N > 0:
             net_score = calculate_net_score(S, P)
             moderation_mark = calculate_class_moderation(N, n)
-            total_score = calculate_total_score(net_score, moderation_mark)
-            M = calculate_class_index(total_score, N)
+            M = calculate_class_index(S=S, P=P, N=N, n=n)
+            total_score = round(M * float(N), 2) if M is not None else 0.0
         else:
             net_score = calculate_net_score(S, P)
             moderation_mark = 0.0
@@ -561,6 +644,8 @@ def compute_all_rankings(academic_year: Optional[str] = None, n_benchmark: Optio
 
         dept_name = cls.department.name if cls.department else 'General'
         dept_code = cls.department.code if cls.department else 'GEN'
+
+        cat_list = sorted(class_cat_breakdown.get(cls.id, {}).values(), key=lambda x: (-x['count'], -x['points']))
 
         res = {
             "class_id": cls.id,
@@ -574,6 +659,8 @@ def compute_all_rankings(academic_year: Optional[str] = None, n_benchmark: Optio
             "net_score": net_score,
             "moderation_mark": moderation_mark,
             "total_score": total_score,
+            "total_submissions": class_sub_counts.get(cls.id, 0),
+            "submitted_categories": cat_list,
             "M": M,
             "academic_score": pillar_scores['Academic'],
             "co_curricular_score": pillar_scores['Co-Curricular'],
@@ -632,12 +719,12 @@ def explain_class_score(cls, academic_year: Optional[str] = None, n_benchmark: O
     M = data["M"]
 
     steps = [
-        f"Step 1 (Net Score): Gross Marks S ({S:.2f}) - Penalty Points P ({P:.2f}) = Net Score ({net:.2f})",
-        f"Step 2 (Moderation Mark): min(200.0, max(0.0, 2.0 * (N ({N}) - n ({n})))) = Moderation ({mod:.2f})",
-        f"Step 3 (Total Moderated Score): max(0.0, Net Score ({net:.2f}) + Moderation ({mod:.2f})) = Total Score ({total:.2f})",
+        f"Step 1 (Net Evaluated Score): S ({S:.2f}) - P ({P:.2f}) = {net:.2f}",
+        f"Step 2 (Cohort Scaling): (S - P) / N² = ({net:.2f}) / ({N}²) = {((net / (N**2)) if N > 0 else 0):.6f}",
+        f"Step 3 (Benchmark Multiplier): 1 + 100 * (N ({N}) - n ({n})) = {1.0 + 100.0 * (N - n):.2f}",
     ]
     if N > 0:
-        steps.append(f"Step 4 (Class Index M): Total Score ({total:.2f}) / Class Size N ({N}) = Class Index M ({M:.4f})")
+        steps.append(f"Step 4 (Class Index M): M = (S - P) / N² * (1 + 100 * (N - n)) = {M:.4f}")
     else:
         steps.append("Step 4 (Class Index M): Class Size N is 0; Class Index is unranked (null)")
 
@@ -645,10 +732,11 @@ def explain_class_score(cls, academic_year: Optional[str] = None, n_benchmark: O
         **data,
         "explanation_steps": steps,
         "formula_spec": {
-            "step_1": "Net Score = S - P",
-            "step_2": "Mod = min(200.0, max(0.0, 2.0 * (N - n)))",
-            "step_3": "Total Score = max(0.0, Net Score + Mod)",
-            "step_4": "Class Index M = Total Score / N",
+            "formula": "M = (S − P) / N² × (1 + 100 × (N − n))",
+            "S": "Evaluated Marks",
+            "P": "Penalties (defined in department management)",
+            "N": "Class Size (defined in department management)",
+            "n": "Smallest Class Benchmark (defined in department management)",
         },
         "breakdown": {
             "Academic": data["academic_score"],
@@ -669,12 +757,8 @@ def verify_scoring_invariants(data: Dict[str, Any]) -> bool:
     """
     N = data.get("N", 0)
     S = data.get("S", 0.0)
-    mod = data.get("moderation_mark", 0.0)
     tot = data.get("total_score", 0.0)
     M = data.get("M")
-
-    if mod < 0.0 or mod > MAX_MODERATION_MARK + 1e-4:
-        raise AssertionError(f"Invariant violation: moderation_mark ({mod}) outside allowed range [0.0, 200.0].")
 
     if tot < 0.0:
         raise AssertionError(f"Invariant violation: total_score ({tot}) cannot be negative.")

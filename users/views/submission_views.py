@@ -89,6 +89,152 @@ HISTORICAL_CRITERIA_TITLES = {
 }
 
 
+def validate_academic_field_positive_integer(field_name, val):
+    """
+    Strictly validates that field_name only permits positive whole numbers (>= 0).
+    Prohibits characters like '-', '+', '*', '/', 'e', 'E', '.', or non-digit entries.
+    Returns (is_valid, cleaned_int_val, error_message).
+    """
+    if val is None or val == '':
+        return True, None, None
+    if isinstance(val, bool):
+        return False, None, f"Field '{field_name}' must be a numeric integer, not boolean."
+    if isinstance(val, str):
+        s_val = val.strip()
+        if not s_val:
+            return True, None, None
+        if not re.match(r'^\d+$', s_val):
+            return False, None, f"Field '{field_name}' must only contain positive whole numbers (no -, +, *, e, etc.)."
+        try:
+            num = int(s_val)
+        except (ValueError, TypeError):
+            return False, None, f"Field '{field_name}' must be a valid positive whole number."
+    elif isinstance(val, (int, float)):
+        if isinstance(val, float) and not val.is_integer():
+            return False, None, f"Field '{field_name}' must be a whole number, not a decimal."
+        num = int(val)
+    else:
+        return False, None, f"Field '{field_name}' must be a positive whole number."
+
+    if num < 0:
+        return False, None, f"Field '{field_name}' cannot be negative. Only positive numbers are permitted."
+    return True, num, None
+
+
+def validate_academic_pass_percentage(val):
+    """
+    Strictly validates that pass_percentage only permits positive numbers between 0 and 100.
+    Prohibits characters like '-', '+', '*', '/', 'e', 'E', or non-numeric entries.
+    Returns (is_valid, cleaned_float_val, error_message).
+    """
+    if val is None or val == '':
+        return True, None, None
+    if isinstance(val, bool):
+        return False, None, "Field 'pass_percentage' must be a number, not boolean."
+    if isinstance(val, str):
+        s_val = val.strip()
+        if not s_val:
+            return True, None, None
+        if not re.match(r'^\d+(\.\d+)?$', s_val):
+            return False, None, "Field 'pass_percentage' must only contain positive numbers between 0 and 100 (no -, +, *, e, etc.)."
+        try:
+            num = float(s_val)
+        except (ValueError, TypeError):
+            return False, None, "Field 'pass_percentage' must be a valid number."
+    elif isinstance(val, (int, float)):
+        num = float(val)
+    else:
+        return False, None, "Field 'pass_percentage' must be a positive number between 0 and 100."
+
+    if num < 0.0 or num > 100.0:
+        return False, None, "Field 'pass_percentage' must be a positive number between 0.0 and 100.0."
+    return True, num, None
+
+
+def validate_academic_submission_payload(request_data, evidence, gb_data, proof, description, is_submit=False):
+    """
+    Validates all academic fields across request_data, evidence, and grade_breakdown:
+    - count_90_above, count_80_90, count_70_80, count_fail: must be positive integers (no -, +, *, e, etc.)
+    - pass_percentage: must be positive float/int between 0 and 100 (no -, +, *, e, etc.)
+    - proof_url: must be provided if is_submit is True
+    - description: must be a valid text string if provided
+    Returns (is_valid, parsed_data_dict, error_message).
+    """
+    if is_submit and not proof:
+        return False, {}, "proof_url is required for academic submissions."
+
+    if description is not None and not isinstance(description, str):
+        return False, {}, "description must be a valid text string."
+
+    req_d = request_data if isinstance(request_data, dict) else {}
+    ev_d = evidence if isinstance(evidence, dict) else {}
+    gb_d = gb_data if isinstance(gb_data, dict) else {}
+    grades_d = ev_d.get('grades') if isinstance(ev_d.get('grades'), dict) else {}
+
+    field_sources = [req_d, gb_d, ev_d]
+
+    count_field_aliases = {
+        'count_90_above': ['count_90_above', 'count90Above', 's_grade_count', 'S'],
+        'count_80_90': ['count_80_90', 'count80to90', 'a_plus_grade_count', 'APlus'],
+        'count_70_80': ['count_70_80', 'count70to80', 'a_grade_count', 'A'],
+        'count_fail': ['count_fail', 'failCount', 'failed_count', 'Fail'],
+    }
+
+    parsed = {}
+    for canonical_field, aliases in count_field_aliases.items():
+        found_val = None
+        for alias in aliases:
+            for src in field_sources:
+                if alias in src and src[alias] is not None and src[alias] != '':
+                    found_val = src[alias]
+                    break
+            if found_val is not None:
+                break
+            if alias in grades_d and grades_d[alias] is not None and grades_d[alias] != '':
+                found_val = grades_d[alias]
+                break
+
+        is_valid, clean_num, err_msg = validate_academic_field_positive_integer(canonical_field, found_val)
+        if not is_valid:
+            return False, {}, err_msg
+        parsed[canonical_field] = clean_num
+
+    # pass_percentage
+    found_pct = None
+    for alias in ['pass_percentage', 'passPercentage', 'class_pass_percentage', 'classPassPercentage']:
+        for src in field_sources:
+            if alias in src and src[alias] is not None and src[alias] != '':
+                found_pct = src[alias]
+                break
+        if found_pct is not None:
+            break
+
+    is_valid_pct, clean_pct, err_msg_pct = validate_academic_pass_percentage(found_pct)
+    if not is_valid_pct:
+        return False, {}, err_msg_pct
+    parsed['pass_percentage'] = clean_pct
+
+    # total_students if provided
+    total_stu_val = None
+    for alias in ['total_students', 'totalStudents']:
+        for src in field_sources:
+            if alias in src and src[alias] is not None and src[alias] != '':
+                total_stu_val = src[alias]
+                break
+        if total_stu_val is not None:
+            break
+
+    if total_stu_val is not None and total_stu_val != '':
+        is_valid_t, clean_t, err_msg_t = validate_academic_field_positive_integer('total_students', total_stu_val)
+        if not is_valid_t:
+            return False, {}, err_msg_t
+        parsed['total_students'] = clean_t
+    else:
+        parsed['total_students'] = None
+
+    return True, parsed, None
+
+
 def resolve_criteria_item(criteria_id, data=None, submission=None):
     if not criteria_id:
         return None
@@ -200,7 +346,46 @@ class SubmissionListView(APIView):
         if not user or not user.is_authenticated:
             return Response({"error": "Authentication credentials were not provided."}, status=status.HTTP_401_UNAUTHORIZED)
 
-        criteria_id = request.data.get('criteriaId')
+        criteria_id = request.data.get('criteriaId') or request.data.get('criteria_id')
+        if not criteria_id:
+            cat_id = request.data.get('category_id') or request.data.get('categoryId')
+            subcat_id = request.data.get('subcategory_id') or request.data.get('subcategoryId')
+            if subcat_id:
+                from users.models import SubCategory, CriteriaCategory
+                sub_obj = SubCategory.objects.filter(pk=subcat_id).first()
+                if sub_obj:
+                    crit_item_cand = CriteriaItem.objects.filter(title__icontains=sub_obj.subcategory_name).first()
+                    if not crit_item_cand and sub_obj.category:
+                        crit_item_cand = CriteriaItem.objects.filter(category__code__icontains=sub_obj.category.code).first()
+                    if not crit_item_cand:
+                        cc = CriteriaCategory.objects.filter(code=sub_obj.category.code).first() if sub_obj.category else None
+                        if not cc and sub_obj.category:
+                            cc = CriteriaCategory.objects.create(category=sub_obj.category.name, code=sub_obj.category.code)
+                        crit_item_cand = CriteriaItem.objects.create(
+                            category=cc,
+                            title=sub_obj.subcategory_name,
+                            type='fixed',
+                            marks=float(sub_obj.default_marks)
+                        )
+                    if crit_item_cand:
+                        criteria_id = crit_item_cand.id
+            elif cat_id:
+                crit_item_cand = CriteriaItem.objects.filter(category__id=cat_id).first()
+                if not crit_item_cand:
+                    from users.models import Category, CriteriaCategory
+                    cat_obj = Category.objects.filter(id=cat_id).first()
+                    if cat_obj:
+                        cc = CriteriaCategory.objects.filter(code=cat_obj.code).first()
+                        if not cc:
+                            cc = CriteriaCategory.objects.create(category=cat_obj.name, code=cat_obj.code)
+                        crit_item_cand = CriteriaItem.objects.create(
+                            category=cc,
+                            title=cat_obj.name,
+                            type='fixed',
+                            marks=10.0
+                        )
+                        criteria_id = crit_item_cand.id
+
         if not criteria_id:
             return Response({"error": "criteriaId is required"}, status=status.HTTP_400_BAD_REQUEST)
         try:
@@ -225,6 +410,9 @@ class SubmissionListView(APIView):
 
         description = request.data.get('description', '')
         clean_desc = str(description).strip()
+        cat_code_chk = (criteria_item.category.code or '').lower() if (criteria_item and criteria_item.category) else ''
+        if not clean_desc and ('academic' in cat_code_chk or (criteria_item and criteria_item.type == 'academic_grades')):
+            clean_desc = f"Sem Result (End Semester Examination) — {criteria_item.title}"
         if not clean_desc:
             return Response({"error": "description is required and cannot be empty."}, status=status.HTTP_400_BAD_REQUEST)
         if len(clean_desc) > 5000:
@@ -236,14 +424,14 @@ class SubmissionListView(APIView):
 
         # Validate workflow status on creation: client cannot set privileged or terminal states
         if user_role == 'student':
-            if raw_status is not None and raw_status not in ('Draft', 'Submitted', 'Pending Verification', 'Pending Rep Verification'):
+            if raw_status is not None and raw_status not in ('Draft', 'Submitted', 'Pending Verification', 'Pending Rep Verification', 'DQC_PENDING'):
                 return Response(
                     {"error": "Unauthorized: Students cannot create submissions in verified, evaluated, or locked status."},
                     status=status.HTTP_403_FORBIDDEN
                 )
-            status_val = raw_status if raw_status else 'Draft'
+            status_val = raw_status if raw_status else 'DQC_PENDING'
         else:
-            status_val = raw_status if raw_status else 'Pending Verification'
+            status_val = raw_status if raw_status else 'DQC_PENDING'
             if status_val not in dict(Submission.STATUS_CHOICES):
                 return Response({"error": f"Invalid status: '{status_val}'."}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -251,7 +439,7 @@ class SubmissionListView(APIView):
         if remarks and len(str(remarks)) > 2000:
             return Response({"error": "remarks cannot exceed 2000 characters."}, status=status.HTTP_400_BAD_REQUEST)
 
-        proof = request.data.get('proof', '')
+        proof = request.data.get('proof', '') or request.data.get('proof_url', '')
         if proof:
             raw_proof = str(proof).strip()
             if '..' in raw_proof or raw_proof.startswith('/') or raw_proof.startswith('\\'):
@@ -410,29 +598,60 @@ class SubmissionListView(APIView):
                     pass
 
         # Academic Grade Breakdown Validation & Auto-Calculation
-        if isinstance(evidence, dict) and "grades" in evidence:
-            grades_data = evidence.get("grades") or {}
-            s_cnt = int(grades_data.get("S", 0))
-            ap_cnt = int(grades_data.get("APlus", 0))
-            a_cnt = int(grades_data.get("A", 0))
-            fail_cnt = int(grades_data.get("Fail", 0))
-            t_students = int(evidence.get("totalStudents", 0))
+        is_academic_cat = (
+            (criteria_item.type == 'academic_grades') or
+            ('academics' in cat_code) or
+            ('academics' in cat_name) or
+            (isinstance(evidence, dict) and evidence.get('type') == 'academic_marks') or
+            (isinstance(request.data.get('grade_breakdown'), dict))
+        )
 
-            if s_cnt < 0 or ap_cnt < 0 or a_cnt < 0 or fail_cnt < 0 or t_students < 0:
-                return Response({"error": "Grade counts and total students cannot be negative."}, status=status.HTTP_400_BAD_REQUEST)
+        s_cnt, ap_cnt, a_cnt, fail_cnt, t_students, pass_pct = 0, 0, 0, 0, 0, 0.0
+        if is_academic_cat:
+            is_submitting = status_val in ('Submitted', 'SUBMITTED', 'Pending Rep Verification', 'Pending', 'Student Rep Verified')
+            is_valid_acad, parsed_acad, acad_err = validate_academic_submission_payload(
+                request_data=request.data,
+                evidence=evidence,
+                gb_data=request.data.get('grade_breakdown'),
+                proof=proof,
+                description=description,
+                is_submit=is_submitting
+            )
+            if not is_valid_acad:
+                return Response({"error": acad_err}, status=status.HTTP_400_BAD_REQUEST)
 
+            s_cnt = parsed_acad.get('count_90_above') or 0
+            ap_cnt = parsed_acad.get('count_80_90') or 0
+            a_cnt = parsed_acad.get('count_70_80') or 0
+            fail_cnt = parsed_acad.get('count_fail') or 0
             g_sum = s_cnt + ap_cnt + a_cnt + fail_cnt
+
+            t_students = parsed_acad.get('total_students') or 0
             if t_students <= 0:
                 t_students = max(1, g_sum)
-                evidence["totalStudents"] = t_students
 
             if g_sum > t_students:
                 return Response({"error": f"Sum of student grades ({g_sum}) exceeds total class students ({t_students})."}, status=status.HTTP_400_BAD_REQUEST)
 
             passed = max(0, t_students - fail_cnt)
-            pass_pct = round((passed / float(t_students)) * 100.0, 2)
+            if parsed_acad.get('pass_percentage') is not None:
+                pass_pct = parsed_acad['pass_percentage']
+            elif g_sum > 0 and t_students > 0:
+                pass_pct = round((passed / float(t_students)) * 100.0, 2)
+            else:
+                pass_pct = 0.0
+
+            if not isinstance(evidence, dict):
+                evidence = {}
+
             evidence["classPassPercentage"] = pass_pct
             evidence["passCount"] = passed
+            evidence["count_90_above"] = s_cnt
+            evidence["count_80_90"] = ap_cnt
+            evidence["count_70_80"] = a_cnt
+            evidence["count_fail"] = fail_cnt
+            evidence["pass_percentage"] = pass_pct
+            evidence["totalStudents"] = t_students
 
         # Extract certificate ID and proof hash for duplicate detection
         cert_id = request.data.get('certificateId') or request.data.get('eventId')
@@ -472,7 +691,17 @@ class SubmissionListView(APIView):
 
         # Academic Grade Breakdown: AcademicGradeBreakdown is the authoritative relational source
         gb_data = request.data.get('grade_breakdown')
-        if not gb_data and isinstance(evidence, dict) and "grades" in evidence:
+        if not gb_data and is_academic_cat:
+            gb_data = {
+                "s_grade_count": s_cnt,
+                "a_plus_grade_count": ap_cnt,
+                "a_grade_count": a_cnt,
+                "other_pass_count": 0,
+                "failed_count": fail_cnt,
+                "total_students": t_students,
+                "class_pass_percentage": pass_pct
+            }
+        elif not gb_data and isinstance(evidence, dict) and "grades" in evidence:
             ev_g = evidence.get('grades') or {}
             gb_data = {
                 "s_grade_count": ev_g.get("S", 0),
@@ -483,13 +712,7 @@ class SubmissionListView(APIView):
                 "total_students": evidence.get("totalStudents", 0)
             }
 
-        # Clean evidence to avoid duplicating grade data in JSON
         clean_evidence = dict(evidence or {}) if isinstance(evidence, dict) else {}
-        clean_evidence.pop("grades", None)
-        clean_evidence.pop("markBreakdown", None)
-        clean_evidence.pop("classPassPercentage", None)
-        clean_evidence.pop("totalStudents", None)
-        clean_evidence.pop("passCount", None)
 
         # Resolve SubCategory for categories containing subcategories
         c_item = CriteriaItem.objects.filter(pk=criteria_id_int).select_related('category').first()
@@ -514,7 +737,8 @@ class SubmissionListView(APIView):
                 evidence=evidence
             )
 
-        if subcat:
+        is_academic_item = (c_item and c_item.type == 'academic_grades') or (c_category and c_category.code == 'cat-academics')
+        if subcat and not is_academic_item:
             # Strictly driven by subcategory.default_marks
             count_val = 1
             if (c_item and c_item.type == 'count') or (isinstance(evidence, dict) and 'count' in evidence):
@@ -522,17 +746,36 @@ class SubmissionListView(APIView):
                     count_val = max(1, int(evidence.get('count', 1)))
                 except (ValueError, TypeError):
                     count_val = 1
-            calculated_marks = float(subcat.default_marks) * count_val
-            marks = int(round(calculated_marks))
+            expected_marks = float(subcat.default_marks) * count_val
+            if status_val in ('Approved', 'APPROVED', 'Evaluated', 'Locked', 'Submitted'):
+                calculated_marks = expected_marks
+                marks = int(round(calculated_marks))
+            else:
+                calculated_marks = 0.0
+                marks = None
             subcat_id_to_store = subcat.id
         else:
-            subcat_id_to_store = None
-            if marks is None:
-                if c_item:
-                    marks = calculate_submission_score(c_item, evidence)
-                calculated_marks = float(marks) if marks is not None else None
+            subcat_id_to_store = subcat.id if subcat else None
+            if c_item:
+                if is_academic_item or is_academic_cat:
+                    gb = request.data.get('grade_breakdown') or (gb_data if isinstance(gb_data, dict) else {})
+                    for k in ('count_90_above', 'count_80_90', 'count_70_80', 'count_fail', 'pass_percentage'):
+                        if isinstance(evidence, dict) and k in evidence:
+                            clean_evidence[k] = evidence[k]
+                        elif k in gb:
+                            clean_evidence[k] = gb[k]
+                        elif k in request.data:
+                            clean_evidence[k] = request.data[k]
+                computed = calculate_submission_score(c_item, clean_evidence)
+                if status_val in ('Approved', 'APPROVED', 'Evaluated', 'Locked', 'Submitted'):
+                    calculated_marks = float(computed) if computed is not None else 0.0
+                    marks = int(round(calculated_marks))
+                else:
+                    calculated_marks = 0.0
+                    marks = None
             else:
-                calculated_marks = float(marks)
+                calculated_marks = 0.0
+                marks = None
 
         try:
             with transaction.atomic():
@@ -680,9 +923,10 @@ class SubmissionDetailView(APIView):
 
         is_owner = (submission.user_id == user.id)
         user_role = getattr(user, 'role', None)
-        sub_class = submission.user.class_name if submission.user else None
+        sub_class = getattr(submission, 'class_obj', None) or (submission.user.class_name if submission.user else None)
         from users.workflow import is_user_student_rep_for_class, is_user_class_advisor, is_evaluator_assigned_to_item
         is_rep_for_class = is_user_student_rep_for_class(user, sub_class)
+        is_class_advisor = is_user_class_advisor(user, sub_class)
 
         req_role_context = (
             request.data.get('role_context') or
@@ -704,15 +948,24 @@ class SubmissionDetailView(APIView):
             effective_role = 'evaluation'
         elif req_role_context in ('teacher', 'faculty'):
             effective_role = 'faculty'
-        elif user_role == 'faculty' and is_eval_assigned:
+        elif is_class_advisor and (
+            request.data.get('teacherVerifiedByName') or
+            request.data.get('teacherRemarks') or
+            request.data.get('status') in ('Teacher Verified', 'Approved') or
+            submission.status in ('Submitted', 'Pending Rep Verification', 'Student Rep Verified')
+        ):
+            effective_role = 'faculty'
+        elif user_role in ('faculty', 'staff') and is_eval_assigned:
             is_eval_action = (
                 request.data.get('status') in ('Evaluated', 'Approved') or
                 request.data.get('evaluatorVerified') is True or
                 request.data.get('actionType') == 'APPROVE_AND_CREDIT' or
                 'evaluatorRemarks' in request.data or
+                'evaluatorVerifiedByName' in request.data or
+                req_role_context in ('evaluator', 'evaluation') or
                 submission.status in ('Teacher Verified', 'EVALUATOR_PENDING')
             )
-            if is_eval_action or not is_user_class_advisor(user, sub_class):
+            if is_eval_action or not is_class_advisor:
                 effective_role = 'evaluation'
 
         if user_role == 'student':
@@ -761,7 +1014,7 @@ class SubmissionDetailView(APIView):
                     {"error": "You do not have permission to modify this submission."},
                     status=status.HTTP_403_FORBIDDEN
                 )
-        elif effective_role == 'faculty':
+        elif effective_role in ('faculty', 'staff', 'teacher'):
             is_class_teacher = is_user_class_advisor(user, sub_class)
             is_same_dept = bool(submission.user and user.department_id and (submission.user.department_id == user.department_id))
             if not (is_class_teacher or is_same_dept):
@@ -947,16 +1200,37 @@ class SubmissionDetailView(APIView):
 
         upd_ev = request.data.get('evidence', submission.evidence)
         gb_sync_defaults = None
-        if isinstance(gb_data, dict):
-            s_cnt = int(gb_data.get('s_grade_count', 0) or 0)
-            ap_cnt = int(gb_data.get('a_plus_grade_count', 0) or 0)
-            a_cnt = int(gb_data.get('a_grade_count', 0) or 0)
-            oth_cnt = int(gb_data.get('other_pass_count', 0) or 0)
-            fail_cnt = int(gb_data.get('failed_count', 0) or 0)
-            t_students = int(gb_data.get('total_students', 0) or 0)
 
-            if s_cnt < 0 or ap_cnt < 0 or a_cnt < 0 or oth_cnt < 0 or fail_cnt < 0 or t_students < 0:
-                return Response({"error": "Grade counts and total students cannot be negative."}, status=status.HTTP_400_BAD_REQUEST)
+        crit_for_acad = CriteriaItem.objects.filter(pk=target_criteria_id).select_related('category').first()
+        acad_cat_code = ((crit_for_acad.category.code or '') if (crit_for_acad and crit_for_acad.category) else '').strip().lower()
+        acad_cat_name = ((crit_for_acad.category.category or '') if (crit_for_acad and crit_for_acad.category) else '').strip().lower()
+        is_acad_update = (acad_cat_code == 'cat-academics' or 'academic' in acad_cat_name or (crit_for_acad and crit_for_acad.type == 'academic_grades') or isinstance(gb_data, dict))
+
+        if is_acad_update:
+            is_submitting = target_status in ('Submitted', 'SUBMITTED', 'Pending Rep Verification', 'Pending', 'Student Rep Verified')
+            check_proof = request.data.get('proof') or request.data.get('proof_url') or submission.proof
+            check_desc = request.data.get('description', submission.description)
+            is_valid_acad, parsed_acad, acad_err = validate_academic_submission_payload(
+                request_data=request.data,
+                evidence=upd_ev,
+                gb_data=gb_data,
+                proof=check_proof,
+                description=check_desc,
+                is_submit=is_submitting
+            )
+            if not is_valid_acad:
+                return Response({"error": acad_err}, status=status.HTTP_400_BAD_REQUEST)
+
+            s_cnt = parsed_acad.get('count_90_above') or 0
+            ap_cnt = parsed_acad.get('count_80_90') or 0
+            a_cnt = parsed_acad.get('count_70_80') or 0
+            oth_cnt = 0
+            if isinstance(gb_data, dict):
+                oth_cnt = int(gb_data.get('other_pass_count', 0) or 0)
+            fail_cnt = parsed_acad.get('count_fail') or 0
+            t_students = parsed_acad.get('total_students') or 0
+            if t_students <= 0 and (s_cnt or ap_cnt or a_cnt or oth_cnt or fail_cnt):
+                t_students = s_cnt + ap_cnt + a_cnt + oth_cnt + fail_cnt
 
             passed = max(0, t_students - fail_cnt)
             if oth_cnt <= 0 and passed > (s_cnt + ap_cnt + a_cnt):
@@ -969,7 +1243,13 @@ class SubmissionDetailView(APIView):
             if g_sum != t_students:
                 return Response({"error": f"Sum of grade counts ({g_sum}) must strictly equal total students ({t_students})."}, status=status.HTTP_400_BAD_REQUEST)
 
-            pass_pct = round((passed / float(t_students)) * 100.0, 2)
+            if parsed_acad.get('pass_percentage') is not None:
+                pass_pct = parsed_acad['pass_percentage']
+            elif g_sum > 0 and t_students > 0:
+                pass_pct = round((passed / float(t_students)) * 100.0, 2)
+            else:
+                pass_pct = 0.0
+
             gb_sync_defaults = {
                 "s_grade_count": s_cnt,
                 "a_plus_grade_count": ap_cnt,
@@ -1119,7 +1399,7 @@ class SubmissionDetailView(APIView):
                 crit_to_check = CriteriaItem.objects.filter(pk=extra_updates.get('criteria_id', submission.criteria_id)).select_related('category').first()
                 if crit_to_check and crit_to_check.category:
                     cat_code_check = (crit_to_check.category.code or '').strip().lower()
-                    if cat_code_check not in ('cat-academics', 'cat-career-advancement', 'cat-documentation'):
+                    if cat_code_check not in ('cat-academics', 'cat-career-advancement'):
                         from users.models import SubCategory
                         sub_to_find = extra_updates.get('subcategory_id', submission.subcategory_id)
                         matched_sub = SubCategory.find_subcategory(
@@ -1138,9 +1418,29 @@ class SubmissionDetailView(APIView):
                                 except (ValueError, TypeError):
                                     count_val = 1
                             calculated_val = float(matched_sub.default_marks) * count_val
+                            if target_status in ('Approved', 'APPROVED', 'Evaluated', 'Locked'):
+                                extra_updates['calculated_marks'] = calculated_val
+                                if marks_val is None or user_role == 'student':
+                                    marks_val = calculated_val
+                            else:
+                                extra_updates['calculated_marks'] = 0.0
+                                marks_val = None
+                    elif cat_code_check == 'cat-academics' or crit_to_check.type == 'academic_grades':
+                        ev_for_score = dict(upd_ev or {})
+                        if isinstance(gb_data, dict):
+                            for k in ('count_90_above', 'count_80_90', 'count_70_80', 'count_fail', 'pass_percentage'):
+                                if k in gb_data:
+                                    ev_for_score[k] = gb_data[k]
+                                elif k in request.data:
+                                    ev_for_score[k] = request.data[k]
+                        calculated_val = float(calculate_submission_score(crit_to_check, ev_for_score))
+                        if target_status in ('Approved', 'APPROVED', 'Evaluated', 'Locked'):
                             extra_updates['calculated_marks'] = calculated_val
                             if marks_val is None or user_role == 'student':
                                 marks_val = calculated_val
+                        else:
+                            extra_updates['calculated_marks'] = 0.0
+                            marks_val = None
 
                 action_type = request.data.get('actionType') or request.data.get('action')
 

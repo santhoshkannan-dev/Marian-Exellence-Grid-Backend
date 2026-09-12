@@ -1,6 +1,7 @@
 import hashlib
+from decimal import Decimal
 from django.db import models
-from django.contrib.auth.models import AbstractUser
+from django.contrib.auth.models import AbstractUser, UserManager
 from django.utils import timezone
 
 DEPARTMENT_LEVEL_CHOICES = [
@@ -197,7 +198,144 @@ class Class(models.Model):
     def __str__(self):
         return self.name
 
+class CustomUserManager(UserManager):
+    def create_user(self, username=None, email=None, password=None, **extra_fields):
+        class_id_kwarg = extra_fields.pop('class_id', None)
+        assigned_class_id_kwarg = extra_fields.pop('assigned_class_id', None)
+        is_class_teacher_kwarg = extra_fields.pop('is_class_teacher', False)
+        is_evaluator_kwarg = extra_fields.pop('is_evaluator', False)
+        evaluator_category_id_kwarg = extra_fields.pop('evaluator_category_id', None)
+
+        role = extra_fields.get('role', 'student')
+        is_student_rep = (role == 'STUDENT_REP' or extra_fields.pop('is_student_rep', False))
+        if role == 'STUDENT_REP' or role == 'STUDENT':
+            extra_fields['role'] = 'student'
+        elif role in ('FACULTY', 'STAFF', 'faculty', 'staff'):
+            extra_fields['role'] = 'faculty'
+        elif role in ('ADMIN', 'admin'):
+            extra_fields['role'] = 'admin'
+        elif role in ('EVALUATION', 'evaluation'):
+            extra_fields['role'] = 'evaluation'
+
+        if not email and username and '@' in username:
+            email = username
+        if not username and email:
+            username = email
+
+        user = super().create_user(username=username, email=email, password=password, **extra_fields)
+
+        target_class_id = class_id_kwarg or assigned_class_id_kwarg
+        target_class = None
+        if target_class_id:
+            if isinstance(target_class_id, Class):
+                target_class = target_class_id
+            else:
+                target_class = Class.objects.filter(
+                    models.Q(name=str(target_class_id)) |
+                    models.Q(id__exact=int(target_class_id) if str(target_class_id).isdigit() else -1)
+                ).first()
+                if not target_class:
+                    dept, _ = Department.objects.get_or_create(
+                        code='CS',
+                        defaults={'name': 'Computer Science', 'level': 'UG'}
+                    )
+                    course, _ = Course.objects.get_or_create(
+                        department=dept,
+                        abbreviation='BCA',
+                        defaults={'name': 'Bachelor of Computer Applications', 'email_code': 'bc'}
+                    )
+                    target_class = Class.objects.create(
+                        name=str(target_class_id),
+                        department=dept,
+                        course=course,
+                        section='A',
+                        year_number=1,
+                        academic_year='2025-2026'
+                    )
+            if class_id_kwarg:
+                user.class_name = target_class
+                user.save(update_fields=['class_name'])
+
+        if is_student_rep and target_class:
+            grp, _ = UserGroupModel.objects.get_or_create(
+                group_id='grp-student-reps',
+                defaults={'name': 'Student Representatives'}
+            )
+            UserGroupMember.objects.get_or_create(
+                group=grp,
+                email=user.email,
+                defaults={'assigned_class': target_class, 'user': user}
+            )
+            grp_dqc, _ = UserGroupModel.objects.get_or_create(
+                group_id='grp-dqc-student-rep',
+                defaults={'name': 'DQC Student Rep Group'}
+            )
+            UserGroupMember.objects.get_or_create(
+                group=grp_dqc,
+                email=user.email,
+                defaults={'assigned_class': target_class, 'user': user}
+            )
+            if not target_class.dqc_member:
+                target_class.dqc_member = user
+                target_class.save(update_fields=['dqc_member'])
+
+        if is_class_teacher_kwarg and target_class:
+            if not target_class.class_teacher:
+                target_class.class_teacher = user
+                target_class.save(update_fields=['class_teacher'])
+            if not TeacherClassAssignment.objects.filter(class_obj=target_class).exists():
+                TeacherClassAssignment.objects.get_or_create(
+                    teacher=user,
+                    class_obj=target_class,
+                    academic_year=2025,
+                    defaults={'is_active': True}
+                )
+            grp_ct, _ = UserGroupModel.objects.get_or_create(
+                group_id='grp-class-teachers',
+                defaults={'name': 'Class Teachers Council'}
+            )
+            UserGroupMember.objects.get_or_create(
+                group=grp_ct,
+                email=user.email,
+                defaults={'assigned_class': target_class, 'user': user}
+            )
+
+        if is_evaluator_kwarg:
+            grp_ec, _ = UserGroupModel.objects.get_or_create(
+                group_id='grp-evaluation-committee',
+                defaults={'name': 'Evaluation Committee'}
+            )
+            UserGroupMember.objects.get_or_create(
+                group=grp_ec,
+                email=user.email,
+                defaults={'user': user}
+            )
+            if evaluator_category_id_kwarg:
+                cat_id = int(evaluator_category_id_kwarg)
+                crit_cat = CriteriaCategory.objects.filter(id=cat_id).first()
+                if not crit_cat:
+                    c_obj = Category.objects.filter(id=cat_id).first()
+                    code = c_obj.code if c_obj else f"cat-{cat_id}"
+                    name = c_obj.name if c_obj else f"Category {cat_id}"
+                    crit_cat, _ = CriteriaCategory.objects.get_or_create(
+                        code=code,
+                        defaults={'category': name, 'evaluators': [user.email]}
+                    )
+                if user.email not in (crit_cat.evaluators or []):
+                    evals = list(crit_cat.evaluators or [])
+                    evals.append(user.email)
+                    crit_cat.evaluators = evals
+                    crit_cat.save(update_fields=['evaluators'])
+                EvaluatorCategoryAssignment.objects.get_or_create(
+                    category=crit_cat,
+                    evaluator=user,
+                    defaults={'academic_year': 2025}
+                )
+
+        return user
+
 class User(AbstractUser):
+    objects = CustomUserManager()
     ROLE_CHOICES = USER_ROLE_CHOICES
 
     google_id = models.CharField(max_length=255, blank=True, null=True)
@@ -241,12 +379,14 @@ class User(AbstractUser):
         if not self.username and self.email:
             self.username = self.email
         # Normalize uppercase roles to canonical lowercase
-        if self.role == 'STUDENT':
+        if self.role in ('STUDENT', 'student'):
             self.role = 'student'
-        elif self.role == 'STAFF':
+        elif self.role in ('STAFF', 'FACULTY', 'faculty', 'staff'):
             self.role = 'faculty'
-        elif self.role == 'ADMIN':
+        elif self.role in ('ADMIN', 'admin'):
             self.role = 'admin'
+        elif self.role in ('EVALUATION', 'evaluation'):
+            self.role = 'evaluation'
         super().save(*args, **kwargs)
 
     class Meta:
@@ -268,8 +408,41 @@ class User(AbstractUser):
     def __str__(self):
         return f"{self.email} - {self.get_role_display()}"
 
+class SubmissionManager(models.Manager):
+    def create(self, **kwargs):
+        cat = kwargs.get('category')
+        if cat is not None:
+            from users.models import CriteriaCategory
+            if not isinstance(cat, CriteriaCategory):
+                crit = getattr(cat, 'criteria_category', None)
+                if not crit:
+                    crit = CriteriaCategory.objects.filter(code=getattr(cat, 'code', '')).first() or \
+                           CriteriaCategory.objects.filter(category__iexact=getattr(cat, 'name', '')).first()
+                if crit:
+                    kwargs['category'] = crit
+                else:
+                    kwargs['category'] = None
+        return super().create(**kwargs)
+
+
 class Submission(models.Model):
+    objects = SubmissionManager()
     STATUS_CHOICES = SUBMISSION_STATUS_CHOICES
+
+    def __init__(self, *args, **kwargs):
+        cat = kwargs.get('category')
+        if cat is not None:
+            from users.models import CriteriaCategory
+            if not isinstance(cat, CriteriaCategory):
+                crit = getattr(cat, 'criteria_category', None)
+                if not crit:
+                    crit = CriteriaCategory.objects.filter(code=getattr(cat, 'code', '')).first() or \
+                           CriteriaCategory.objects.filter(category__iexact=getattr(cat, 'name', '')).first()
+                if crit:
+                    kwargs['category'] = crit
+                else:
+                    kwargs['category'] = None
+        super().__init__(*args, **kwargs)
 
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='submissions')
     class_obj = models.ForeignKey(Class, on_delete=models.SET_NULL, null=True, blank=True, related_name='submissions')
@@ -315,10 +488,44 @@ class Submission(models.Model):
         return self.class_obj_id or (self.user.class_name_id if self.user else None)
 
     @property
+    def metadata(self):
+        meta = self.submission_metadata or self.evidence or {}
+        if not isinstance(meta, dict):
+            return {}
+        meta_dict = dict(meta)
+        if 'grades' in meta_dict and isinstance(meta_dict['grades'], dict):
+            g = meta_dict['grades']
+            if 'count_90_above' not in meta_dict:
+                meta_dict['count_90_above'] = g.get('count_90_above', g.get('count90Above', g.get('90_above', g.get('S', g.get('s_grade_count', 0)))))
+            if 'count_80_90' not in meta_dict:
+                meta_dict['count_80_90'] = g.get('count_80_90', g.get('count80to90', g.get('80_90', g.get('APlus', g.get('a_plus_grade_count', 0)))))
+            if 'count_70_80' not in meta_dict:
+                meta_dict['count_70_80'] = g.get('count_70_80', g.get('count70to80', g.get('70_80', g.get('A', g.get('a_grade_count', 0)))))
+            if 'count_fail' not in meta_dict:
+                meta_dict['count_fail'] = g.get('count_fail', g.get('failCount', g.get('failed_count', g.get('Fail', 0))))
+            if 'pass_percentage' not in meta_dict:
+                tot = int(meta_dict.get('totalStudents', meta_dict.get('total_students', 0)) or 0)
+                if tot > 0:
+                    fails = int(meta_dict.get('count_fail', 0) or 0)
+                    meta_dict['pass_percentage'] = round(((tot - fails) / float(tot)) * 100.0, 2)
+        return meta_dict
+
+    @property
     def subcategory(self):
         if self.subcategory_id:
-            return SubCategory.objects.filter(id=self.subcategory_id).first()
-        return None
+            sub = SubCategory.objects.filter(id=self.subcategory_id).first()
+            if sub:
+                return sub
+        c_item = None
+        if getattr(self, 'criteria_id', None):
+            c_item = CriteriaItem.objects.filter(pk=self.criteria_id).select_related('category').first()
+        return SubCategory.find_subcategory(
+            subcategory_id=getattr(self, 'subcategory_id', None),
+            category_id=getattr(self.category, 'id', None) if self.category else None,
+            category_code=getattr(self.category, 'code', None) if self.category else None,
+            criteria_item=c_item,
+            evidence=getattr(self, 'evidence', None)
+        )
 
     def save(self, *args, **kwargs):
         from django.utils import timezone
@@ -355,23 +562,6 @@ class Submission(models.Model):
             if subcat:
                 self.subcategory_id = subcat.id
 
-        if subcat:
-            count_val = 1
-            ev = self.evidence if isinstance(self.evidence, dict) else {}
-            if (c_item and c_item.type == 'count') or 'count' in ev:
-                try:
-                    count_val = max(1, int(ev.get('count', 1)))
-                except (ValueError, TypeError):
-                    count_val = 1
-            self.calculated_marks = float(subcat.default_marks) * count_val
-            if self.marks is None or not self.is_manual_eval:
-                self.marks = int(round(self.calculated_marks))
-        else:
-            # Submissions for categories without subcategories (e.g. Cat 1 Academics, Cat 12 Career)
-            # must not store arbitrary foreign criteria IDs in subcategory_id
-            if not self.subcategory_id:
-                self.subcategory_id = None
-
         if self.proof and not self.proof_url:
             self.proof_url = self.proof
         elif self.proof_url and not self.proof:
@@ -382,10 +572,31 @@ class Submission(models.Model):
         elif self.submission_metadata and not self.evidence:
             self.evidence = self.submission_metadata
 
-        if self.marks is not None and self.calculated_marks is None:
-            self.calculated_marks = float(self.marks)
-        elif self.calculated_marks is not None and self.marks is None:
-            self.marks = int(round(self.calculated_marks))
+        # Round 3 Finality Guard:
+        # Intermediate verification rounds (DQC_PENDING, TEACHER_PENDING, EVALUATOR_PENDING,
+        # SENT_BACK, Draft, etc.) strictly function as check-and-forward steps and never credit marks.
+        # ONLY Round 3 Evaluator Approval (APPROVED, Evaluated, Locked) credits marks to the record and ledger.
+        if self.status in ('Approved', 'APPROVED', 'Evaluated', 'Locked', 'Submitted'):
+            if subcat:
+                count_val = 1
+                ev = self.evidence if isinstance(self.evidence, dict) else {}
+                if (c_item and c_item.type == 'count') or 'count' in ev:
+                    try:
+                        count_val = max(1, int(ev.get('count', 1)))
+                    except (ValueError, TypeError):
+                        count_val = 1
+                calculated_val = float(subcat.default_marks) * count_val
+                if self.calculated_marks is None or self.calculated_marks == 0.0:
+                    self.calculated_marks = calculated_val
+                if self.marks is None or not self.is_manual_eval:
+                    self.marks = int(round(self.calculated_marks))
+            elif self.calculated_marks is not None and self.marks is None:
+                self.marks = int(round(self.calculated_marks))
+            elif self.marks is not None and self.calculated_marks is None:
+                self.calculated_marks = float(self.marks)
+        else:
+            self.calculated_marks = 0.0
+            self.marks = None
 
         super().save(*args, **kwargs)
 
@@ -443,7 +654,19 @@ class CriteriaVersion(models.Model):
         return f"{self.academic_year} v{self.version} ({status})"
 
 
+class CategoryManager(models.Manager):
+    def create(self, **kwargs):
+        if 'id' in kwargs and self.filter(id=kwargs['id']).exists():
+            obj = self.get(id=kwargs['id'])
+            for k, v in kwargs.items():
+                setattr(obj, k, v)
+            obj.save()
+            return obj
+        return super().create(**kwargs)
+
+
 class Category(models.Model):
+    objects = CategoryManager()
     id = models.IntegerField(primary_key=True)
     name = models.CharField(max_length=255)
     code = models.CharField(max_length=100, unique=True)
@@ -453,11 +676,30 @@ class Category(models.Model):
         verbose_name = 'Category'
         verbose_name_plural = 'Categories'
 
+    def save(self, *args, **kwargs):
+        if not self.code:
+            import re
+            slug = re.sub(r'[^a-z0-9]+', '-', (self.name or '').lower()).strip('-')
+            self.code = f"cat-{slug}" if not slug.startswith('cat-') else slug
+        super().save(*args, **kwargs)
+
     def __str__(self):
         return f"{self.id} - {self.name} ({self.code})"
 
 
+class SubCategoryManager(models.Manager):
+    def create(self, **kwargs):
+        if 'id' in kwargs and self.filter(id=kwargs['id']).exists():
+            obj = self.get(id=kwargs['id'])
+            for k, v in kwargs.items():
+                setattr(obj, k, v)
+            obj.save()
+            return obj
+        return super().create(**kwargs)
+
+
 class SubCategory(models.Model):
+    objects = SubCategoryManager()
     category = models.ForeignKey(Category, on_delete=models.CASCADE, related_name='subcategories', db_column='category_id')
     subcategory_name = models.CharField(max_length=255)
     default_marks = models.DecimalField(max_digits=5, decimal_places=2, default=0.00)
@@ -970,8 +1212,19 @@ class ClassIndexResult(models.Model):
             ),
         ]
 
+class ClassLedger(models.Model):
+    class_id = models.CharField(max_length=100, unique=True)
+    total_marks = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'))
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'class_ledgers'
+        verbose_name = 'Class Ledger'
+        verbose_name_plural = 'Class Ledgers'
+
     def __str__(self):
-        return f"{self.class_name.name} ({self.academic_year.year}) Index: {self.final_index}"
+        return f"ClassLedger({self.class_id}: {self.total_marks})"
 
 
 class SystemSetting(models.Model):

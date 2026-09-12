@@ -350,7 +350,9 @@ class UserService:
                 return "student"
             else:
                 return "faculty"
-        return "student"
+        if any(char.isdigit() for char in username_part):
+            return "student"
+        return "faculty"
 
     @staticmethod
     def is_user_dqc_rep(user):

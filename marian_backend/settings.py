@@ -62,9 +62,11 @@ ENABLE_DEV_BYPASS = (
 
 if DEBUG:
     ALLOWED_HOSTS = [
-        h.strip() for h in os.environ.get('DJANGO_ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',')
+        h.strip() for h in os.environ.get('DJANGO_ALLOWED_HOSTS', 'localhost,127.0.0.1,testserver').split(',')
         if h.strip()
     ]
+    if 'testserver' not in ALLOWED_HOSTS:
+        ALLOWED_HOSTS.append('testserver')
 else:
     _allowed_hosts = os.environ.get('DJANGO_ALLOWED_HOSTS')
     if not _allowed_hosts:
@@ -242,6 +244,7 @@ else:
 # REST Framework settings
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
+        'rest_framework.authentication.SessionAuthentication',
         'rest_framework_simplejwt.authentication.JWTAuthentication',
     ),
     'DEFAULT_PERMISSION_CLASSES': (

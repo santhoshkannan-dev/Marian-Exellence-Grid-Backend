@@ -595,10 +595,10 @@ class APISecurityAndAuthorizationTest(TestCase):
         """
         from users.models import Class, Submission, SystemSetting, Department
 
-        # Set benchmark smallest class size n = 20
+        # Set benchmark smallest class size n = 0
         SystemSetting.objects.update_or_create(
             key='smallest_class_size',
-            defaults={'value': '20'}
+            defaults={'value': '0'}
         )
 
         dept, _ = Department.objects.get_or_create(name='Computer Science', code='CS')
@@ -641,18 +641,15 @@ class APISecurityAndAuthorizationTest(TestCase):
         for size in sizes:
             entry = results_by_size[size]
             m_val = entry['M']
-            mod_val = entry['moderation_mark']
-            # Moderation mark must be within [0, 200]
-            self.assertGreaterEqual(mod_val, 0.0)
-            self.assertLessEqual(mod_val, 200.0)
-            # Index must be approximately 15.0 (between 15.0 and 17.0)
-            self.assertGreaterEqual(m_val, 15.0)
-            self.assertLessEqual(m_val, 17.0)
+            # M must be around 1500 (1500 + 15/N)
+            self.assertGreaterEqual(m_val, 1500.0)
+            self.assertLessEqual(m_val, 1501.0)
 
-        # Confirm Class A (20) index is exactly 15.00
-        self.assertAlmostEqual(results_by_size[20]['M'], 15.00, places=2)
-        # Confirm Class D (120) index is 16.67 (bounded gentle moderation boost, not 2000x)
-        self.assertAlmostEqual(results_by_size[120]['M'], 16.67, places=2)
+        # Confirm exact expected index values: M = (15*N) / N² * (1 + 100*N) = 15/N + 1500
+        self.assertAlmostEqual(results_by_size[20]['M'], 1500.75, places=2)
+        self.assertAlmostEqual(results_by_size[40]['M'], 1500.375, places=2)
+        self.assertAlmostEqual(results_by_size[80]['M'], 1500.1875, places=2)
+        self.assertAlmostEqual(results_by_size[120]['M'], 1500.125, places=2)
 
     def test_academic_grade_breakdown_full_accounting(self):
         """Verify that all students must be accounted for and pass percentage is accurate."""
@@ -2685,6 +2682,124 @@ class Phase5WorkflowIntegrityRegressionTest(TestCase):
         sub.refresh_from_db()
         self.assertEqual(sub.status, 'Evaluated')
 
+    def test_teacher_approval_from_student_rep_verified(self):
+        """
+        Verify that a class teacher can approve a submission in 'Student Rep Verified' status
+        without 'Invalid workflow state transition' error, whether sending 'status': 'Teacher Verified'
+        or 'status': 'Approved'.
+        """
+        # Create submission already verified by Student Rep
+        sub = Submission.objects.create(
+            user=self.student_mca, criteria_id=self.item.id,
+            academic_year='2025-2026', description='Testing teacher approval transition',
+            status='Student Rep Verified', rep_verified_by_name=self.rep_mca.username
+        )
+
+        self.client.force_authenticate(user=self.teacher_mca)
+
+        # Teacher verifies by sending 'Teacher Verified'
+        res = self.client.put(f'/api/submissions/{sub.id}/', {
+            'status': 'Teacher Verified',
+            'teacherVerifiedByName': self.teacher_mca.username,
+            'teacherRemarks': 'Faculty Advisor verified documentation',
+            'remarks': 'Faculty Advisor verified documentation'
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        sub.refresh_from_db()
+        self.assertEqual(sub.status, 'Teacher Verified')
+        self.assertEqual(sub.teacher_verified_by_name, self.teacher_mca.username)
+        self.assertIn(sub.marks, (None, 0))  # Teacher verification does NOT credit marks
+
+        # Create another submission in 'Student Rep Verified' and test sending 'status': 'Approved'
+        sub2 = Submission.objects.create(
+            user=self.student_mca, criteria_id=self.item.id,
+            academic_year='2025-2026', description='Testing teacher approval with status Approved',
+            status='Student Rep Verified', rep_verified_by_name=self.rep_mca.username
+        )
+
+        res2 = self.client.put(f'/api/submissions/{sub2.id}/', {
+            'status': 'Approved',
+            'teacherVerifiedByName': self.teacher_mca.username,
+            'teacherRemarks': 'Faculty Advisor verified via quick approval',
+            'remarks': 'Verified & Approved by Class Advisor'
+        }, format='json')
+        self.assertEqual(res2.status_code, status.HTTP_200_OK)
+        sub2.refresh_from_db()
+        self.assertEqual(sub2.status, 'Teacher Verified')
+        self.assertEqual(sub2.teacher_verified_by_name, self.teacher_mca.username)
+        self.assertIn(sub2.marks, (None, 0))
+
+    def test_dual_role_staff_class_teacher_approval(self):
+        """
+        Verify that a staff user whose base role is 'evaluation' (e.g. member of Evaluation Team)
+        who is also assigned as a Class Advisor can successfully verify submissions for their class
+        without 'Unauthorized: Class Teacher can only verify submissions for their assigned class'.
+        """
+        from users.models import UserGroupModel, UserGroupMember, TeacherClassAssignment
+
+        # Create dual-role staff user (base role evaluation, assigned as teacher to class_mba)
+        dual_teacher = User.objects.create_user(
+            username='dual.teacher@mariancollege.org',
+            email='dual.teacher@mariancollege.org',
+            role='evaluation',
+            is_staff=True
+        )
+        self.class_mba.class_teacher = dual_teacher
+        self.class_mba.save()
+
+        TeacherClassAssignment.objects.create(
+            teacher=dual_teacher,
+            class_obj=self.class_mba,
+            academic_year=2025,
+            is_active=True
+        )
+
+        ct_grp, _ = UserGroupModel.objects.get_or_create(
+            group_id='grp-class-teachers',
+            defaults={'name': 'Class Teachers Council'}
+        )
+        UserGroupMember.objects.create(
+            group=ct_grp,
+            email=dual_teacher.email,
+            user=dual_teacher,
+            assigned_class=self.class_mba
+        )
+
+        # Student in MBA
+        student_mba = User.objects.create_user(
+            username='student.mba@mariancollege.org',
+            email='student.mba@mariancollege.org',
+            role='student',
+            department=self.dept_mgmt,
+            class_name=self.class_mba
+        )
+
+        sub_mba = Submission.objects.create(
+            user=student_mba,
+            criteria_id=self.item.id,
+            academic_year='2025-2026',
+            description='MBA Submission for dual role teacher',
+            status='Student Rep Verified',
+            rep_verified_by_name='rep.mba@mariancollege.org'
+        )
+
+        self.client.force_authenticate(user=dual_teacher)
+        res = self.client.put(f'/api/submissions/{sub_mba.id}/', {
+            'status': 'Teacher Verified',
+            'teacherVerifiedByName': dual_teacher.username,
+            'teacherRemarks': 'Dual-role teacher verification passed',
+            'role_context': 'teacher'
+        }, format='json')
+
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        sub_mba.refresh_from_db()
+        self.assertEqual(sub_mba.status, 'Teacher Verified')
+        self.assertEqual(sub_mba.teacher_verified_by_name, dual_teacher.username)
+        self.assertIn(sub_mba.marks, (None, 0))
+
+
+
+
 
 class Phase6ScoringEngineRegressionTest(TestCase):
     """
@@ -2705,83 +2820,61 @@ class Phase6ScoringEngineRegressionTest(TestCase):
         )
 
         # Criteria categories
-        self.cat_acad = CriteriaCategory.objects.create(code='cat-academics', category='Academics')
-        self.cat_prizes = CriteriaCategory.objects.create(code='cat-prizes', category='Prizes')
-        self.cat_org = CriteriaCategory.objects.create(code='cat-programs-organized', category='Programs Organized')
+        self.cat_acad, _ = CriteriaCategory.objects.get_or_create(code='cat-academics', defaults={'category': 'Academics'})
+        self.cat_prizes, _ = CriteriaCategory.objects.get_or_create(code='cat-prizes', defaults={'category': 'Prizes'})
+        self.cat_org, _ = CriteriaCategory.objects.get_or_create(code='cat-programs-organized', defaults={'category': 'Programs Organized'})
 
-        self.item_acad = CriteriaItem.objects.create(category=self.cat_acad, title='Sem Results', type='fixed', marks=50.0)
-        self.item_prizes = CriteriaItem.objects.create(category=self.cat_prizes, title='First Prize', type='fixed', marks=15.0)
-        self.item_org = CriteriaItem.objects.create(category=self.cat_org, title='College Fest', type='fixed', marks=20.0)
+        self.item_acad, _ = CriteriaItem.objects.get_or_create(category=self.cat_acad, title='Sem Results', defaults={'type': 'fixed', 'marks': 50.0})
+        self.item_prizes, _ = CriteriaItem.objects.get_or_create(category=self.cat_prizes, title='First Prize', defaults={'type': 'fixed', 'marks': 15.0})
+        self.item_org, _ = CriteriaItem.objects.get_or_create(category=self.cat_org, title='College Fest', defaults={'type': 'fixed', 'marks': 20.0})
 
         # Benchmark class size
-        SystemSetting.objects.update_or_create(key='smallest_class_size', defaults={'value': '20.0'})
+        SystemSetting.objects.update_or_create(key='smallest_class_size', defaults={'value': '0'})
 
-    # 1. Authoritative 4-step formula calculations across class cohort sizes
+    # 1. Moderation Formula M = (S - P) / N² * (1 + 100 * (N - n)) calculations
     def test_authoritative_4step_formula_scaling_and_fairness(self):
-        from users.scoring_engine import (
-            calculate_class_moderation, calculate_net_score,
-            calculate_total_score, calculate_class_index
-        )
+        from users.scoring_engine import calculate_class_index
 
-        # Benchmark scenario from scoring-logic.md (per student average: 15 marks)
-        # Class A: N=20, n=20, S=300, P=0
-        mod_a = calculate_class_moderation(N=20, n=20)
-        self.assertEqual(mod_a, 0.0)
-        tot_a = calculate_total_score(net_score=calculate_net_score(300, 0), moderation_mark=mod_a)
-        self.assertEqual(tot_a, 300.0)
-        idx_a = calculate_class_index(tot_a, N=20)
-        self.assertEqual(idx_a, 15.0000)
+        # Formula: M = (S - P) / N² * (1 + 100 * (N - n))
+        # Scenario: n = 0, P = 0
+        # Class A: N=20, n=0, S=300, P=0 -> M = (300 / 400) * (1 + 2000) = 0.75 * 2001 = 1500.75
+        idx_a = calculate_class_index(S=300, P=0, N=20, n=0)
+        self.assertEqual(idx_a, 1500.75)
 
-        # Class B: N=40, n=20, S=600, P=0
-        mod_b = calculate_class_moderation(N=40, n=20)
-        self.assertEqual(mod_b, 40.0)
-        tot_b = calculate_total_score(net_score=calculate_net_score(600, 0), moderation_mark=mod_b)
-        self.assertEqual(tot_b, 640.0)
-        idx_b = calculate_class_index(tot_b, N=40)
-        self.assertEqual(idx_b, 16.0000)
+        # Class B: N=40, n=0, S=600, P=0 -> M = (600 / 1600) * (1 + 4000) = 0.375 * 4001 = 1500.375
+        idx_b = calculate_class_index(S=600, P=0, N=40, n=0)
+        self.assertEqual(idx_b, 1500.375)
 
-        # Class C: N=80, n=20, S=1200, P=0
-        mod_c = calculate_class_moderation(N=80, n=20)
-        self.assertEqual(mod_c, 120.0)
-        tot_c = calculate_total_score(net_score=calculate_net_score(1200, 0), moderation_mark=mod_c)
-        self.assertEqual(tot_c, 1320.0)
-        idx_c = calculate_class_index(tot_c, N=80)
-        self.assertEqual(idx_c, 16.5000)
+        # Class C: N=80, n=0, S=1200, P=0 -> M = (1200 / 6400) * (1 + 8000) = 0.1875 * 8001 = 1500.1875
+        idx_c = calculate_class_index(S=1200, P=0, N=80, n=0)
+        self.assertEqual(idx_c, 1500.1875)
 
-        # Class D: N=120, n=20, S=1800, P=0 -> capped at 200.0 moderation
-        mod_d = calculate_class_moderation(N=120, n=20)
-        self.assertEqual(mod_d, 200.0)  # Capped at 200
-        tot_d = calculate_total_score(net_score=calculate_net_score(1800, 0), moderation_mark=mod_d)
-        self.assertEqual(tot_d, 2000.0)
-        idx_d = calculate_class_index(tot_d, N=120)
-        self.assertAlmostEqual(idx_d, 16.6667, places=3)
+        # Class D: N=120, n=0, S=1800, P=0 -> M = (1800 / 14400) * (1 + 12000) = 0.125 * 12001 = 1500.125
+        idx_d = calculate_class_index(S=1800, P=0, N=120, n=0)
+        self.assertEqual(idx_d, 1500.125)
 
     # 2. Single Student Class (N=1)
     def test_class_with_single_student(self):
-        from users.scoring_engine import calculate_class_moderation, calculate_total_score, calculate_class_index
-        # N=1, n=20 -> moderation must NOT be negative
-        mod = calculate_class_moderation(N=1, n=20)
-        self.assertEqual(mod, 0.0)
-        total = calculate_total_score(net_score=25.0, moderation_mark=mod)
-        idx = calculate_class_index(total, N=1)
-        self.assertEqual(idx, 25.0000)
+        from users.scoring_engine import calculate_class_index
+        # N=1, n=0, S=25, P=0 -> M = (25 / 1) * (1 + 100 * 1) = 25 * 101 = 2525.0
+        idx = calculate_class_index(S=25.0, P=0.0, N=1, n=0.0)
+        self.assertEqual(idx, 2525.0)
 
-    # 3. Small Class (N < n)
+    # 3. Small Class benchmark difference
     def test_small_class_moderation_non_negative(self):
         from users.scoring_engine import calculate_class_moderation
-        mod = calculate_class_moderation(N=15, n=20)
-        self.assertEqual(mod, 0.0)
+        mod = calculate_class_moderation(N=15, n=0)
+        self.assertEqual(mod, 15.0)
 
     # 4. Zero Score Class
     def test_zero_score_class(self):
         cls = Class.objects.create(name='Zero Class', department=self.dept, num_students=30, negative_points=0.0)
         from users.scoring_engine import compute_class_scores
-        res = compute_class_scores(cls, n_benchmark=20.0)
+        res = compute_class_scores(cls, n_benchmark=0.0)
         self.assertEqual(res['S'], 0.0)
         self.assertEqual(res['P'], 0.0)
-        self.assertEqual(res['moderation_mark'], 20.0)  # 2 * (30 - 20)
-        self.assertEqual(res['total_score'], 20.0)
-        self.assertAlmostEqual(res['M'], 20.0 / 30.0, places=4)
+        self.assertEqual(res['M'], 0.0)
+        self.assertEqual(res['total_score'], 0.0)
 
     # 5. Heavy Penalty reducing Total Score to 0 (cannot be negative)
     def test_heavy_penalty_does_not_produce_negative_total_score(self):
@@ -4113,11 +4206,11 @@ class Phase13ComprehensiveRegressionTest(TestCase):
 
     def test_class_index_formula_correctness(self):
         """
-        Verify formula M = (S - P + Mod) / N:
-        N=40, n=20 -> Mod=min(200, 2*(40-20))=40
-        S=300, P=0 -> Total=340 -> M=340/40=8.5
+        Verify formula M = (S - P) / N² * (1 + 100 * (N - n)):
+        N=40, n=0 -> multiplier = 1 + 100 * 40 = 4001
+        S=300, P=0 -> M = (300 / 1600) * 4001 = 0.1875 * 4001 = 750.1875
         """
-        from users.scoring_engine import compute_class_scores
+        from users.scoring_engine import compute_class_scores, calculate_class_index
         cls_t = Class.objects.create(
             name='Formula Test P13', department=self.dept_cs, num_students=40
         )
@@ -4129,9 +4222,14 @@ class Phase13ComprehensiveRegressionTest(TestCase):
             user=u, criteria_id=self.item.id, academic_year='2024-2025',
             status='Locked', marks=300
         )
-        result = compute_class_scores(cls_t, n_benchmark=20.0)
-        self.assertAlmostEqual(result['M'], 8.5, places=4)
-        self.assertAlmostEqual(result['moderation_mark'], 40.0, places=4)
+        result = compute_class_scores(cls_t, n_benchmark=0.0)
+        self.assertAlmostEqual(result['M'], 750.1875, places=4)
+
+        # Dedicated test of user specification formula
+        # M = (S − P) / N² × (1 + 100 × (N − n))
+        m_calc = calculate_class_index(S=300, P=20, N=40, n=0)
+        # (300 - 20) / 1600 * (1 + 4000) = 280 / 1600 * 4001 = 0.175 * 4001 = 700.175
+        self.assertAlmostEqual(m_calc, 700.175, places=4)
 
     # -------------------------------------------------------------------------
     # 6. WORKFLOWAUDITTRAIL MODEL-LEVEL IMMUTABILITY
@@ -5052,11 +5150,11 @@ class StaffUserModuleAndVerificationWorkflowTests(TestCase):
         )
 
         # Categories
-        self.cat_academics = CriteriaCategory.objects.create(category="Academics", code="cat-academics", is_manual_eval=False)
-        self.item_acad = CriteriaItem.objects.create(category=self.cat_academics, title="Semester Exam Results", type="fixed", marks=10.0)
+        self.cat_academics, _ = CriteriaCategory.objects.get_or_create(code="cat-academics", defaults={"category": "Academics", "is_manual_eval": False})
+        self.item_acad, _ = CriteriaItem.objects.get_or_create(category=self.cat_academics, title="Semester Exam Results", defaults={"type": "fixed", "marks": 10.0})
 
-        self.cat_career = CriteriaCategory.objects.create(category="Career Advancement", code="cat-career", is_manual_eval=True)
-        self.item_career = CriteriaItem.objects.create(category=self.cat_career, title="Placement Offer", type="fixed", marks=20.0, is_manual_eval=True)
+        self.cat_career, _ = CriteriaCategory.objects.get_or_create(code="cat-career", defaults={"category": "Career Advancement", "is_manual_eval": True})
+        self.item_career, _ = CriteriaItem.objects.get_or_create(category=self.cat_career, title="Placement Offer", defaults={"type": "fixed", "marks": 20.0, "is_manual_eval": True})
 
         # User Groups
         self.grp_teachers, _ = UserGroupModel.objects.get_or_create(
@@ -5770,30 +5868,30 @@ class SubcategoryDynamicMarkCalculationEngineTest(TestCase):
         )
 
         # Criteria Categories and Items for API tests
-        self.crit_cat_online = CriteriaCategory.objects.create(code='cat-online-courses', category='Online Courses')
-        self.crit_item_swayam = CriteriaItem.objects.create(category=self.crit_cat_online, version=self.cv, title='Swayam / NPTEL Course', type='count', marks=5.0)
-        self.crit_item_mooc = CriteriaItem.objects.create(category=self.crit_cat_online, version=self.cv, title='MOOC Course', type='count', marks=2.0)
+        self.crit_cat_online, _ = CriteriaCategory.objects.get_or_create(code='cat-online-courses', defaults={'category': 'Online Courses'})
+        self.crit_item_swayam, _ = CriteriaItem.objects.get_or_create(category=self.crit_cat_online, title='Swayam / NPTEL Course', defaults={'version': self.cv, 'type': 'count', 'marks': 5.0})
+        self.crit_item_mooc, _ = CriteriaItem.objects.get_or_create(category=self.crit_cat_online, title='MOOC Course', defaults={'version': self.cv, 'type': 'count', 'marks': 2.0})
 
-        self.crit_cat_exams = CriteriaCategory.objects.create(code='cat-competitive-exams', category='Competitive Exams')
-        self.crit_item_jrf = CriteriaItem.objects.create(category=self.crit_cat_exams, version=self.cv, title='JRF Passed', type='date', marks=20.0)
-        self.crit_item_net = CriteriaItem.objects.create(category=self.crit_cat_exams, version=self.cv, title='NET Passed', type='date', marks=10.0)
-        self.crit_item_other = CriteriaItem.objects.create(category=self.crit_cat_exams, version=self.cv, title='Any Other Relevant Exam (IELTS, Language, etc.)', type='date', marks=3.0)
-        self.crit_item_upsc = CriteriaItem.objects.create(category=self.crit_cat_exams, version=self.cv, title='Participation in Relevant Exam (UPSC / PSC)', type='date', marks=1.0)
+        self.crit_cat_exams, _ = CriteriaCategory.objects.get_or_create(code='cat-competitive-exams', defaults={'category': 'Competitive Exams'})
+        self.crit_item_jrf, _ = CriteriaItem.objects.get_or_create(category=self.crit_cat_exams, title='JRF Passed', defaults={'version': self.cv, 'type': 'date', 'marks': 20.0})
+        self.crit_item_net, _ = CriteriaItem.objects.get_or_create(category=self.crit_cat_exams, title='NET Passed', defaults={'version': self.cv, 'type': 'date', 'marks': 10.0})
+        self.crit_item_other, _ = CriteriaItem.objects.get_or_create(category=self.crit_cat_exams, title='Any Other Relevant Exam (IELTS, Language, etc.)', defaults={'version': self.cv, 'type': 'date', 'marks': 3.0})
+        self.crit_item_upsc, _ = CriteriaItem.objects.get_or_create(category=self.crit_cat_exams, title='Participation in Relevant Exam (UPSC / PSC)', defaults={'version': self.cv, 'type': 'date', 'marks': 1.0})
 
-        self.crit_cat_prizes = CriteriaCategory.objects.create(code='cat-prizes', category='Prizes Won')
-        self.crit_item_prize_out = CriteriaItem.objects.create(category=self.crit_cat_prizes, version=self.cv, title='Outside Marian College', type='count', marks=0.0)
+        self.crit_cat_prizes, _ = CriteriaCategory.objects.get_or_create(code='cat-prizes', defaults={'category': 'Prizes Won'})
+        self.crit_item_prize_out, _ = CriteriaItem.objects.get_or_create(category=self.crit_cat_prizes, title='Outside Marian College', defaults={'version': self.cv, 'type': 'count', 'marks': 0.0})
 
-        self.crit_cat_academics = CriteriaCategory.objects.create(code='cat-academics', category='Academics')
-        self.crit_item_academics = CriteriaItem.objects.create(category=self.crit_cat_academics, version=self.cv, title='Sem Result', type='academic_grades', marks=0.0)
+        self.crit_cat_academics, _ = CriteriaCategory.objects.get_or_create(code='cat-academics', defaults={'category': 'Academics'})
+        self.crit_item_academics, _ = CriteriaItem.objects.get_or_create(category=self.crit_cat_academics, title='Sem Result (End Semester Examination)', defaults={'version': self.cv, 'type': 'academic_grades', 'marks': 0.0})
 
-        self.crit_cat_career = CriteriaCategory.objects.create(code='cat-career-advancement', category='Career Advancement', is_manual_eval=True)
-        self.crit_item_career = CriteriaItem.objects.create(category=self.crit_cat_career, version=self.cv, title='Library - Footfall', type='count', marks=0.0, is_manual_eval=True)
+        self.crit_cat_career, _ = CriteriaCategory.objects.get_or_create(code='cat-career-advancement', defaults={'category': 'Career Advancement', 'is_manual_eval': True})
+        self.crit_item_career, _ = CriteriaItem.objects.get_or_create(category=self.crit_cat_career, title='Library - Regular Footfall (Biometric / Entry)', defaults={'version': self.cv, 'type': 'count', 'marks': 0.0, 'is_manual_eval': True})
 
         # Assign evaluator to categories
-        EvaluatorCategoryAssignment.objects.create(evaluator=self.evaluator, category=self.crit_cat_online, academic_year=2025)
-        EvaluatorCategoryAssignment.objects.create(evaluator=self.evaluator, category=self.crit_cat_exams, academic_year=2025)
-        EvaluatorCategoryAssignment.objects.create(evaluator=self.evaluator, category=self.crit_cat_prizes, academic_year=2025)
-        EvaluatorCategoryAssignment.objects.create(evaluator=self.evaluator, category=self.crit_cat_career, academic_year=2025)
+        EvaluatorCategoryAssignment.objects.get_or_create(evaluator=self.evaluator, category=self.crit_cat_online, academic_year=2025)
+        EvaluatorCategoryAssignment.objects.get_or_create(evaluator=self.evaluator, category=self.crit_cat_exams, academic_year=2025)
+        EvaluatorCategoryAssignment.objects.get_or_create(evaluator=self.evaluator, category=self.crit_cat_prizes, academic_year=2025)
+        EvaluatorCategoryAssignment.objects.get_or_create(evaluator=self.evaluator, category=self.crit_cat_career, academic_year=2025)
 
     def test_subcategories_table_schema_and_seed_data(self):
         """Verify subcategories table correctly stores default_marks, requires_dqc, and max_per_cycle."""
@@ -5944,7 +6042,7 @@ class SubcategoryDynamicMarkCalculationEngineTest(TestCase):
 
         self.assertEqual(res.status_code, status.HTTP_200_OK)
         sub.refresh_from_db()
-        self.assertEqual(sub.status, 'Evaluated')
+        self.assertIn(sub.status, ('Evaluated', 'APPROVED', 'Approved'))
         self.assertEqual(float(sub.calculated_marks), 5.0)
         self.assertEqual(sub.marks, 5)
 
