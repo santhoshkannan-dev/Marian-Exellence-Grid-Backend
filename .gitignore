@@ -16,7 +16,9 @@ __pycache__/
 
 # Local Environment Variables
 .env
-.env.local
+.env.*
+!.env.example
+!.env.production.example
 
 # Media and Uploads & Static Assets
 media/

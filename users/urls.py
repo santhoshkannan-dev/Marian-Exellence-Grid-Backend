@@ -1,8 +1,6 @@
-from django.conf import settings
 from django.urls import path
 from .views import (
     GoogleLoginView,
-    DevBypassLoginView,
     CustomTokenRefreshView,
     LogoutView,
     UserProfileView,
@@ -85,6 +83,5 @@ urlpatterns = [
     path('champions/', ChampionListView.as_view(), name='champions-list'),
     path('champions/<int:pk>/', ChampionDetailView.as_view(), name='champions-detail'),
     path('bug-reports/', BugReportView.as_view(), name='bug-reports'),
-    path('auth/bypass/', DevBypassLoginView.as_view(), name='dev-bypass-login'),
 ]
 

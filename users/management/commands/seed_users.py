@@ -1,6 +1,5 @@
 from django.core.management.base import BaseCommand
 from users.models import Department, Course, Class, User, AcademicYear
-from users.views import allocate_student_from_email
 
 class Command(BaseCommand):
     help = 'Seeds departments, classes, academic years, and pre-mapped users'
@@ -23,12 +22,8 @@ class Command(BaseCommand):
                 obj.is_active = ay["is_active"]
                 obj.save()
 
-        # Purge outdated legacy departments, courses, classes, and non-existing users
-        User.objects.filter(email='iqac@mariancollege.org').delete()
-        User.objects.all().update(class_name=None, department=None)
-        Class.objects.all().delete()
-        Course.objects.all().delete()
-        Department.objects.all().delete()
+        # Do not modify or delete existing users.
+        # Users are managed through registration, admin, or application workflows.
 
         # 2. Seed 13 Official Academic Departments in exact order
         departments_data = [
@@ -49,14 +44,17 @@ class Command(BaseCommand):
 
         departments = {}
         for dept in departments_data:
-            obj = Department.objects.create(
-                name=dept["name"],
+            obj, created = Department.objects.update_or_create(
                 code=dept["code"],
-                level=dept["level"],
-                email_prefix=dept["email_prefix"]
+                defaults={
+                    "name": dept["name"],
+                    "level": dept["level"],
+                    "email_prefix": dept["email_prefix"]
+                }
             )
             departments[dept["code"]] = obj
-            self.stdout.write(f"Created Department: {obj.name} ({obj.code})")
+            action = "Created" if created else "Updated"
+            self.stdout.write(f"{action} Department: {obj.name} ({obj.code})")
 
         # 3. Seed 16 Official Courses
         courses_data = [
@@ -81,16 +79,19 @@ class Command(BaseCommand):
         courses = {}
         for c in courses_data:
             dept = departments[c["dept_code"]]
-            obj = Course.objects.create(
+            obj, created = Course.objects.update_or_create(
                 department=dept,
-                name=c["name"],
-                abbreviation=c["abbreviation"],
                 email_code=c["email_code"],
-                is_multi_batch=c["is_multi_batch"],
-                duration_years=c["duration_years"],
+                defaults={
+                    "name": c["name"],
+                    "abbreviation": c["abbreviation"],
+                    "is_multi_batch": c["is_multi_batch"],
+                    "duration_years": c["duration_years"],
+                }
             )
             courses[c["email_code"]] = obj
-            self.stdout.write(f"Created Course: {obj.abbreviation} ({obj.email_code})")
+            action = "Created" if created else "Updated"
+            self.stdout.write(f"{action} Course: {obj.abbreviation} ({obj.email_code})")
 
         # 4. Seed 65 Official Classes
         classes_data = [
@@ -181,88 +182,90 @@ class Command(BaseCommand):
         for cls in classes_data:
             course = courses[cls["course_code"]]
             dept = course.department
-            obj = Class.objects.create(
+            obj, created = Class.objects.update_or_create(
                 name=cls["name"],
-                department=dept,
-                course=course,
-                year_number=cls["year_number"],
-                section=cls["section"],
+                defaults={
+                    "department": dept,
+                    "course": course,
+                    "year_number": cls["year_number"],
+                    "section": cls["section"],
+                }
             )
             classes[cls["name"]] = obj
-            self.stdout.write(f"Created Class: {obj.name}")
+            action = "Created" if created else "Updated"
+            self.stdout.write(f"{action} Class: {obj.name}")
 
-        # 5. Seed Users (non-admin accounts are static personas for development)
-        # Admin accounts are sourced exclusively from the ADMIN_EMAILS env variable.
+        # 5. Seed Admin Users Only
+        #
+        # Admin accounts are sourced exclusively from the ADMIN_EMAILS
+        # environment variable. No dummy student, faculty, or evaluator
+        # accounts are created by this command.
+
         from django.conf import settings as django_settings
-
-        base_users_data = [
-            ("santhosh.25pmc152@mariancollege.org", "student", "PGDCA", "II MCA", False, False, "Santhosh", "Kannan"),
-            ("amal.25pmc114@mariancollege.org", "student", "PGDCA", "II MCA", False, False, "Amal", "Thomas"),
-            ("santhosh.25ubc154@mariancollege.org", "student", "UGDCA", "II BCA A", False, False, "Santhosh", "Kannan"),
-            ("kochumol.abraham@mariancollege.org", "faculty", "PGDCA", None, True, False, "Kochumol", "Abraham"),
-            ("allen.george@mariancollege.org", "evaluation", "PGDCA", None, True, False, "Allen", "George"),
-        ]
-
-        # Dynamically build admin user entries from ADMIN_EMAILS environment variable
-        admin_emails = getattr(django_settings, 'ADMIN_EMAILS', frozenset())
-        if not admin_emails:
-            self.stdout.write(self.style.WARNING(
-                "WARNING: ADMIN_EMAILS is not set in your .env file. "
-                "No admin accounts will be seeded. "
-                "Add ADMIN_EMAILS=admin@example.org to your .env file to seed admin users."
-            ))
-        admin_users_data = [
-            (email, "admin", None, None, True, True, "System", "Administrator")
-            for email in sorted(admin_emails)
-        ]
-        users_data = base_users_data + admin_users_data
-
         import os
-        seed_pwd = os.environ.get('SEED_DEFAULT_PASSWORD') or getattr(django_settings, 'SEED_DEFAULT_PASSWORD', 'MarianPassword@123')
 
-        seeded_users = {}
-        for email, role, dept_code, class_name, is_staff, is_superuser, first, last in users_data:
-            dept = departments.get(dept_code)
-            cls = classes.get(class_name) if class_name else None
+        admin_emails = getattr(django_settings, "ADMIN_EMAILS", frozenset())
 
-            username = email.split('@')[0]
+        if not admin_emails:
+            self.stdout.write(
+                self.style.WARNING(
+                    "WARNING: ADMIN_EMAILS is not set in your .env file. "
+                    "No admin accounts will be seeded. "
+                    "Add ADMIN_EMAILS=admin@example.org to your .env file "
+                    "if you want to create admin users."
+                )
+            )
+
+        seed_pwd = (
+            os.environ.get("SEED_DEFAULT_PASSWORD")
+            or getattr(
+                django_settings,
+                "SEED_DEFAULT_PASSWORD",
+                None,
+            )
+        )
+
+        for email in sorted(admin_emails):
+            username = email.split("@")[0]
 
             user = User.objects.filter(email=email).first()
+
             if not user:
-                user = User.objects.create_user(
+                user = User(
                     email=email,
                     username=username,
-                    password=seed_pwd,
-                    role=role,
-                    department=dept,
-                    class_name=cls,
-                    is_staff=is_staff,
-                    is_superuser=is_superuser,
-                    first_name=first,
-                    last_name=last
+                    role="admin",
+                    department=None,
+                    class_name=None,
+                    is_staff=True,
+                    is_superuser=True,
+                    first_name="System",
+                    last_name="Administrator",
                 )
-                self.stdout.write(f"Created pre-registered user: {email} ({role})")
-            else:
-                user.role = role
-                user.department = dept
-                user.class_name = cls
-                user.is_staff = is_staff
-                user.is_superuser = is_superuser
-                user.first_name = first
-                user.last_name = last
-                user.set_password(seed_pwd)
+                if seed_pwd:
+                    user.set_password(seed_pwd)
+                else:
+                    user.set_unusable_password()
                 user.save()
 
-            user = allocate_student_from_email(user)
-            seeded_users[email] = user
+                self.stdout.write(
+                    f"Created admin user: {email}"
+                )
+            else:
+                user.role = "admin"
+                user.department = None
+                user.class_name = None
+                user.is_staff = True
+                user.is_superuser = True
+                user.first_name = "System"
+                user.last_name = "Administrator"
+                if seed_pwd:
+                    user.set_password(seed_pwd)
+                user.save()
 
-        # 5. Set Class Teacher & DQC member for classes
-        mca_class = Class.objects.filter(name__in=["II MCA", "MCA"]).first()
-        if mca_class:
-            mca_class.class_teacher = seeded_users.get("kochumol.abraham@mariancollege.org")
-            mca_class.dqc_member = seeded_users.get("santhosh.25pmc152@mariancollege.org")
-            mca_class.save()
-            self.stdout.write("Configured MCA Class Teacher and DQC member links")
+                self.stdout.write(
+                    f"Updated admin user: {email}"
+                )
 
         # 6. Seed Criteria Catalog (Idempotent 12 categories)
         from users.models import CriteriaCategory, CriteriaItem, CriteriaRule
@@ -548,140 +551,71 @@ class Command(BaseCommand):
                     }
                 )
 
-        # 7. Seed Official User Groups (strictly 4 official groups)
-        from users.models import UserGroupModel, UserGroupMember, EvaluatorCategoryAssignment, TeacherClassAssignment, StaffProfile
-        UserGroupModel.objects.exclude(group_id__in=[
-            'grp-evaluation-committee',
-            'grp-class-teachers',
-            'grp-dqc-student-rep',
-            'grp-student-reps'
-        ]).delete()
+        # 7. Seed Official User Groups
+        from users.models import UserGroupModel
+
+        UserGroupModel.objects.exclude(
+            group_id__in=[
+                "grp-evaluation-committee",
+                "grp-class-teachers",
+                "grp-dqc-student-rep",
+                "grp-student-reps",
+            ]
+        ).delete()
 
         official_groups = [
             {
                 "group_id": "grp-evaluation-committee",
                 "name": "Evaluation Committee",
-                "description": "Evaluator members assigned to review activity submissions.",
+                "description": (
+                    "Evaluator members assigned to review activity submissions."
+                ),
             },
             {
                 "group_id": "grp-class-teachers",
                 "name": "Class Teachers Council",
-                "description": "Faculty members acting as class advisors.",
+                "description": (
+                    "Faculty members acting as class advisors."
+                ),
             },
             {
                 "group_id": "grp-dqc-student-rep",
                 "name": "DQC Student Rep Group",
-                "description": "Data Quality Cell student representatives responsible for initial verification of peer submissions, and access to all categories for submissions of class they belong to.",
+                "description": (
+                    "Data Quality Cell student representatives responsible "
+                    "for initial verification of peer submissions."
+                ),
             },
             {
                 "group_id": "grp-student-reps",
                 "name": "Student Representatives",
-                "description": "Class representatives responsible for initial verification of peer submissions of class they belong to only.",
+                "description": (
+                    "Class representatives responsible for initial verification "
+                    "of peer submissions."
+                ),
             },
         ]
 
-        created_groups = {}
-        for g_data in official_groups:
-            group, _ = UserGroupModel.objects.update_or_create(
-                group_id=g_data["group_id"],
+        for group_data in official_groups:
+            group, created = UserGroupModel.objects.update_or_create(
+                group_id=group_data["group_id"],
                 defaults={
-                    "name": g_data["name"],
-                    "description": g_data["description"]
-                }
-            )
-            created_groups[g_data["group_id"]] = group
-
-        # Seed group members with peer details
-        mca_class = Class.objects.filter(name="II MCA").first()
-        pgdca_dept = Department.objects.filter(code="PGDCA").first()
-
-        # Ensure Official Group Memberships are synced with seeded personas
-        # 1. Allen George -> Evaluation Committee
-        eval_user = seeded_users.get("allen.george@mariancollege.org")
-        eval_member, _ = UserGroupMember.objects.update_or_create(
-            group=created_groups["grp-evaluation-committee"],
-            email="allen.george@mariancollege.org",
-            defaults={
-                "name": "Allen George",
-                "user": eval_user,
-                "department": pgdca_dept,
-            }
-        )
-        if eval_user:
-            StaffProfile.objects.update_or_create(
-                user=eval_user,
-                defaults={
-                    "department": pgdca_dept,
-                    "designation": "Evaluator"
-                }
-            )
-        # Assign all categories to Allen George
-        for cat in CriteriaCategory.objects.all():
-            EvaluatorCategoryAssignment.objects.get_or_create(
-                member=eval_member,
-                category=cat,
-                defaults={"evaluator": eval_user, "academic_year": 2025}
-            )
-            if "allen.george@mariancollege.org" not in cat.evaluators:
-                cat.evaluators.append("allen.george@mariancollege.org")
-                cat.save(update_fields=["evaluators"])
-
-        # 2. Kochumol Abraham -> Class Teachers Council
-        teacher_user = seeded_users.get("kochumol.abraham@mariancollege.org")
-        UserGroupMember.objects.update_or_create(
-            group=created_groups["grp-class-teachers"],
-            email="kochumol.abraham@mariancollege.org",
-            defaults={
-                "name": "Kochumol Abraham",
-                "user": teacher_user,
-                "department": pgdca_dept,
-                "assigned_class": mca_class,
-            }
-        )
-        if teacher_user and mca_class:
-            StaffProfile.objects.update_or_create(
-                user=teacher_user,
-                defaults={
-                    "department": pgdca_dept,
-                    "designation": "Class Teacher"
-                }
-            )
-            TeacherClassAssignment.objects.get_or_create(
-                teacher=teacher_user,
-                class_obj=mca_class,
-                defaults={"academic_year": 2025}
+                    "name": group_data["name"],
+                    "description": group_data["description"],
+                },
             )
 
-        # 3. Santhosh Kannan -> DQC Student Rep Group & Student Representatives
-        UserGroupMember.objects.update_or_create(
-            group=created_groups["grp-dqc-student-rep"],
-            email="santhosh.25pmc152@mariancollege.org",
-            defaults={
-                "name": "Santhosh Kannan",
-                "user": seeded_users.get("santhosh.25pmc152@mariancollege.org"),
-                "department": pgdca_dept,
-                "assigned_class": mca_class,
-                "badge": "DQC member",
-            }
-        )
-        UserGroupMember.objects.update_or_create(
-            group=created_groups["grp-student-reps"],
-            email="santhosh.25pmc152@mariancollege.org",
-            defaults={
-                "name": "Santhosh Kannan",
-                "user": seeded_users.get("santhosh.25pmc152@mariancollege.org"),
-                "department": pgdca_dept,
-                "assigned_class": mca_class,
-                "badge": "Student Rep",
-            }
-        )
+            action = "Created" if created else "Updated"
 
-        for grp in created_groups.values():
-            grp.sync_json_members()
+            self.stdout.write(
+                f"{action} official group: {group.name}"
+            )
 
+        # 8. Seed System Settings
         from users.models import SystemSetting
         SystemSetting.objects.get_or_create(key='smallest_class_size', defaults={'value': '0'})
 
+        # 9. Heal Criteria Submissions
         from django.core.management import call_command
         call_command('heal_criteria_submissions')
 

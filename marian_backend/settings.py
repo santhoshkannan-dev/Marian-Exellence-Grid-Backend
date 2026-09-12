@@ -54,12 +54,6 @@ if not SECRET_KEY:
     else:
         raise ImproperlyConfigured("DJANGO_SECRET_KEY environment variable is required in production.")
 
-# SECURITY: Dev bypass login controls (Strictly fail-closed; disabled unless DEBUG and ENABLE_DEV_BYPASS are explicitly set to true)
-ENABLE_DEV_BYPASS = (
-    DEBUG and
-    os.environ.get("ENABLE_DEV_BYPASS", "False").lower() == "true"
-)
-
 if DEBUG:
     ALLOWED_HOSTS = [
         h.strip() for h in os.environ.get('DJANGO_ALLOWED_HOSTS', 'localhost,127.0.0.1,testserver').split(',')
@@ -244,8 +238,8 @@ else:
 # REST Framework settings
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
-        'rest_framework.authentication.SessionAuthentication',
         'rest_framework_simplejwt.authentication.JWTAuthentication',
+        'rest_framework.authentication.SessionAuthentication',
     ),
     'DEFAULT_PERMISSION_CLASSES': (
         'rest_framework.permissions.IsAuthenticated',
@@ -280,7 +274,12 @@ SIMPLE_JWT = {
 }
 
 # Google OAuth Client ID loaded from environment variable
-GOOGLE_CLIENT_ID = os.environ.get('GOOGLE_CLIENT_ID')
+_google_client_id_raw = os.environ.get('GOOGLE_CLIENT_ID', '').strip()
+if ',' in _google_client_id_raw:
+    GOOGLE_CLIENT_ID = [cid.strip() for cid in _google_client_id_raw.split(',') if cid.strip()]
+else:
+    GOOGLE_CLIENT_ID = _google_client_id_raw or None
+
 if not DEBUG and not GOOGLE_CLIENT_ID:
     raise ImproperlyConfigured("GOOGLE_CLIENT_ID environment variable is required in production.")
 

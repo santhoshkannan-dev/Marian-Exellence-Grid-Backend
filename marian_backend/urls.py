@@ -13,8 +13,6 @@ def api_root(request):
         "google_auth": "/api/auth/google/",
         "profile": "/api/auth/profile/"
     }
-    if getattr(settings, 'ENABLE_DEV_BYPASS', False):
-        endpoints["bypass_auth"] = "/api/auth/bypass/"
     return JsonResponse({
         "status": "online",
         "message": "Marian Excellence Grid Evaluation API Server is running",

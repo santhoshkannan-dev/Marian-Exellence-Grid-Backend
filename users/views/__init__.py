@@ -34,7 +34,6 @@ from .auth_views import (
     GoogleLoginView,
     LogoutView,
     CustomTokenRefreshView,
-    DevBypassLoginView,
     UserProfileView,
     UserManagementView,
     SwitchRoleView,
@@ -127,7 +126,6 @@ __all__ = [
     "GoogleLoginView",
     "LogoutView",
     "CustomTokenRefreshView",
-    "DevBypassLoginView",
     "UserProfileView",
     "UserManagementView",
     # Academic Views

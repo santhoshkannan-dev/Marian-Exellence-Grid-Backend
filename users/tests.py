@@ -236,21 +236,18 @@ class DepartmentCourseClassManagementTest(TestCase):
         self.assertEqual(cls.num_students, 60)
         self.assertEqual(cls.negative_points, 5.5)
 
-    def test_dev_bypass_login_allocates_student(self):
+    def test_allocate_student_from_email(self):
         dept = Department.objects.create(name='Post-Graduate Dept of CS', code='PGDCA', email_prefix='p', level='PG')
         Course.objects.create(department=dept, name='MCA', abbreviation='MCA', email_code='mc', duration_years=2)
 
         # Active academic year is 2026-2027 (set in setUp)
-        # Login via bypass
-        from django.conf import settings
-        with self.settings(DEBUG=True, ENABLE_DEV_BYPASS=True):
-            res = self.client.post('/api/auth/bypass/', {
-                'email': 'amal.25pmc114@mariancollege.org'
-            }, format='json')
-            self.assertEqual(res.status_code, status.HTTP_200_OK)
-            self.assertIn('tokens', res.data)
-            self.assertEqual(res.data['user']['class_name'], 'II MCA')
-            self.assertEqual(res.data['user']['department_code'], 'PGDCA')
+        from users.views.base import allocate_student_from_email
+        from users.views.auth_views import get_user_class_details
+        user = User.objects.create(username='amal.25pmc114@mariancollege.org', email='amal.25pmc114@mariancollege.org', role='student')
+        user = allocate_student_from_email(user)
+        cls_name, cls_data = get_user_class_details(user)
+        self.assertEqual(cls_name, 'II MCA')
+        self.assertEqual(cls_data['department_code'], 'PGDCA')
 
 
 class CriteriaSubcategoryScoreValidationTest(TestCase):
@@ -581,13 +578,11 @@ class APISecurityAndAuthorizationTest(TestCase):
         self.assertNotIn(sub2.id, returned_ids)
 
     def test_dev_bypass_disabled_fails_closed(self):
-        """When DEBUG and ENABLE_DEV_BYPASS are False, bypass endpoint returns 404."""
-        from django.conf import settings
-        with self.settings(DEBUG=False, ENABLE_DEV_BYPASS=False):
-            res = self.client.post('/api/auth/bypass/', {
-                'email': 'student1@mariancollege.org'
-            }, format='json')
-            self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
+        """Bypass endpoint is completely removed and returns 404."""
+        res = self.client.post('/api/auth/bypass/', {
+            'email': 'student1@mariancollege.org'
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
 
     def test_class_index_normalization_invariance_across_class_sizes(self):
         """Mathematically prove that classes with identical per-student performance
@@ -989,42 +984,14 @@ class Phase1SecurityRemediationRegressionTest(TestCase):
         )
 
     # -------------------------------------------------------------
-    # 1. DEVELOPMENT AUTHENTICATION BYPASS REGRESSION TESTS
+    # 1. DEVELOPMENT AUTHENTICATION BYPASS REMOVAL REGRESSION TESTS
     # -------------------------------------------------------------
-    def test_dev_bypass_fails_closed_when_debug_false(self):
-        """Bypass must strictly fail closed (404) when DEBUG=False, even if ENABLE_DEV_BYPASS=True."""
-        with self.settings(DEBUG=False, ENABLE_DEV_BYPASS=True):
-            res = self.client.post('/api/auth/bypass/', {
-                'email': 'student_a@mariancollege.org'
-            }, format='json')
-            self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
-
-    def test_dev_bypass_fails_closed_when_flag_false(self):
-        """Bypass must return 404 when ENABLE_DEV_BYPASS=False in development."""
-        with self.settings(DEBUG=True, ENABLE_DEV_BYPASS=False):
-            res = self.client.post('/api/auth/bypass/', {
-                'email': 'student_a@mariancollege.org'
-            }, format='json')
-            self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
-
-    def test_dev_bypass_cannot_escalate_privileged_role(self):
-        """Dev bypass must reject client attempts to select an arbitrary privileged role."""
-        with self.settings(DEBUG=True, ENABLE_DEV_BYPASS=True):
-            res = self.client.post('/api/auth/bypass/', {
-                'email': 'student_a@mariancollege.org',
-                'role': 'admin'
-            }, format='json')
-            self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
-            self.student_a.refresh_from_db()
-            self.assertEqual(self.student_a.role, 'student')
-
-    def test_dev_bypass_cannot_autocreate_privileged_accounts(self):
-        """Unseeded admin or staff accounts cannot be created on the fly via dev bypass."""
-        with self.settings(DEBUG=True, ENABLE_DEV_BYPASS=True):
-            res = self.client.post('/api/auth/bypass/', {
-                'email': 'unseeded.staff@mariancollege.org'
-            }, format='json')
-            self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
+    def test_dev_bypass_removed_from_endpoints(self):
+        """Bypass route is removed and returns 404."""
+        res = self.client.post('/api/auth/bypass/', {
+            'email': 'student_a@mariancollege.org'
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
 
     def test_hardcoded_student_emails_not_granted_rep_privileges(self):
         """Hardcoded student emails must NOT bypass rep verification logic without class assignment."""
@@ -1610,14 +1577,7 @@ class Phase2AuthorizationHardeningRegressionTest(TestCase):
             is_active=False
         )
 
-        # 1. Bypass login denied for disabled user
-        with self.settings(DEBUG=True, ENABLE_DEV_BYPASS=True):
-            res_bypass = self.client.post('/api/auth/bypass/', {
-                'email': disabled_user.email
-            }, format='json')
-            self.assertEqual(res_bypass.status_code, status.HTTP_403_FORBIDDEN)
-
-        # 2. Token refresh denied for disabled user
+        # Token refresh denied for disabled user
         from rest_framework_simplejwt.tokens import RefreshToken
         token = RefreshToken.for_user(disabled_user)
         res_refresh = self.client.post('/api/auth/token/refresh/', {
